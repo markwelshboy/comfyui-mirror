@@ -6,7 +6,7 @@ apt-get update
 apt-get install -y --no-install-recommends \
   python3.12 python3.12-venv python3.12-dev python3-pip \
   curl git git-lfs aria2 ffmpeg ninja-build build-essential gcc \
-  libgl1 libglib2.0-0 tmux google-perftools
+  libgl1 libglib2.0-0 tmux nano vim google-perftools
 git lfs install --system || true
 
 ln -sf /usr/bin/python3.12 /usr/bin/python || true
@@ -29,7 +29,6 @@ pip install packaging pyyaml gdown triton comfy-cli \
 yes | comfy --workspace /ComfyUI install
 
 chmod +x start.sh
-: "${download_wan22:=false}"
-: "${change_preview_method:=false}"
-export download_wan22 change_preview_method
+export download_wan22="${download_wan22:-true}"
+export change_preview_method="${change_preview_method:-true}"
 exec ./start.sh
