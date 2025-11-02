@@ -305,21 +305,139 @@ while [[ ! -f /tmp/sage_build_done ]]; do
 done
 [[ -f /tmp/sage_build_done ]] && echo "✅ SageAttention built"
 
-# Start ComfyUI
-PORT="${PORT:-8188}"
-URL="http://127.0.0.1:${PORT}"
-echo "▶️  Starting ComfyUI on 0.0.0.0:${PORT}"
-nohup python3 "$COMFY_DIR_VOL/main.py" --listen --port "$PORT" --use-sage-attention \
-  > "$NETWORK_VOLUME/comfyui_${RUNPOD_POD_ID:-local}_nohup.log" 2>&1 &
+## Start ComfyUI
+#PORT="${PORT:-8188}"
+#URL="http://127.0.0.1:${PORT}"
+#echo "▶️  Starting ComfyUI on 0.0.0.0:${PORT}"
+#nohup python3 "$COMFY_DIR_VOL/main.py" --listen --port "$PORT" --use-sage-attention \
+#  > "$NETWORK_VOLUME/comfyui_${RUNPOD_POD_ID:-local}_nohup.log" 2>&1 &
 
 # readiness probe (max ~45s)
-for i in {1..45}; do
-  if curl -fsS "$URL" >/dev/null 2>&1; then
-    echo "🚀 ComfyUI is UP"
-    break
-  fi
-  echo "🔄 ComfyUI starting… logs: $NETWORK_VOLUME/comfyui_${RUNPOD_POD_ID:-local}_nohup.log"
-  sleep 1
-done
+#for i in {1..45}; do
+#  if curl -fsS "$URL" >/dev/null 2>&1; then
+#    echo "🚀 ComfyUI is UP"
+#    break
+#  fi
+#  echo "🔄 ComfyUI starting… logs: $NETWORK_VOLUME/comfyui_${RUNPOD_POD_ID:-local}_nohup.log"
+#  sleep 1
+#done
 
+# ================== MULTI-INSTANCE / MULTI-GPU LAUNCH (tmux + Telegram) ==================
+
+set +e  # don't die on curl/tmux checks
+
+COMFY_ROOT="$NETWORK_VOLUME/ComfyUI"
+LOG_DIR="$NETWORK_VOLUME/logs"
+mkdir -p "$LOG_DIR"
+
+# Per-instance dirs
+OUT_8188="$NETWORK_VOLUME/output"
+CACHE_8188="$NETWORK_VOLUME/cache"
+OUT_8288="$NETWORK_VOLUME/output_gpu0"
+CACHE_8288="$NETWORK_VOLUME/cache_gpu0"
+OUT_8388="$NETWORK_VOLUME/output_gpu1"
+CACHE_8388="$NETWORK_VOLUME/cache_gpu1"
+
+mkdir -p "$OUT_8188" "$CACHE_8188" "$OUT_8288" "$CACHE_8288" "$OUT_8388" "$CACHE_8388"
+
+# --- helpers ---
+send_telegram() {
+  local text="$1"
+  if [[ -n "${TELEGRAM_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]]; then
+    curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+      -d "chat_id=${TELEGRAM_CHAT_ID}" \
+      --data-urlencode "text=${text}" >/dev/null 2>&1 || true
+  fi
+}
+
+wait_ready() {
+  # $1=port $2=timeout_seconds
+  local port="$1" timeout="${2:-60}" url="http://127.0.0.1:${port}"
+  local i=0
+  until curl -fsS "$url" >/dev/null 2>&1; do
+    sleep 1
+    i=$((i+1))
+    if (( i >= timeout )); then
+      return 1
+    fi
+  done
+  return 0
+}
+
+launch_instance() {
+  # args: name session port gpu_id out_dir cache_dir log_file extra_args
+  local name="$1" sess="$2" port="$3" gpu="$4" outdir="$5" cachedir="$6" logfile="$7"
+  shift 7
+  local extra="$*"
+
+  # Build command
+  local cmd="cd \"$COMFY_ROOT\" && \
+XDG_CACHE_HOME=\"$cachedir\" CUDA_VISIBLE_DEVICES=\"$gpu\" \
+python3 main.py --listen 0.0.0.0 --port \"$port\" --use-sage-attention \
+  --output-directory \"$outdir\" $extra >> \"$logfile\" 2>&1"
+
+  # Start tmux session
+  if tmux has-session -t "$sess" 2>/dev/null; then
+    tmux kill-session -t "$sess" 2>/dev/null || true
+  fi
+  tmux new-session -d -s "$sess" "bash -lc '$cmd'"
+
+  # Initial readiness
+  if wait_ready "$port" 60; then
+    echo "[$name] UP on port $port" | tee -a "$logfile"
+    send_telegram "🚀 ComfyUI: $name is UP on ${HOSTNAME:-pod} (port $port)"
+  else
+    echo "[$name] did not become ready within 60s" | tee -a "$logfile"
+    send_telegram "⚠️ $name did not respond with HTTP 200 within 60s (port $port). Check logs: $logfile"
+  fi
+
+  # Crash/health monitor (background)
+  (
+    local was_up=0
+    while true; do
+      sleep 10
+      # Check tmux session
+      if ! tmux has-session -t "$sess" 2>/dev/null; then
+        send_telegram "❌ $name tmux session exited (port $port). Log: $logfile"
+        exit 0
+      fi
+      # Check HTTP health
+      if curl -fsS "http://127.0.0.1:${port}" >/dev/null 2>&1; then
+        was_up=1
+      else
+        # Only notify if it had been up at least once to avoid duplicate noise
+        if (( was_up == 1 )); then
+          send_telegram "❌ $name became unresponsive (port $port). Log: $logfile"
+          exit 0
+        fi
+      fi
+    done
+  ) &
+
+}
+
+# --- detect GPU count ---
+GPU_COUNT="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l | tr -d ' ')"
+[[ -z "$GPU_COUNT" || "$GPU_COUNT" -lt 0 ]] && GPU_COUNT=0
+
+# --- launch instances ---
+# 8188 (leave general settings "alone": no explicit GPU mask; still isolate outputs/cache/logs)
+LOG_8188="$LOG_DIR/comfyui-8188.log"
+launch_instance "ComfyUI-8188" "comfy-8188" 8188 "all" "$OUT_8188" "$CACHE_8188" "$LOG_8188" ""
+
+# 8288 on GPU 0 always
+LOG_8288="$LOG_DIR/comfyui-8288.log"
+launch_instance "ComfyUI-8288 (GPU0)" "comfy-8288" 8288 "0" "$OUT_8288" "$CACHE_8288" "$LOG_8288" ""
+
+# 8388 only if we have >=2 GPUs, bound to GPU 1
+if (( GPU_COUNT >= 2 )); then
+  LOG_8388="$LOG_DIR/comfyui-8388.log"
+  launch_instance "ComfyUI-8388 (GPU1)" "comfy-8388" 8388 "1" "$OUT_8388" "$CACHE_8388" "$LOG_8388" ""
+else
+  echo "[Info] <2 GPUs detected; skipping ComfyUI-8388"
+fi
+
+# Keep container alive (tmux owns the processes)
 sleep infinity
+
+# ================== END MULTI-INSTANCE BLOCK ==================
