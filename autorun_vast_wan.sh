@@ -309,9 +309,8 @@ echo "SageAttention building in background (PID $SAGE_PID)"
 # 3) Ensure tools available for HF downloads
 need_tools_for_hf
 
-mkdir -p /workspace/logs "$COMFY/output" "$COMFY/cache" "$CUST"
-
 CUST="$COMFY/custom_nodes"
+mkdir -p /workspace/logs "$COMFY/output" "$COMFY/cache" "$CUST"
 
 # ---------- 4) Node set (Hearmeman-equivalent) ----------
 NODES=(
