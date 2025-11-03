@@ -63,25 +63,34 @@ except Exception as e:
     print("opencv import ERROR:", e)
 PY
 
-# --- comfy-cli (after pins so it doesn't drag in conflicting deps) ---
-$PIP install -U comfy-cli
+# ---------- ensure ComfyUI in /workspace (non-interactive, idempotent) ----------
+COMFY_HOME="/workspace/ComfyUI"
+REPO_URL="https://github.com/comfyanonymous/ComfyUI"
+export PATH="/opt/venv/bin:$PATH"
+PY="/opt/venv/bin/python"; PIP="$PY -m pip"
 
-# --- install ComfyUI into COMFY_HOME if missing ---
-if [ ! -f "$COMFY_HOME/main.py" ]; then
-  /opt/venv/bin/comfy --workspace "$COMFY_HOME" install || true
-fi
+mkdir -p /workspace
 
-# --- normalize /ComfyUI → $COMFY_HOME (do NOT clobber data) ---
-if [ -L /ComfyUI ]; then
-  tgt="$(readlink -f /ComfyUI || true)"
-  [ "$tgt" = "$COMFY_HOME" ] || { rm -f /ComfyUI; ln -s "$COMFY_HOME" /ComfyUI; }
-elif [ -d /ComfyUI ] && [ "$COMFY_HOME" != "/ComfyUI" ]; then
-  rsync -aHAX --delete /ComfyUI/ "$COMFY_HOME"/
-  mv /ComfyUI "/ComfyUI.old.$(date +%s)" || true
-  ln -s "$COMFY_HOME" /ComfyUI
-else
-  [ -e /ComfyUI ] || ln -s "$COMFY_HOME" /ComfyUI
-fi
+ensure_comfy() {
+  # If it looks like a valid git checkout, hard-reset it
+  if [ -d "$COMFY_HOME/.git" ] && [ -f "$COMFY_HOME/main.py" ]; then
+    git -C "$COMFY_HOME" fetch --depth=1 origin
+    git -C "$COMFY_HOME" reset --hard origin/master || git -C "$COMFY_HOME" reset --hard origin/main || true
+  else
+    # Anything else (empty/invalid dir) → replace cleanly
+    rm -rf "$COMFY_HOME"
+    git clone --depth=1 "$REPO_URL" "$COMFY_HOME"
+  fi
+
+  # deps (safe to re-run)
+  $PIP install -U pip wheel setuptools
+  [ -f "$COMFY_HOME/requirements.txt" ] && $PIP install -r "$COMFY_HOME/requirements.txt" || true
+
+  # keep /ComfyUI pointing to the workspace copy
+  ln -sfn "$COMFY_HOME" /ComfyUI
+}
+
+ensure_comfy
 
 COMFY=$COMFY_HOME
 CUST="$COMFY/custom_nodes"
