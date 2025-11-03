@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+mkdir -p /workspace
+
 # =========================
 #  Hugging Face helpers
 # =========================
@@ -18,6 +20,18 @@ REPO_URL="https://github.com/comfyanonymous/ComfyUI"
 export COMFY_HOME="${COMFY_HOME:-/workspace/ComfyUI}"
 export COMFY=$COMFY_HOME
 export COMFYUI_PATH=$COMFY_HOME
+
+# =========================
+#  For custom_nodes management
+# =========================
+
+CUSTOM_DIR="${CUSTOM_DIR:-$COMFY_HOME/custom_nodes}"
+CUSTOM_LOG_DIR="${CUSTOM_LOG_DIR:-/workspace/logs/custom_nodes}"
+MAX_NODE_JOBS="${MAX_NODE_JOBS:-8}"         # parallelism cap
+PIP_EXTRA_OPTS="${PIP_EXTRA_OPTS:-}"        # e.g. "--constraint /workspace/pins.txt"
+GIT_DEPTH="${GIT_DEPTH:-1}"                 # 0 means full; 1 is shallow
+
+mkdir -p $CUSTOM_DIR $CUSTOM_LOG_DIR
 
 # Ensure git-lfs etc are present
 need_tools_for_hf() {
@@ -199,11 +213,18 @@ install_node () {
   [ -f "$dest/install.py" ]       && $PY  "$dest/install.py" || true
 }
 
+
+# ==============================================================================================
+# System prerequisites (must be before any torch/extension builds)
+# ==============================================================================================
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y --no-install-recommends \
+  python3.12-dev build-essential ninja-build git curl ca-certificates
+
 # ==============================================================================================
 #  Main entrypoint logic
 # ==============================================================================================
-# --- config ---
-export DEBIAN_FRONTEND=noninteractive
 
 # --- venv & PATH ---
 if [ ! -x /opt/venv/bin/python ]; then
@@ -219,54 +240,148 @@ export PIP_DISABLE_PIP_VERSION_CHECK=1
 export PIP_NO_CACHE_DIR=1
 
 # Base tooling in venv
-$PIP install -U pip wheel setuptools
+$PIP install -U pip wheel setuptools ninja packaging
 
-# ---------- pins & OpenCV cleanup (avoid stray 'cv2' namespace) ----------
-# 0) Remove any OpenCV variants FIRST
-$PIP uninstall -y opencv-python opencv-python-headless opencv-contrib-python opencv-contrib-python-headless >/dev/null 2>&1 || true
-
-# 1) Purge stale cv2 directories that shadow the wheel
-"$PY" - <<'PY'
-import sys, glob, os, shutil
-site = next(p for p in sys.path if p.endswith("site-packages"))
-for p in [os.path.join(site, "cv2"), *glob.glob(os.path.join(site, "cv2*"))]:
-    try:
-        if os.path.isdir(p):
-            shutil.rmtree(p, ignore_errors=True)
-        elif os.path.isfile(p):
-            os.remove(p)
-        print("Removed:", p)
-    except Exception as e:
-        print("Skip:", p, e)
+# ---------- torch first (CUDA 12.8 nightly channel) ----------
+$PIP install --pre torch torchvision torchaudio \
+  --index-url https://download.pytorch.org/whl/nightly/cu128
+$PY - <<'PY'
+import torch; print("torch:", torch.__version__)
 PY
 
-# 2) Pin a compatible trio (CUDA 12.x image):
-$PIP install -U "numpy>=2.0,<2.3"
-$PIP install -U "cupy-cuda12x>=13.0.0"
-$PIP install --no-cache-dir "opencv-contrib-python==4.12.0.88"
-# (If you prefer headless: swap for opencv-contrib-python-headless==4.12.0.88)
+# ---------- GPU arch detect + SageAttention build (arch-aware) ----------
+# Pre-reqs (Python.h, nvcc toolchain, ninja) should already be installed earlier.
+GPU_CC="$($PY - <<'PY'
+import torch, json
+if not torch.cuda.is_available():
+    print("0.0"); raise SystemExit
+d= torch.cuda.get_device_capability(0)  # (major, minor)
+print(f"{d[0]}.{d[1]}")
+PY
+)"
 
-# Quick probe
-"$PY" - <<'PY'
+echo "Detected GPU compute capability: ${GPU_CC}"
+
+# Map CC → sensible arch lists
+case "$GPU_CC" in
+  9.0)  # Hopper (H100)
+    export TORCH_CUDA_ARCH_LIST="9.0;8.9;8.6;8.0"
+    SAGE_GENCODE="-gencode arch=compute_90,code=sm_90"
+    # Try newer first (main), then the Ada commit as fallback
+    SAGE_COMMITS=("main" "68de379")
+    ;;
+  8.9)  # Ada (L40S, RTX 6000 Ada)
+    export TORCH_CUDA_ARCH_LIST="8.9;8.6;8.0"
+    SAGE_GENCODE="-gencode arch=compute_89,code=sm_89"
+    SAGE_COMMITS=("68de379" "main")
+    ;;
+  8.*)  # Ampere (A100=8.0, 3090=8.6, etc.)
+    export TORCH_CUDA_ARCH_LIST="8.6;8.0"
+    SAGE_GENCODE="-gencode arch=compute_86,code=sm_86 -gencode arch=compute_80,code=sm_80"
+    SAGE_COMMITS=("main" "68de379")
+    ;;
+  *)    # Fallback
+    export TORCH_CUDA_ARCH_LIST="8.0"
+    SAGE_GENCODE="-gencode arch=compute_80,code=sm_80"
+    SAGE_COMMITS=("main" "68de379")
+    ;;
+esac
+
+echo "TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}"
+echo "NVCC extra: ${SAGE_GENCODE}"
+
+# Build SageAttention (sequential, with fallbacks)
+echo "Building SageAttention..."
+rm -rf /tmp/SageAttention
+git clone https://github.com/thu-ml/SageAttention.git /tmp/SageAttention
+
+build_sage() {
+  local commit="$1"
+  echo "  -> trying commit: $commit"
+  ( set -e
+    cd /tmp/SageAttention
+    git fetch --all --tags
+    git reset --hard "$commit"
+
+    # Environment to help nvcc/torch extensions:
+    export MAX_JOBS="${MAX_JOBS:-32}"
+    export EXT_PARALLEL="${EXT_PARALLEL:-4}"
+    export NVCC_APPEND_FLAGS="--threads 8"
+    export FORCE_CUDA=1
+    export CXX="${CXX:-g++}"
+    export CC="${CC:-gcc}"
+
+    # Feed explicit gencode flags via env Torch respects:
+    export EXTRA_NVCCFLAGS="${SAGE_GENCODE}"
+
+    # No isolation so it sees torch headers in the venv
+    $PIP install --no-build-isolation -e . 
+  )
+}
+
+SAGE_OK=0
+for c in "${SAGE_COMMITS[@]}"; do
+  if build_sage "$c" 2>&1 | tee /workspace/logs/sage_build_${c}.log; then
+    echo "SageAttention built successfully at commit ${c}"
+    SAGE_OK=1
+    break
+  else
+    echo "SageAttention build failed at commit ${c} — will try next (if any)…"
+  fi
+done
+
+if [ "$SAGE_OK" -ne 1 ]; then
+  echo "FATAL: SageAttention failed to build for CC=${GPU_CC}. See logs in /workspace/logs/sage_build_*.log"
+  # You can choose to exit 1 here, or continue without --use-sage-attention
+  # exit 1
+fi
+
+# ---------- OpenCV cleanup (avoid 'cv2' namespace collisions) ----------
+$PIP uninstall -y opencv-python opencv-python-headless opencv-contrib-python opencv-contrib-python-headless >/dev/null 2>&1 || true
+$PY - <<'PY'
+import sys, os, glob, shutil
+site=[p for p in sys.path if p.endswith("site-packages")]
+if site:
+    site=site[0]
+    for p in [os.path.join(site,"cv2"), *glob.glob(os.path.join(site,"cv2*"))]:
+        try:
+            if os.path.isdir(p): shutil.rmtree(p, ignore_errors=True)
+            elif os.path.isfile(p): os.remove(p)
+            print("Removed:", p)
+        except Exception as e:
+            print("Skip:", p, e)
+PY
+
+# ---------- pin numeric stack (single source of truth) ----------
+cat >/workspace/pins.txt <<'PIN'
+numpy>=2.2,<2.3
+cupy-cuda12x>=13.6.0
+opencv-contrib-python==4.12.0.88
+PIN
+export PIP_EXTRA_OPTS="--constraint /workspace/pins.txt"
+
+$PIP install $PIP_EXTRA_OPTS -U numpy cupy-cuda12x opencv-contrib-python
+$PY - <<'PY'
 import numpy, importlib
 print("numpy:", numpy.__version__)
 try:
     import cupy; print("cupy:", cupy.__version__)
 except Exception as e:
-    print("cupy: ERROR", e)
+    print("cupy ERROR:", e)
 try:
-    import cv2; print("cv2:", getattr(cv2, "__version__", "NO __version__"))
-    if not hasattr(cv2, "__version__"):
-        m = importlib.import_module("cv2.cv2")
-        print("cv2.cv2:", m.__version__)
+    import cv2
+    v=getattr(cv2,"__version__",None)
+    if v is None:
+        cv2=cv2.cv2
+        v=cv2.__version__
+    print("opencv:", v)
 except Exception as e:
-    print("opencv import ERROR:", e)
+    print("opencv ERROR:", e)
 PY
 
-export PATH="/opt/venv/bin:$PATH"
-PY="/opt/venv/bin/python"; PIP="$PY -m pip"
-
-mkdir -p /workspace
+#====================================================================================
+# Ensure ComfyUI present and up-to-date
+#
 
 ensure_comfy() {
   # If it looks like a valid git checkout, hard-reset it
@@ -287,33 +402,17 @@ ensure_comfy() {
   ln -sfn "$COMFY_HOME" /ComfyUI
 }
 
-# 2.5) Build Comfy
+# Build Comfy
 
 ensure_comfy
-
-# ---------- 3) SageAttention (background build, exact commit) ----------
-echo "Starting SageAttention build…"
-(
-  export EXT_PARALLEL=4 NVCC_APPEND_FLAGS="--threads 8" MAX_JOBS=32
-  cd /tmp
-  rm -rf SageAttention
-  git clone https://github.com/thu-ml/SageAttention.git
-  cd SageAttention
-  git reset --hard 68de379
-  pip install -e .
-  echo "done" > /tmp/sage_build_done
-) > /tmp/sage_build.log 2>&1 &
-SAGE_PID=$!
-echo "SageAttention building in background (PID $SAGE_PID)"
 
 # 3) Ensure tools available for HF downloads
 need_tools_for_hf
 
-CUST="$COMFY/custom_nodes"
-mkdir -p /workspace/logs "$COMFY/output" "$COMFY/cache" "$CUST"
+mkdir -p /workspace/logs "$COMFY/output" "$COMFY/cache" "$CUSTOM_DIR" "$CUSTOM_LOG_DIR"
 
-# ---------- 4) Node set (Hearmeman-equivalent) ----------
-NODES=(
+# ---------- 4) Node set ----------
+DEFAULT_NODES=(
   https://github.com/ssitu/ComfyUI_UltimateSDUpscale.git
   https://github.com/kijai/ComfyUI-KJNodes.git
   https://github.com/rgthree/rgthree-comfy.git
@@ -343,11 +442,78 @@ NODES=(
   https://github.com/BadCafeCode/masquerade-nodes-comfyui.git
   https://github.com/1038lab/ComfyUI-RMBG.git
   https://github.com/M1kep/ComfyLiterals.git
-  # extras you added:
   https://github.com/wildminder/ComfyUI-VibeVoice.git
   https://github.com/kijai/ComfyUI-WanAnimatePreprocess.git
 )
-for r in "${NODES[@]}"; do install_node "$r"; done
+# --- Source of truth for nodes ---
+# 1) CUSTOM_NODE_LIST_FILE (one repo per line)
+# 2) CUSTOM_NODE_LIST (space/newline separated)
+# 3) DEFAULT_NODES
+NODES=()
+if [[ -n "${CUSTOM_NODE_LIST_FILE:-}" && -f "${CUSTOM_NODE_LIST_FILE:-}" ]]; then
+  mapfile -t NODES < <(grep -vE '^\s*(#|$)' "$CUSTOM_NODE_LIST_FILE")
+elif [[ -n "${CUSTOM_NODE_LIST:-}" ]]; then
+  # shellcheck disable=SC2206
+  NODES=(${CUSTOM_NODE_LIST})
+else
+  NODES=("${DEFAULT_NODES[@]}")
+fi
+
+# --- Simple semaphore using a named pipe (portable, no GNU parallel needed) ---
+SEM_FIFO="/tmp/.nodes.sem.$$"
+mkfifo "$SEM_FIFO"
+exec 9<>"$SEM_FIFO"
+rm -f "$SEM_FIFO"
+# pre-fill tokens
+for _ in $(seq 1 "$MAX_NODE_JOBS"); do echo >&9; done
+
+# --- Main loop: clone/update + build in parallel, with bounded concurrency ---
+pids=()
+errs=0
+for repo in "${NODES[@]}"; do
+  # sanitize blank/comment
+  [[ -n "$repo" ]] || continue
+  [[ "$repo" =~ ^# ]] && continue
+
+  read -r _ <&9  # acquire token
+
+  (
+    name="$(repo_dir_name "$repo")"
+    dst="$CUSTOM_DIR/$name"
+    rec="$(needs_recursive "$repo")"
+
+    echo "[custom-nodes] $name → $dst"
+    mkdir -p "$dst"
+    clone_or_pull "$repo" "$dst" "$rec"
+
+    # Per-node installation (requirements/install.py)
+    if ! build_node "$dst"; then
+      echo "[custom-nodes] ERROR building $name (see $CUSTOM_LOG_DIR/${name}.log)"
+      exit 1
+    fi
+    echo "[custom-nodes] OK $name"
+  ) &
+  pid=$!
+  pids+=("$pid")
+
+  # release token when job ends
+  {
+    wait "$pid" || errs=$((errs+1))
+    echo >&9
+  } &
+done
+
+# Wait for all release-waiters
+echo "[custom-nodes] Waiting for parallel node installs to complete..."
+wait
+
+# Final status
+if (( errs > 0 )); then
+  echo "[custom-nodes] Completed with $errs error(s). Check logs in: $LOG_DIR"
+  exit 2
+else
+  echo "[custom-nodes] All nodes installed successfully."
+fi
 
 # ---------- 5) VHS preview default (optional) ----------
 if [ "${change_preview_method:-true}" = "true" ]; then
@@ -400,13 +566,6 @@ if [ "${download_wan22:-false}" = "true" ]; then
   dl "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors"              "$DIFF/wan2.2_ti2v_5B_fp16.safetensors"
   dl "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/vae/wan2.2_vae.safetensors"                                    "$VAE/wan2.2_vae.safetensors"
 fi
-
-# ---------- 7) Wait for SageAttention, then launch tmux instances ----------
-echo "Waiting for SageAttention build..."
-for i in $(seq 1 120); do
-  [ -f /tmp/sage_build_done ] && break
-  sleep 2
-done
 
 # Telegram notify helper
 tg() {
