@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+touch /root/.no_auto_tmux
+
 mkdir -p /workspace
 
 # =========================
@@ -227,7 +229,7 @@ build_node() {
   local dst="$1"
   local name
   name="$(basename "$dst")"
-  local log="$LOG_DIR/${name}.log"
+  local log="$CUSTOM_LOG_DIR/${name}.log"
 
   {
     echo "==> [$name] starting at $(date -Is)"
@@ -572,10 +574,10 @@ fi
 
 # ---------- 5) VHS preview default (optional) ----------
 if [ "${change_preview_method:-true}" = "true" ]; then
-  JS="$CUST/ComfyUI-VideoHelperSuite/web/js/VHS.core.js"
+  JS="$CUSTOM_DIR/ComfyUI-VideoHelperSuite/web/js/VHS.core.js"
   [ -f "$JS" ] && sed -i "/id: *'VHS.LatentPreview'/,/defaultValue:/s/defaultValue: false/defaultValue: true/" "$JS" || true
-  mkdir -p "$COMFY/user/default/ComfyUI-Manager"
-  CFG="$COMFY/user/default/ComfyUI-Manager/config.ini"
+  mkdir -p "$COMFY_HOME/user/default/ComfyUI-Manager"
+  CFG="$COMFY_HOME/user/default/ComfyUI-Manager/config.ini"
   if [ ! -f "$CFG" ]; then
     cat >"$CFG" <<'INI'
 [default]
