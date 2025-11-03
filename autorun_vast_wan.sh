@@ -1,9 +1,209 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# =========================
+#  Hugging Face helpers
+# =========================
+export HF_REPO_ID="${HF_REPO_ID:-markwelshboyx/comfyui-bundles}"
+export CN_BRANCH="${CN_BRANCH:-main}"
+export HF_API_BASE="https://huggingface.co"
+export HF_AUTH_HEADER="Authorization: Bearer ${HF_TOKEN:-}"
+
+#  Git repo URL for ComfyUI
+REPO_URL="https://github.com/comfyanonymous/ComfyUI"
+
+# =========================
+#  COMFY config helpers
+# =========================
+export COMFY_HOME="${COMFY_HOME:-/workspace/ComfyUI}"
+export COMFY=$COMFY_HOME
+export COMFYUI_PATH=$COMFY_HOME
+
+# Ensure git-lfs etc are present
+need_tools_for_hf() {
+  apt-get update -y >/dev/null 2>&1 || true
+  apt-get install -y jq git git-lfs >/dev/null 2>&1 || true
+  git lfs install --system || true
+}
+
+# Build a pin signature from the currently active venv
+pins_signature() {
+  "$PY" - <<'PY'
+import importlib, re, sys
+def v(mod, attr="__version__"):
+    try:
+        m = importlib.import_module(mod)
+        return getattr(m, attr, "0.0.0")
+    except Exception:
+        return "0.0.0"
+
+np = v("numpy")
+try:
+    cv = importlib.import_module("cv2")
+    cvv = getattr(cv, "__version__", None)
+    if not cvv or cvv == cv:  # namespace pkg case
+        raise Exception()
+    cv = cvv
+except Exception:
+    cv = "0.0.0"
+
+cp = v("cupy")
+# normalize: replace non [0-9.] with '-' and dots with 'd'
+def norm(s): return re.sub(r'[^0-9\.]+','-',s).replace('.','d')
+sig = f"np{norm(np)}_cupy{norm(cp)}_cv{norm(cv)}"
+print(sig)
+PY
+}
+
+# Resolve list of available files in the repo (JSON) and pick newest matching pins
+hf_latest_bundle_for_pins() {
+  local PINS="$1"
+  local url="$HF_API_BASE/api/models/$HF_REPO_ID/tree/$CN_BRANCH?recursive=1"
+  local json="$(curl -fsSL -H "$HF_AUTH_HEADER" "$url" || true)"
+  [ -n "$json" ] || { echo ""; return 0; }
+  echo "$json" \
+    | jq -r --arg PINS "$PINS" '
+      [ .[] 
+        | select(.type=="file") 
+        | select(.path|test("^bundles/custom_nodes_bundle_\\Q"+$PINS+"\\E_\\d{8}-\\d{4}\\.tgz$"))
+        | .path ] 
+      | sort 
+      | last // "" '
+}
+
+# Download a file from HF to local dest
+hf_download_to() {
+  local REPO_PATH="$1"   # e.g. bundles/custom_nodes_bundle_np2d2d6_cupy13d6d0_cv4d12d0d88_20251103-0943.tgz
+  local DEST="$2"
+  local url="$HF_API_BASE/$HF_REPO_ID/resolve/$CN_BRANCH/$REPO_PATH"
+  aria2c -x16 -s16 -k1M -o "$(basename "$DEST")" -d "$(dirname "$DEST")" "$url"
+}
+
+# Upload (commit) files to HF repo using git+LFS
+hf_push_files() {
+  local TMP="/workspace/.hf_push.$$"
+  local MSG="${1:-"update bundles"}"; shift || true
+  local FILES=( "$@" )
+
+  need_tools_for_hf
+  rm -rf "$TMP"
+  GIT_ASKPASS=/bin/echo git clone "https://oauth2:${HF_TOKEN}@huggingface.co/${HF_REPO_ID}" "$TMP"
+  cd "$TMP"
+  git checkout "$CN_BRANCH" 2>/dev/null || git checkout -b "$CN_BRANCH"
+  mkdir -p bundles
+  for f in "${FILES[@]}"; do
+    cp -f "$f" bundles/
+  done
+  git add bundles
+  git commit -m "$MSG" || true
+  git push origin "$CN_BRANCH"
+}
+
+# Pull a custom_nodes.txt (list of repos) if present; echo the path or empty
+hf_fetch_nodes_list() {
+  local OUT="/workspace/cache/custom_nodes.txt"
+  mkdir -p /workspace/cache
+  local url="$HF_API_BASE/$HF_REPO_ID/resolve/$CN_BRANCH/custom_nodes.txt"
+  if curl -fsSL -H "$HF_AUTH_HEADER" "$url" -o "$OUT"; then
+    echo "$OUT"
+  else
+    echo ""
+  fi
+}
+
+# =========================
+#  Bundling helpers
+# =========================
+# Create manifest + consolidated requirements (skips heavy pins we manage)
+make_nodes_manifest_and_reqs() {
+  local CN="$CUST"
+  local OUTDIR="$1"
+  mkdir -p "$OUTDIR"
+
+  # manifest of repo URLs + commit SHAs
+  "$PY" - <<PY > "$OUTDIR/custom_nodes_manifest.json"
+import os, subprocess, json, glob
+cn = os.environ.get("CUST")
+pins={}
+for g in glob.glob(os.path.join(cn, "*/.git")):
+    repo = os.path.basename(os.path.dirname(g))
+    try:
+        sha = subprocess.check_output(["git","-C",os.path.dirname(g),"rev-parse","HEAD"], text=True).strip()
+        url = subprocess.check_output(["git","-C",os.path.dirname(g),"config","--get","remote.origin.url"], text=True).strip()
+        pins[repo]={"commit":sha,"origin":url}
+    except Exception: pass
+print(json.dumps(pins, indent=2))
+PY
+
+  # consolidate requirements
+  local REQ_ALL="$OUTDIR/_all_requirements.txt"
+  : > "$REQ_ALL"
+  find "$CN" -maxdepth 2 -type f -name requirements.txt -print0 \
+    | xargs -0 -I{} bash -lc "cat '{}' >> '$REQ_ALL'" || true
+
+  # strip heavy/conflicting libs we pin elsewhere
+  grep -vE '^(torch|torchvision|torchaudio|opencv(|-python|-contrib-python|-headless)|cupy(|-cuda.*)|numpy)\b' "$REQ_ALL" \
+    | sed '/^\s*#/d;/^\s*$/d' \
+    | sort -u > "$OUTDIR/consolidated_requirements.txt"
+  rm -f "$REQ_ALL"
+}
+
+# Tar up custom_nodes with a pin-aware name; print full path to tar
+build_custom_nodes_bundle() {
+  local PINS="$1"
+  local TAG="$(date +%Y%m%d-%H%M)"
+  local OUTBASE="/workspace/cache/custom_nodes_bundle_${PINS}_${TAG}"
+  mkdir -p /workspace/cache
+  make_nodes_manifest_and_reqs "/workspace/cache"
+  tar --owner=0 --group=0 --numeric-owner -C "$CUST" -czf "${OUTBASE}.tgz" .
+  sha256sum "${OUTBASE}.tgz" > "${OUTBASE}.tgz.sha256"
+  echo "${OUTBASE}.tgz"
+}
+
+# Extract a bundle into custom_nodes (overlay)
+extract_custom_nodes_bundle() {
+  local TARBALL="$1"
+  mkdir -p "$CUST"
+  tar -xzf "$TARBALL" -C "$CUST"
+}
+
+# Install consolidated requirements (safe with your pins)
+safe_install_consolidated_reqs() {
+  local REQS="/workspace/cache/consolidated_requirements.txt"
+  [ -f "$REQS" ] || return 0
+  $PIP install --no-cache-dir -r "$REQS" || true
+}
+
+# ---------- helper: safe requirements install (keeps pins intact) ----------
+safe_pip_install_reqs() {
+  local req="$1"
+  # Try normal install; tolerate failures and re-pin afterwards to avoid drift
+  $PIP install -r "$req" || true
+  $PIP install -U "numpy>=2.0,<2.3" "cupy-cuda12x>=13.0.0" "opencv-contrib-python==4.12.0.88"
+}
+
+# ---------- Helper to install nodes ----------
+install_node () {
+  local repo="$1"
+  local dest="$CUST/$(basename "$repo" .git)"
+  if [ ! -d "$dest/.git" ]; then
+    if [ "$repo" = "https://github.com/ssitu/ComfyUI_UltimateSDUpscale.git" ]; then
+      git -C "$CUST" clone --recursive "$repo"
+    else
+      git -C "$CUST" clone "$repo"
+    fi
+  else
+    git -C "$dest" pull --rebase || true
+  fi
+  [ -f "$dest/requirements.txt" ] && safe_pip_install_reqs "$dest/requirements.txt" || true
+  [ -f "$dest/install.py" ]       && $PY  "$dest/install.py" || true
+}
+
+# ==============================================================================================
+#  Main entrypoint logic
+# ==============================================================================================
 # --- config ---
 export DEBIAN_FRONTEND=noninteractive
-export COMFY_HOME="${COMFY_HOME:-/workspace/ComfyUI}"
 
 # --- venv & PATH ---
 if [ ! -x /opt/venv/bin/python ]; then
@@ -63,9 +263,6 @@ except Exception as e:
     print("opencv import ERROR:", e)
 PY
 
-# ---------- ensure ComfyUI in /workspace (non-interactive, idempotent) ----------
-COMFY_HOME="/workspace/ComfyUI"
-REPO_URL="https://github.com/comfyanonymous/ComfyUI"
 export PATH="/opt/venv/bin:$PATH"
 PY="/opt/venv/bin/python"; PIP="$PY -m pip"
 
@@ -90,36 +287,31 @@ ensure_comfy() {
   ln -sfn "$COMFY_HOME" /ComfyUI
 }
 
+# 2.5) Build Comfy
+
 ensure_comfy
 
-COMFY=$COMFY_HOME
-CUST="$COMFY/custom_nodes"
+# ---------- 3) SageAttention (background build, exact commit) ----------
+echo "Starting SageAttention build…"
+(
+  export EXT_PARALLEL=4 NVCC_APPEND_FLAGS="--threads 8" MAX_JOBS=32
+  cd /tmp
+  rm -rf SageAttention
+  git clone https://github.com/thu-ml/SageAttention.git
+  cd SageAttention
+  git reset --hard 68de379
+  pip install -e .
+  echo "done" > /tmp/sage_build_done
+) > /tmp/sage_build.log 2>&1 &
+SAGE_PID=$!
+echo "SageAttention building in background (PID $SAGE_PID)"
+
+# 3) Ensure tools available for HF downloads
+need_tools_for_hf
+
 mkdir -p /workspace/logs "$COMFY/output" "$COMFY/cache" "$CUST"
 
-# ---------- helper: safe requirements install (keeps pins intact) ----------
-safe_pip_install_reqs() {
-  local req="$1"
-  # Try normal install; tolerate failures and re-pin afterwards to avoid drift
-  $PIP install -r "$req" || true
-  $PIP install -U "numpy>=2.0,<2.3" "cupy-cuda12x>=13.0.0" "opencv-contrib-python==4.12.0.88"
-}
-
-# ---------- 3) Helper to install nodes ----------
-install_node () {
-  local repo="$1"
-  local dest="$CUST/$(basename "$repo" .git)"
-  if [ ! -d "$dest/.git" ]; then
-    if [ "$repo" = "https://github.com/ssitu/ComfyUI_UltimateSDUpscale.git" ]; then
-      git -C "$CUST" clone --recursive "$repo"
-    else
-      git -C "$CUST" clone "$repo"
-    fi
-  else
-    git -C "$dest" pull --rebase || true
-  fi
-  [ -f "$dest/requirements.txt" ] && safe_pip_install_reqs "$dest/requirements.txt" || true
-  [ -f "$dest/install.py" ]       && $PY  "$dest/install.py" || true
-}
+CUST="$COMFY/custom_nodes"
 
 # ---------- 4) Node set (Hearmeman-equivalent) ----------
 NODES=(
@@ -213,7 +405,7 @@ fi
 # ---------- 7) Wait for SageAttention, then launch tmux instances ----------
 echo "Waiting for SageAttention build..."
 for i in $(seq 1 120); do
-  [ -f /tmp/sage_ok ] && break
+  [ -f /tmp/sage_build_done ] && break
   sleep 2
 done
 
