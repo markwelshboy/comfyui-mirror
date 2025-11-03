@@ -196,6 +196,61 @@ safe_pip_install_reqs() {
   $PIP install -U "numpy>=2.0,<2.3" "cupy-cuda12x>=13.0.0" "opencv-contrib-python==4.12.0.88"
 }
 
+# --- Helper: safe repo name (dir) ---
+repo_dir_name() {
+  # Strip trailing .git, take basename
+  local u="$1"
+  basename "${u%.git}"
+}
+
+# --- Helper: clone or pull (supports recursive for specific repos) ---
+clone_or_pull() {
+  local repo="$1"
+  local dst="$2"
+  local recursive="$3" # "true" or "false"
+  if [[ -d "$dst/.git" ]]; then
+    git -C "$dst" fetch --all --prune --tags --depth="$GIT_DEPTH" || true
+    # Prefer main/master reset
+    git -C "$dst" reset --hard origin/main 2>/dev/null || \
+    git -C "$dst" reset --hard origin/master 2>/dev/null || true
+  else
+    if [[ "$recursive" == "true" ]]; then
+      git -C "$CUSTOM_DIR" clone --recursive ${GIT_DEPTH:+--depth "$GIT_DEPTH"} "$repo" "$dst"
+    else
+      git -C "$CUSTOM_DIR" clone ${GIT_DEPTH:+--depth "$GIT_DEPTH"} "$repo" "$dst"
+    fi
+  fi
+}
+
+# --- Helper: per-node build/install (requirements.txt then install.py) ---
+build_node() {
+  local dst="$1"
+  local name
+  name="$(basename "$dst")"
+  local log="$LOG_DIR/${name}.log"
+
+  {
+    echo "==> [$name] starting at $(date -Is)"
+    if [[ -f "$dst/requirements.txt" ]]; then
+      echo "==> [$name] pip install -r requirements.txt"
+      $PIP install --no-cache-dir $PIP_EXTRA_OPTS -r "$dst/requirements.txt"
+    fi
+    if [[ -f "$dst/install.py" ]]; then
+      echo "==> [$name] python install.py"
+      "$PY" "$dst/install.py"
+    fi
+    echo "==> [$name] done at $(date -Is)"
+  } >"$log" 2>&1
+}
+
+# --- Nodes that require recursive clone (submodules) ---
+needs_recursive() {
+  case "$1" in
+    *ComfyUI_UltimateSDUpscale*) echo "true" ;;
+    *) echo "false" ;;
+  esac
+}
+
 # ---------- Helper to install nodes ----------
 install_node () {
   local repo="$1"
