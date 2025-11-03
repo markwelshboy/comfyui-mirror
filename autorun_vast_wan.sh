@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # --- config ---
-export COMFY_HOME="${COMFY_HOME:-/workspace/ComfyUI}"
 export DEBIAN_FRONTEND=noninteractive
+export COMFY_HOME="${COMFY_HOME:-/workspace/ComfyUI}"
 
 # --- venv & PATH ---
 if [ ! -x /opt/venv/bin/python ]; then
@@ -13,8 +13,58 @@ export PATH="/opt/venv/bin:$PATH"
 PY="/opt/venv/bin/python"
 PIP="$PY -m pip"
 
-# tools in venv (safe if already installed)
-$PIP install -U pip wheel setuptools comfy-cli
+# Keep pip predictable
+export PIP_NO_INPUT=1
+export PIP_DISABLE_PIP_VERSION_CHECK=1
+export PIP_NO_CACHE_DIR=1
+
+# Base tooling in venv
+$PIP install -U pip wheel setuptools
+
+# ---------- pins & OpenCV cleanup (avoid stray 'cv2' namespace) ----------
+# 0) Remove any OpenCV variants FIRST
+$PIP uninstall -y opencv-python opencv-python-headless opencv-contrib-python opencv-contrib-python-headless >/dev/null 2>&1 || true
+
+# 1) Purge stale cv2 directories that shadow the wheel
+"$PY" - <<'PY'
+import sys, glob, os, shutil
+site = next(p for p in sys.path if p.endswith("site-packages"))
+for p in [os.path.join(site, "cv2"), *glob.glob(os.path.join(site, "cv2*"))]:
+    try:
+        if os.path.isdir(p):
+            shutil.rmtree(p, ignore_errors=True)
+        elif os.path.isfile(p):
+            os.remove(p)
+        print("Removed:", p)
+    except Exception as e:
+        print("Skip:", p, e)
+PY
+
+# 2) Pin a compatible trio (CUDA 12.x image):
+$PIP install -U "numpy>=2.0,<2.3"
+$PIP install -U "cupy-cuda12x>=13.0.0"
+$PIP install --no-cache-dir "opencv-contrib-python==4.12.0.88"
+# (If you prefer headless: swap for opencv-contrib-python-headless==4.12.0.88)
+
+# Quick probe
+"$PY" - <<'PY'
+import numpy, importlib
+print("numpy:", numpy.__version__)
+try:
+    import cupy; print("cupy:", cupy.__version__)
+except Exception as e:
+    print("cupy: ERROR", e)
+try:
+    import cv2; print("cv2:", getattr(cv2, "__version__", "NO __version__"))
+    if not hasattr(cv2, "__version__"):
+        m = importlib.import_module("cv2.cv2")
+        print("cv2.cv2:", m.__version__)
+except Exception as e:
+    print("opencv import ERROR:", e)
+PY
+
+# --- comfy-cli (after pins so it doesn't drag in conflicting deps) ---
+$PIP install -U comfy-cli
 
 # --- install ComfyUI into COMFY_HOME if missing ---
 if [ ! -f "$COMFY_HOME/main.py" ]; then
@@ -26,7 +76,6 @@ if [ -L /ComfyUI ]; then
   tgt="$(readlink -f /ComfyUI || true)"
   [ "$tgt" = "$COMFY_HOME" ] || { rm -f /ComfyUI; ln -s "$COMFY_HOME" /ComfyUI; }
 elif [ -d /ComfyUI ] && [ "$COMFY_HOME" != "/ComfyUI" ]; then
-  # migrate then link
   rsync -aHAX --delete /ComfyUI/ "$COMFY_HOME"/
   mv /ComfyUI "/ComfyUI.old.$(date +%s)" || true
   ln -s "$COMFY_HOME" /ComfyUI
@@ -34,25 +83,17 @@ else
   [ -e /ComfyUI ] || ln -s "$COMFY_HOME" /ComfyUI
 fi
 
-
 COMFY=$COMFY_HOME
 CUST="$COMFY/custom_nodes"
 mkdir -p /workspace/logs "$COMFY/output" "$COMFY/cache" "$CUST"
 
-# ---------- 2) SageAttention (pinned) ----------
-if ! $PY -c 'import sageattention' >/dev/null 2>&1; then
-  (
-    set -xe
-    export EXT_PARALLEL=4 NVCC_APPEND_FLAGS="--threads 8" MAX_JOBS=32
-    cd /tmp
-    rm -rf SageAttention
-    git clone https://github.com/thu-ml/SageAttention.git
-    cd SageAttention
-    git reset --hard 68de379
-    $PIP install -e .
-    echo ok > /tmp/sage_ok
-  ) > /workspace/logs/sage_build.log 2>&1 &
-fi
+# ---------- helper: safe requirements install (keeps pins intact) ----------
+safe_pip_install_reqs() {
+  local req="$1"
+  # Try normal install; tolerate failures and re-pin afterwards to avoid drift
+  $PIP install -r "$req" || true
+  $PIP install -U "numpy>=2.0,<2.3" "cupy-cuda12x>=13.0.0" "opencv-contrib-python==4.12.0.88"
+}
 
 # ---------- 3) Helper to install nodes ----------
 install_node () {
@@ -67,7 +108,7 @@ install_node () {
   else
     git -C "$dest" pull --rebase || true
   fi
-  [ -f "$dest/requirements.txt" ] && $PIP install --no-cache-dir -r "$dest/requirements.txt" || true
+  [ -f "$dest/requirements.txt" ] && safe_pip_install_reqs "$dest/requirements.txt" || true
   [ -f "$dest/install.py" ]       && $PY  "$dest/install.py" || true
 }
 
