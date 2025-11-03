@@ -1,43 +1,41 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ---------- 0) OS + Python/venv ----------
+# --- config ---
+export COMFY_HOME="${COMFY_HOME:-/workspace/ComfyUI}"
 export DEBIAN_FRONTEND=noninteractive
-apt-get update
-apt-get install -y --no-install-recommends \
-  python3.12 python3.12-venv python3-pip \
-  git git-lfs curl aria2 ffmpeg ninja-build build-essential gcc \
-  libgl1 libglib2.0-0 tmux vim google-perftools rsync
 
-git lfs install --system || true
-
-# venv and tool shims
-if [ ! -d /opt/venv ]; then
+# --- venv & PATH ---
+if [ ! -x /opt/venv/bin/python ]; then
   python3.12 -m venv /opt/venv
 fi
 export PATH="/opt/venv/bin:$PATH"
-PY="python"
-PIP="python -m pip"
+PY="/opt/venv/bin/python"
+PIP="$PY -m pip"
 
-$PY -m pip install -U pip wheel setuptools
-$PIP install -U comfy-cli
+# tools in venv (safe if already installed)
+$PIP install -U pip wheel setuptools comfy-cli
 
-# ---------- 1) Workspace + ComfyUI normalization ----------
-mkdir -p /workspace
-# If comfy-cli didn’t install yet, install/restore to /ComfyUI (root)
-if [ ! -d /ComfyUI ] && [ ! -d /workspace/ComfyUI ]; then
-  /opt/venv/bin/comfy --workspace /ComfyUI install --restore || true
+# --- install ComfyUI into COMFY_HOME if missing ---
+if [ ! -f "$COMFY_HOME/main.py" ]; then
+  /opt/venv/bin/comfy --workspace "$COMFY_HOME" install || true
 fi
 
-# Move to /workspace and keep a symlink at /ComfyUI
-if [ -d /ComfyUI ] && [ ! -e /workspace/ComfyUI ]; then
-  rsync -aHAX --delete /ComfyUI/ /workspace/ComfyUI/
-  mv /ComfyUI /ComfyUI.old || true
-  ln -s /workspace/ComfyUI /ComfyUI
+# --- normalize /ComfyUI → $COMFY_HOME (do NOT clobber data) ---
+if [ -L /ComfyUI ]; then
+  tgt="$(readlink -f /ComfyUI || true)"
+  [ "$tgt" = "$COMFY_HOME" ] || { rm -f /ComfyUI; ln -s "$COMFY_HOME" /ComfyUI; }
+elif [ -d /ComfyUI ] && [ "$COMFY_HOME" != "/ComfyUI" ]; then
+  # migrate then link
+  rsync -aHAX --delete /ComfyUI/ "$COMFY_HOME"/
+  mv /ComfyUI "/ComfyUI.old.$(date +%s)" || true
+  ln -s "$COMFY_HOME" /ComfyUI
+else
+  [ -e /ComfyUI ] || ln -s "$COMFY_HOME" /ComfyUI
 fi
-[ -e /ComfyUI ] || ln -s /workspace/ComfyUI /ComfyUI
 
-COMFY="/ComfyUI"
+
+COMFY=$COMFY_HOME
 CUST="$COMFY/custom_nodes"
 mkdir -p /workspace/logs "$COMFY/output" "$COMFY/cache" "$CUST"
 
