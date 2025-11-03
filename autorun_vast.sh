@@ -47,7 +47,16 @@ pip install packaging pyyaml gdown triton comfy-cli \
 # ------------------------
 # 3) Install ComfyUI to /ComfyUI (as your scripts expect)
 # ------------------------
-/usr/bin/yes | comfy --workspace /ComfyUI install || true
+/usr/bin/yes | comfy --workspace ComfyUI install || true
+
+# Normalize ComfyUI location to /workspace with a symlink at /ComfyUI
+mkdir -p /workspace
+if [ -d /ComfyUI ] && [ ! -e /workspace/ComfyUI ]; then
+  rsync -aHAX --delete /ComfyUI/ /workspace/ComfyUI/
+  mv /ComfyUI /ComfyUI.old || true
+  ln -s /workspace/ComfyUI /ComfyUI
+fi
+[ -e /ComfyUI ] || ln -s /workspace/ComfyUI /ComfyUI
 
 # ------------------------
 # 4) Run your bootstrap (does downloads, nodes, etc.)
