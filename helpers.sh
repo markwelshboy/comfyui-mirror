@@ -252,7 +252,7 @@ build_node() {
     echo "==> [$name] starting at $(date -Is)"
     if [[ -f "$dst/requirements.txt" ]]; then
       echo "==> [$name] pip install -r requirements.txt"
-      $PIP install --no-cache-dir $PIP_EXTRA_OPTS -r "$dst/requirements.txt"
+      $PIP install --no-cache-dir -r "$dst/requirements.txt"
     fi
     if [[ -f "$dst/install.py" ]]; then
       echo "==> [$name] python install.py"

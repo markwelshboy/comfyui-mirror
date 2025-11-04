@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 export PATH="/opt/venv/bin:$PATH"
-BASE=/ComfyUI
-LOGS=/workspace/logs
-mkdir -p "$LOGS" "$BASE/output" "$BASE/cache"
+BASE=${COMFY_DIR}
+LOGS=${COMFY_LOGS}
 
 /usr/bin/printf "GPUs: "
 python - <<'PY'
