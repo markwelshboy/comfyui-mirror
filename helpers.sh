@@ -758,7 +758,7 @@ helpers_start_aria2_daemon() {
     --summary-interval=0 \
     --show-console-readout=false \
     --console-log-level=warn \
-    --log="$LOG_DIR/aria2.log" --log-level=notice
+    --log="$COMFY_LOGS/aria2.log" --log-level=notice
 }
 
 # Resolve {VARNAME} placeholders against a JSON map
