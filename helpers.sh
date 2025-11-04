@@ -289,9 +289,7 @@ resolve_nodes_list() {
   fi
 }
 
-# install_custom_nodes_set: bounded parallel installer
-#   Optional: install_custom_nodes_set MY_NODE_ARRAY
-# install_custom_nodes_set: bounded parallel installer
+# install_custom_nodes_set: bounded parallel installer (wait -n throttle, no FIFOs)
 #   Usage: install_custom_nodes_set NODES_ARRAY_NAME
 install_custom_nodes_set() {
   local src_name="${1:-}"
@@ -304,41 +302,34 @@ install_custom_nodes_set() {
   fi
 
   echo "[custom-nodes] install_custom_nodes_set(): ${#NODES_LIST[@]} node(s)"
-
   mkdir -p "${CUSTOM_DIR:?}" "${CUSTOM_LOG_DIR:?}"
+
+  # Concurrency
   local max_jobs="${MAX_NODE_JOBS:-8}"
-  if ! [[ "$max_jobs" =~ ^[0-9]+$ ]] || (( max_jobs < 1 )); then
-    max_jobs=8
-  fi
+  if ! [[ "$max_jobs" =~ ^[0-9]+$ ]] || (( max_jobs < 1 )); then max_jobs=8; fi
   echo "[custom-nodes] Using concurrency: ${max_jobs}"
 
-  # robust two-FD FIFO semaphore
-  local SEM="/tmp/.nodes.sem.$$"
-  mkfifo "$SEM"
-  exec 9<"$SEM"      # read-only
-  exec 10>"$SEM"     # write-only
-  rm -f "$SEM"
-  for _ in $(seq 1 "$max_jobs"); do printf . >&10; done
-  echo "[custom-nodes] Filled FIFO semaphore with ${max_jobs} tokens."
+  # Harden git so it never prompts (prompts can look like a 'hang')
+  export GIT_TERMINAL_PROMPT=0
+  export GIT_ASKPASS=/bin/echo
 
-  local -a pids=()
+  local running=0
   local errs=0
+  local -a pids=()
 
   echo "[custom-nodes] Starting iterations over NODE_LIST."
   for repo in "${NODES_LIST[@]}"; do
     [[ -n "$repo" ]] || continue
     [[ "$repo" =~ ^# ]] && continue
 
-    # acquire token
-    read -r _ <&9
+    # If we're at the limit, wait for one job to finish
+    if (( running >= max_jobs )); then
+      if ! wait -n; then errs=$((errs+1)); fi
+      running=$((running-1))
+    fi
 
     (
-      # always release a token when this subshell exits
-      release() { printf . >&10; }
-      trap release EXIT
       set -e
-
-      local name dst rec
       name="$(repo_dir_name "$repo")"
       dst="$CUSTOM_DIR/$name"
       rec="$(needs_recursive "$repo")"
@@ -346,7 +337,7 @@ install_custom_nodes_set() {
       echo "[custom-nodes] START $name → $dst"
       mkdir -p "$dst"
 
-      GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/echo clone_or_pull "$repo" "$dst" "$rec"
+      clone_or_pull "$repo" "$dst" "$rec"
 
       if ! build_node "$dst"; then
         echo "[custom-nodes] ERROR $name (see ${CUSTOM_LOG_DIR}/${name}.log)"
@@ -355,19 +346,17 @@ install_custom_nodes_set() {
 
       echo "[custom-nodes] OK $name"
     ) &
+
     pids+=("$!")
+    running=$((running+1))
   done
 
   echo "[custom-nodes] Waiting for parallel node installs to complete…"
-  local pid
-  for pid in "${pids[@]}"; do
-    if ! wait "$pid"; then
-      errs=$((errs+1))
-    fi
+  # Wait for remaining jobs
+  while (( running > 0 )); do
+    if ! wait -n; then errs=$((errs+1)); fi
+    running=$((running-1))
   done
-
-  # close semaphore FDs
-  exec 9>&- 10>&-
 
   if (( errs > 0 )); then
     echo "[custom-nodes] Completed with ${errs} error(s). Check logs: $CUSTOM_LOG_DIR"
