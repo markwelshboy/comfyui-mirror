@@ -319,10 +319,12 @@ install_custom_nodes_set() {
   exec 10>"$SEM"     # write-only
   rm -f "$SEM"
   for _ in $(seq 1 "$max_jobs"); do printf . >&10; done
+  echo "[custom-nodes] Filled FIFO semaphore with ${max_jobs} tokens."
 
   local -a pids=()
   local errs=0
 
+  echo "[custom-nodes] Starting iterations over NODE_LIST."
   for repo in "${NODES_LIST[@]}"; do
     [[ -n "$repo" ]] || continue
     [[ "$repo" =~ ^# ]] && continue
