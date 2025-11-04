@@ -230,6 +230,8 @@ fi
 # -- Default/fallback nodes (must be exported before helpers that resolve lists)
 export DEFAULT_NODES=(
   https://github.com/ssitu/ComfyUI_UltimateSDUpscale.git
+  https://github.com/chflame163/ComfyUI_LayerStyle.git
+  https://github.com/chflame163/ComfyUI_LayerStyle_Advance.git
   https://github.com/kijai/ComfyUI-KJNodes.git
   https://github.com/rgthree/rgthree-comfy.git
   https://github.com/JPS-GER/ComfyUI_JPS-Nodes.git
@@ -246,7 +248,6 @@ export DEFAULT_NODES=(
   https://github.com/theUpsider/ComfyUI-Logic.git
   https://github.com/cubiq/ComfyUI_essentials.git
   https://github.com/chrisgoringe/cg-image-picker.git
-  https://github.com/chflame163/ComfyUI_LayerStyle.git
   https://github.com/chrisgoringe/cg-use-everywhere.git
   https://github.com/kijai/ComfyUI-segment-anything-2.git
   https://github.com/ClownsharkBatwing/RES4LYF
@@ -254,7 +255,6 @@ export DEFAULT_NODES=(
   https://github.com/Fannovel16/ComfyUI-Frame-Interpolation.git
   https://github.com/Jonseed/ComfyUI-Detail-Daemon.git
   https://github.com/kijai/ComfyUI-WanVideoWrapper.git
-  https://github.com/chflame163/ComfyUI_LayerStyle_Advance.git
   https://github.com/BadCafeCode/masquerade-nodes-comfyui.git
   https://github.com/1038lab/ComfyUI-RMBG.git
   https://github.com/M1kep/ComfyLiterals.git
@@ -288,11 +288,9 @@ mkdir -p "$DIFFUSION_MODELS_DIR" "$TEXT_ENCODERS_DIR" "$CLIP_VISION_DIR" "$VAE_D
 #  6.1) Huggingface Model downloader from manifest (uses helpers.sh)
 #===============================================================================================
 
-helpers_run_downloads() {
-  helpers_download_from_manifest
-  # Run snapshot loop in foreground (or background by appending &)
-  helpers_progress_snapshot_loop "$ARIA_PROGRESS_INTERVAL" "$ARIA_PROGRESS_BAR_WIDTH" "$LOG_DIR/aria2_progress.log"
-}
+helpers_download_from_manifest
+# Run snapshot loop in foreground (or background by appending &)
+helpers_progress_snapshot_loop "$ARIA_PROGRESS_INTERVAL" "$ARIA_PROGRESS_BAR_WIDTH" "$LOG_DIR/aria2_progress.log"
 
 #===============================================================================================
 #  6.2) CivitAI model downloader
@@ -325,7 +323,8 @@ echo "✅ All models downloaded successfully!"
 echo "Renaming loras downloaded as zip files to safetensors files...."
 cd $LORAS_DIR
 for file in *.zip; do
-    mv "$file" "${file%.zip}.safetensors"
+  echo "Renaming $file to ${file%.zip}.safetensors"
+  mv "$file" "${file%.zip}.safetensors"
 done
 # Return to workspace
 cd /workspace
