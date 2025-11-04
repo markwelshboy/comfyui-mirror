@@ -70,6 +70,21 @@ die(){ echo "FATAL: $*" >&2; exit 1; }
 # ensure CMD exists or die
 need(){ command -v "$1" >/dev/null 2>&1 || die "Missing tool: $1"; }
 
+# -------------------------- #
+#  Path + directory helpers  #
+# -------------------------- #
+
+ensure_dirs(){
+  mkdir -p \
+    "${COMFY_HOME:?}" \
+    "${CUSTOM_DIR:?}" \
+    "${CUSTOM_LOG_DIR:?}" \
+    "${OUTPUT_DIR:?}" \
+    "${CACHE_DIR:?}" \
+    "${BUNDLES_DIR:?}" \
+    "${COMFY_LOGS:?}"
+}
+
 # ------------------------- #
 #  Workflows / Icons import #
 # ------------------------- #
