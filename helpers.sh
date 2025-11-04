@@ -488,11 +488,11 @@ install_custom_nodes_set() {
       clone_or_pull "$repo" "$dst" "$rec"
 
       if ! build_node "$dst"; then
-        echo "[custom-nodes] Install ERROR $name (see ${CUSTOM_LOG_DIR}/${name}.log)"
+        echo "[custom-nodes] ❌ Install ERROR $name (see ${CUSTOM_LOG_DIR}/${name}.log)"
         exit 1
       fi
 
-      echo "[custom-nodes] Completed install for: $name"
+      echo "[custom-nodes] ✅ Completed install for: $name"
     ) &
 
     pids+=("$!")
@@ -507,10 +507,10 @@ install_custom_nodes_set() {
   done
 
   if (( errs > 0 )); then
-    echo "[custom-nodes] Completed with ${errs} error(s). Check logs: $CUSTOM_LOG_DIR"
+    echo "[custom-nodes] ❌ Completed with ${errs} error(s). Check logs: $CUSTOM_LOG_DIR"
     return 2
   else
-    echo "[custom-nodes] All nodes installed successfully."
+    echo "[custom-nodes] ✅ All nodes installed successfully."
   fi
 }
 
@@ -714,4 +714,369 @@ push_bundle_if_requested() {
   sha="${CACHE_DIR}/$(sha_name "$base")"
   hf_push_files "bundle ${base}" "$tarpath" "$sha" "$manifest" "$reqs"
   echo "Uploaded bundle [$base]"
+}
+
+#=====================================================================
+# Section 5: Aria2-Based Model Downloads (uses json manifest)
+#===================================================================== 
+
+# ---------- .env loader (optional) ----------
+helpers_load_dotenv() {
+  local file="${1:-.env}"
+  [ -f "$file" ] || return 0
+  # export all non-comment lines
+  set -a
+  # shellcheck disable=SC1090
+  . "$file"
+  set +a
+}
+
+# ---------- Internals ----------
+_helpers_need() { command -v "$1" >/dev/null || { echo "Missing $1" >&2; exit 1; }; }
+
+_helpers_tok_json() {
+  if [[ -n "$ARIA2_SECRET" ]]; then printf '"token:%s",' "$ARIA2_SECRET"; fi
+}
+
+helpers_have_aria2_rpc() {
+  curl -s "http://${ARIA2_HOST}:${ARIA2_PORT}/jsonrpc" -H 'Content-Type: application/json' \
+    --data '{"jsonrpc":"2.0","id":"ping","method":"aria2.getVersion","params":[]}' \
+    | jq -e '.result.version?|length>0' >/dev/null 2>&1
+}
+
+helpers_start_aria2_daemon() {
+  echo "▶ Starting aria2 RPC daemon…"
+  aria2c \
+    --enable-rpc \
+    ${ARIA2_SECRET:+--rpc-secret="$ARIA2_SECRET"} \
+    --rpc-listen-port="$ARIA2_PORT" \
+    --rpc-listen-all=false \
+    --daemon=true \
+    --max-concurrent-downloads="$ARIA2_MAX_CONC" \
+    --continue=true \
+    --file-allocation="$ARIA2_FALLOC" \
+    --summary-interval=0 \
+    --show-console-readout=false \
+    --console-log-level=warn \
+    --log="$LOG_DIR/aria2.log" --log-level=notice
+}
+
+# Resolve {VARNAME} placeholders against a JSON map
+helpers_resolve_placeholders() {
+  local string="$1" map_json="$2"
+  jq -nr --arg s "$string" --argjson map "$map_json" '
+    def subvars($m):
+      reduce ($m|to_entries[]) as $e ($s; gsub("\\{"+($e.key)+"\\}"; ($e.value|tostring)) );
+    $s | subvars($map)
+  '
+}
+
+# Quick size/partial cleanup; returns 0 if should download, 1 if skip
+helpers_ensure_target_ready() {
+  local full_path="$1"
+  local sz
+  mkdir -p "$(dirname -- "$full_path")"
+  if [[ -f "$full_path" ]]; then
+    sz=$(stat -c%s "$full_path" 2>/dev/null || stat -f%z "$full_path" 2>/dev/null || echo 0)
+    if (( sz > 10485760 )); then
+      echo "✅ $(basename -- "$full_path") exists (${sz}B), skipping."
+      return 1
+    else
+      echo "🗑️  Deleting small/partial file: $full_path"
+      rm -f -- "$full_path"
+    fi
+  fi
+  [[ -f "${full_path}.aria2" ]] && rm -f -- "${full_path}.aria2" || true
+  return 0
+}
+
+# Enqueue single item via RPC
+helpers_rpc_add_uri() {
+  local url="$1" dir="$2" out="$3" checksum="${4:-}"
+  local headers_json='[]'
+  if [[ -n "$HF_TOKEN" ]]; then
+    headers_json='["Authorization: Bearer '"$HF_TOKEN"'"]'
+  fi
+
+  local opt
+  opt="$(jq -n \
+      --arg dir "$dir" \
+      --arg out "$out" \
+      --arg split "$ARIA2_SPLIT" \
+      --arg mconn "$ARIA2_MCONN" \
+      --arg chunk "$ARIA2_CHUNK" \
+      --arg fa "$ARIA2_FALLOC" \
+      --argjson hdrs "$headers_json" \
+      --arg chk "$checksum" \
+      '{
+         dir: $dir, out: $out, continue: "true",
+         split: $split, "max-connection-per-server": $mconn,
+         "min-split-size": $chunk, "file-allocation": $fa,
+         header: $hdrs
+       } + ( $chk|length>0 ? {checksum: ("sha-256=" + $chk)} : {} )'
+    )"
+
+  curl -s "http://${ARIA2_HOST}:${ARIA2_PORT}/jsonrpc" -H 'Content-Type: application/json' \
+    --data "$(jq -n \
+      --argjson prefix "[$(_helpers_tok_json)]" \
+      --arg url "$url" \
+      --argjson opt "$opt" \
+      '{jsonrpc:"2.0",id:"add",method:"aria2.addUri",
+        params: ( ($prefix|map(select(.!=null))) + [[ $url ]] + [ $opt ] ) }'
+    )" >/dev/null
+}
+
+# ---------- MAIN: download selected sections from manifest ----------
+helpers_download_from_manifest() {
+  _helpers_need curl; _helpers_need jq; _helpers_need awk
+
+  if [[ -z "${MODEL_MANIFEST_URL:-}" ]]; then
+    echo "MODEL_MANIFEST_URL is not set." >&2; return 1
+  fi
+
+  local MAN; MAN="$(mktemp)"
+  curl -fsSL "$MODEL_MANIFEST_URL" -o "$MAN"
+
+  # Build placeholder map = vars + paths + current env (env can override)
+  local VARS_JSON
+  VARS_JSON="$(
+    jq -n --slurpfile m "$MAN" '
+      ($m[0].vars // {}) as $v
+      | ($m[0].paths // {}) as $p
+      | ($v + $p)
+    '
+  )"
+  # merge uppercase env into map
+  while IFS='=' read -r k v; do
+    [[ "$k" =~ ^[A-Z0-9_]+$ ]] || continue
+    VARS_JSON="$(jq --arg k "$k" --arg v "$v" '. + {($k):$v}' <<<"$VARS_JSON")"
+  done < <(env)
+
+  # Which sections are enabled? either export <section>=true or download_<section>=true
+  local SECTIONS_ALL ENABLED sec
+  SECTIONS_ALL="$(jq -r '.sections | keys[]' "$MAN")"
+  ENABLED=()
+  while read -r sec; do
+    # e.g. export wan22=true OR export download_wan22=true
+    if [[ "${!sec:-}" == "true" || "${!sec:-}" == "1" ]]; then ENABLED+=("$sec"); fi
+    local dl_var="download_${sec}"
+    if [[ "${!dl_var:-}" == "true" || "${!dl_var:-}" == "1" ]]; then ENABLED+=("$sec"); fi
+  done <<<"$SECTIONS_ALL"
+
+  # dedupe ENABLED
+  if ((${#ENABLED[@]}==0)); then
+    echo "No sections enabled. Available:"; echo "$SECTIONS_ALL" | sed 's/^/  - /'
+    return 0
+  fi
+  mapfile -t ENABLED < <(printf '%s\n' "${ENABLED[@]}" | awk '!seen[$0]++')
+
+  helpers_have_aria2_rpc || helpers_start_aria2_daemon
+
+  local url raw_path checksum path dir out
+  for sec in "${ENABLED[@]}"; do
+    echo ">>> Enqueue section: $sec"
+    jq -r --arg sec "$sec" '
+      (.sections[$sec] // [])[]
+      | [.url, (.path // ((.dir // "") + (if .out then "/" + .out else "" end))), (.sha256 // "")]
+      | @tsv
+    ' "$MAN" | while IFS=$'\t' read -r url raw_path checksum; do
+          [[ -z "$url" || -z "$raw_path" ]] && continue
+          path="$(helpers_resolve_placeholders "$raw_path" "$VARS_JSON")"
+          dir="$(dirname -- "$path")"
+          out="$(basename -- "$path")"
+          mkdir -p -- "$dir"
+
+          if helpers_ensure_target_ready "$path"; then
+            echo "📥 Queue: $(basename -- "$path")"
+            helpers_rpc_add_uri "$url" "$dir" "$out" "${checksum:-}"
+          fi
+       done
+  done
+
+  echo "✅ Enqueued selected sections."
+}
+
+# ---------- Progress snapshots (append-friendly; no clear by default) ----------
+helpers_progress_snapshot_loop() {
+  _helpers_need curl; _helpers_need jq; _helpers_need awk
+  local interval="${1:-$ARIA2_PROGRESS_INTERVAL}"
+  local barw="${2:-$ARIA2_PROGRESS_BAR_WIDTH}"
+  local outlog="${3:-$LOG_DIR/aria2_progress.log}"
+
+  local maybe_clear=""
+  if [[ "$ARIA2_PROGRESS_CLEAR" == "1" && -t 1 ]]; then maybe_clear="$(tput clear 2>/dev/null || true)"; fi
+
+  local keys='["gid","status","totalLength","completedLength","downloadSpeed","files"]'
+
+  human_bytes() {
+    awk 'function h(x){s="B KB MB GB TB PB";split(s,a," ");i=1;while(x>=1024&&i<6){x/=1024;i++}
+         return (i==1 ? sprintf("%d %s",x,a[i]) : sprintf("%.2f %s",x,a[i]))} {print h($1)}'
+  }
+
+  print_bar() {
+    local pct="$1" width="$2"
+    local filled=$(( (pct*width)/100 )); local empty=$(( width - filled ))
+    printf "[%s%s]" "$(printf '█%.0s' $(seq 1 $filled))" "$(printf ' %.0s' $(seq 1 $empty))"
+  }
+
+  while :; do
+    {
+      [[ -n "$maybe_clear" ]] && printf '%s' "$maybe_clear"
+      echo "=== aria2 progress @ $(date '+%Y-%m-%d %H:%M:%S') ==="
+
+      ACTIVE_JSON="$(curl -s "http://${ARIA2_HOST}:${ARIA2_PORT}/jsonrpc" -H 'Content-Type: application/json' \
+        --data "{ \"jsonrpc\":\"2.0\",\"id\":\"a\",\"method\":\"aria2.tellActive\",\"params\":[ $(_helpers_tok_json) $keys ] }")"
+
+      count="$(jq '.result|length' <<<"$ACTIVE_JSON")"
+      echo "Active (${count})"
+      echo "--------------------------------------------------------------------------------"
+
+      total_speed=0; total_done=0; total_size=0
+      jq -r '
+        .result[]
+        | {
+            status, total: (.totalLength|tonumber? // 0),
+              done: (.completedLength|tonumber? // 0),
+             speed: (.downloadSpeed|tonumber? // 0),
+              name: ( .files[0].path // .files[0].uris[0].uri // "unknown" )
+          }
+        | @tsv
+      ' <<<"$ACTIVE_JSON" | while IFS=$'\t' read -r status total done speed name; do
+          pct=0; [[ "$total" -gt 0 ]] && pct=$(( (done*100)/total ))
+          bar="$(print_bar "$pct" "$barw")"
+          sh="$(printf "%s/s" "$(printf "%s" "$speed" | human_bytes)")"
+          dh="$(printf "%s" "$done" | human_bytes)"
+          th="$(printf "%s" "$total" | human_bytes)"
+          printf "%-50.50s  %3d%% %s  %8s  (%s / %s)\n" "$(basename "$name")" "$pct" "$bar" "$sh" "$dh" "$th"
+
+          total_speed=$(( total_speed + speed ))
+          total_done=$(( total_done + done ))
+          total_size=$(( total_size + total ))
+        done
+
+      sp="$(printf "%s/s" "$(printf "%s" "$total_speed" | human_bytes)")"
+      dsum="$(printf "%s" "$total_done" | human_bytes)"
+      tsum="$(printf "%s" "$total_size" | human_bytes)"
+      echo "--------------------------------------------------------------------------------"
+      echo "Group total: speed ${sp}, done ${dsum} / ${tsum}"
+      echo
+    } >>"$outlog"
+
+    # exit when idle (no active and no waiting)
+    active_count="$(jq '.result | length' <<<"$ACTIVE_JSON")"
+    WAITING_JSON="$(curl -s "http://${ARIA2_HOST}:${ARIA2_PORT}/jsonrpc" -H 'Content-Type: application/json' \
+        --data "{ \"jsonrpc\":\"2.0\",\"id\":\"w\",\"method\":\"aria2.tellWaiting\",\"params\":[ $(_helpers_tok_json) 0,1, $keys ] }")"
+    waiting_count="$(jq '.result | length' <<<"$WAITING_JSON")"
+
+    if [[ "$active_count" -eq 0 && "$waiting_count" -eq 0 ]]; then
+      echo "All downloads are idle/finished." >>"$outlog"
+      break
+    fi
+    sleep "$interval"
+  done
+}
+
+# ---------- CivitAI ID downloader (via /usr/local/bin/download_with_aria.py) ----------
+# Env it uses (override in .env):
+: "${CHECKPOINT_IDS_TO_DOWNLOAD:=}"     # e.g. "12345, 67890"
+: "${LORAS_IDS_TO_DOWNLOAD:=}"          # e.g. "abc, def ghi"
+: "${CIVITAI_LOG_DIR:=${LOG_DIR:-/workspace/logs}/civitai}"
+
+# Split a comma/space/newline-separated list, dedupe, echo one-per-line
+_helpers_split_ids() {
+  local s="${1:-}"
+  # drop placeholder tokens
+  s="${s//replace_with_ids/}"
+  # unify separators (comma/newline->space), trim
+  s="$(printf '%s' "$s" | tr ',\n' '  ' | xargs -n1 echo | sed '/^$/d')"
+  # dedupe, preserve order
+  awk '!seen[$0]++' <<<"$s"
+}
+
+# Run a command with a simple concurrency gate
+_helpers_gate() {
+  local -n _count_ref=$1
+  local max="${2:-6}"
+  while (( _count_ref >= max )); do
+    wait -n || true
+    ((_count_ref--))
+  done
+}
+
+# Main entry: schedule CivitAI downloads by IDs into target dirs.
+# You may pass an explicit mapping; otherwise it uses checkpoints/loras envs.
+# Usage:
+#   helpers_download_civitai_ids
+#   helpers_download_civitai_ids "/path/A:ID1 ID2" "/path/B:ID3,ID4"
+helpers_download_civitai_ids() {
+  command -v download_with_aria.py >/dev/null || {
+    echo "❌ /usr/local/bin/download_with_aria.py not found/executable" >&2
+    return 1
+  }
+
+  declare -A map=()
+
+  if (( $# > 0 )); then
+    # Accept arguments like: "/target/dir1:IDa,IDb" "/target/dir2:IDc IDd"
+    local pair dir ids
+    for pair in "$@"; do
+      dir="${pair%%:*}"; ids="${pair#*:}"
+      map["$dir"]="$ids"
+    done
+  else
+    # Default mapping from env
+    map["$COMFY_HOME/models/checkpoints"]="$CHECKPOINT_IDS_TO_DOWNLOAD"
+    map["$COMFY_HOME/models/loras"]="$LORAS_IDS_TO_DOWNLOAD"
+  fi
+
+  local total=0 running=0 started=0 pids=()
+
+  for TARGET_DIR in "${!map[@]}"; do
+    mkdir -p "$TARGET_DIR"
+    ids_raw="${map[$TARGET_DIR]}"
+
+    # Skip empty or placeholder
+    if [[ -z "${ids_raw// }" ]]; then
+      echo "⏭️  No IDs set for $TARGET_DIR"
+      continue
+    fi
+
+    echo "📦 Target: $TARGET_DIR"
+    while IFS= read -r MODEL_ID; do
+      [[ -z "$MODEL_ID" ]] && continue
+
+      # Gate concurrency
+      _helpers_gate running "$ARIA2_MAX_CONC"
+
+      # Per-ID log
+      safe_id="${MODEL_ID//[^A-Za-z0-9._-]/_}"
+      logfile="${CIVITAI_LOG_DIR}/$(basename "$TARGET_DIR")_${safe_id}.log"
+
+      (
+        cd "$TARGET_DIR"
+        echo "🚀 [$MODEL_ID] → $TARGET_DIR"
+        # If your downloader supports API tokens, export here (example):
+        # export CIVITAI_TOKEN=...
+        download_with_aria.py -m "$MODEL_ID" >"$logfile" 2>&1
+        rc=$?
+        if (( rc == 0 )); then
+          echo "✅ [$MODEL_ID] done"
+        else
+          echo "❌ [$MODEL_ID] failed (rc=$rc) — see $logfile"
+        fi
+      ) &
+
+      pids+=($!)
+      ((running++))
+      ((started++))
+      ((total++))
+      # small jitter to avoid thundering herd
+      sleep 0.2
+    done < <(_helpers_split_ids "$ids_raw")
+  done
+
+  echo "📋 Scheduled ${started} download(s). Waiting…"
+  # Drain remaining jobs
+  for pid in "${pids[@]}"; do wait "$pid" || true; done
+  echo "✅ CivitAI batch complete. Logs: ${CIVITAI_LOG_DIR}"
 }

@@ -27,7 +27,9 @@ apt-get install -y --no-install-recommends \
   python3.12 python3.12-venv python3.12-dev python3-pip \
   build-essential ninja-build pkg-config cmake gcc g++ \
   git git-lfs curl ca-certificates \
-  ffmpeg libgl1 libglib2.0-0
+  ffmpeg libgl1 libglib2.0-0 \
+  aria2 jq gawk nano coreutils \
+  tmux net-tools ncurses-base bash-completion
 git lfs install --system || true
 
 # -----------------------------
@@ -270,56 +272,69 @@ ensure_nodes_from_bundle_or_build
 # 3) Optional: push a new bundle if requested (requires HF_* env set)
 push_bundle_if_requested
 
-# 4) Cleanup temp list
-[[ -n "${NODES_TMP_FILE:-}" && -f "$NODES_TMP_FILE" ]] && rm -f "$NODES_TMP_FILE" || true
-
-# ---------- 5) VHS preview default (optional) ----------
-if [ "${change_preview_method:-true}" = "true" ]; then
-  JS="$CUSTOM_DIR/ComfyUI-VideoHelperSuite/web/js/VHS.core.js"
-  [ -f "$JS" ] && sed -i "/id: *'VHS.LatentPreview'/,/defaultValue:/s/defaultValue: false/defaultValue: true/" "$JS" || true
-  mkdir -p "$COMFY_HOME/user/default/ComfyUI-Manager"
-  CFG="$COMFY_HOME/user/default/ComfyUI-Manager/config.ini"
-  if [ ! -f "$CFG" ]; then
-    cat >"$CFG" <<'INI'
-[default]
-preview_method = auto
-git_exe =
-use_uv = False
-channel_url = https://raw.githubusercontent.com/ltdrdata/ComfyUI-Manager/main
-share_option = all
-bypass_ssl = False
-file_logging = True
-component_policy = workflow
-update_policy = stable-comfyui
-windows_selector_event_loop_policy = False
-model_download_by_agent = False
-downgrade_blacklist =
-security_level = normal
-skip_migration_check = False
-always_lazy_install = False
-network_mode = public
-db_mode = cache
-INI
-  fi
-fi
-
-# ---------- 6) Model directories + simple downloader ----------
+# =============================================================================================
+#
+#
+#  6 ) Download all requested models, from HuggingFace manifests, CivitAI, etc.
+#
+#
+# =============================================================================================
 
 echo "Ensuring model directories exist..."
 mkdir -p "$DIFFUSION_MODELS_DIR" "$TEXT_ENCODERS_DIR" "$CLIP_VISION_DIR" "$VAE_DIR" \
   "$LORAS_DIR" "$DETECTION_DIR" "$CTRL_DIR" "$UPSCALE_DIR"
 
-# 6.1) CivitAI downloader script
+#===============================================================================================
+#  6.1) Huggingface Model downloader from manifest (uses helpers.sh)
+#===============================================================================================
 
+helpers_run_downloads() {
+  helpers_download_from_manifest
+  # Run snapshot loop in foreground (or background by appending &)
+  helpers_progress_snapshot_loop "$ARIA_PROGRESS_INTERVAL" "$ARIA_PROGRESS_BAR_WIDTH" "$LOG_DIR/aria2_progress.log"
+}
+
+#===============================================================================================
+#  6.2) CivitAI model downloader
+#===============================================================================================
+
+#----------- Download CivitAI downloader script ----------
 echo "Downloading CivitAI download script to /usr/local/bin"
 git clone "https://github.com/Hearmeman24/CivitAI_Downloader.git" || { echo "Git clone failed"; exit 1; }
 mv CivitAI_Downloader/download_with_aria.py "/usr/local/bin/" || { echo "Move failed"; exit 1; }
 chmod +x "/usr/local/bin/download_with_aria.py" || { echo "Chmod failed"; exit 1; }
 rm -rf CivitAI_Downloader  # Clean up the cloned repo
 
-download_models_if_requested
+mkdir -p "${CIVITAI_LOG_DIR}"
+echo "Downloading models from CivitAI..."
 
-echo "Relocate upscale models"
+# Using env-defined lists (checkpoints + loras):
+helpers_download_civitai_ids
+
+# Optional: wait until aria2 RPC daemon is idle
+echo "⏳ Waiting for background aria2 downloads to finish..."
+while pgrep -x "aria2c" >/dev/null; do
+  echo "🔽 Downloads still running..."
+  sleep 5
+done
+echo "✅ All models downloaded successfully!"
+
+#===============================================================================================
+#  6.2.1) Rename any .zip loras to .safetensors
+#===============================================================================================
+echo "Renaming loras downloaded as zip files to safetensors files...."
+cd $LORAS_DIR
+for file in *.zip; do
+    mv "$file" "${file%.zip}.safetensors"
+done
+# Return to workspace
+cd /workspace
+
+#===============================================================================================
+#  6.3) Relocate upscaling models from comfyui-mirror git dir to proper upscale dir
+#===============================================================================================
+
+echo "Relocate upscaling model(s) to the correct directory..."
 if [ ! -f "$UPSCALE_DIR/4xLSDIR.pth" ]; then
     if [ -f "/workspace/comfyui-mirror/4xLSDIR.pth" ]; then
         mv "/workspace/comfyui-mirror/4xLSDIR.pth" "$UPSCALE_DIR/4xLSDIR.pth"
@@ -331,9 +346,9 @@ else
     echo "4xLSDIR.pth already exists. Skipping."
 fi
 
-echo "✅ All requested downloads completed!"
-
-#----------- 6.5) Fetch/Move workflow files ----------
+#===============================================================================================
+#  6.4) Copy Hearmeman24's WAN workflows into ComfyUI workflows dir
+#===============================================================================================
 
 echo "Cloning Hearmeman24's ComfyUI-WAN repository for latest workflows..."
 cd /workspace
@@ -367,7 +382,56 @@ for dir in "$SOURCE_DIR"/*/; do
     fi
 done
 
-# ---------- 7) Final launch script ----------
+
+#===============================================================================================
+#  6.5) Change default preview method to 'auto' in VHS Latent Preview node
+#===============================================================================================
+
+if [ "${change_preview_method:-true}" = "true" ]; then
+  JS="$CUSTOM_DIR/ComfyUI-VideoHelperSuite/web/js/VHS.core.js"
+  [ -f "$JS" ] && sed -i "/id: *'VHS.LatentPreview'/,/defaultValue:/s/defaultValue: false/defaultValue: true/" "$JS" || true
+  mkdir -p "$COMFY_HOME/user/default/ComfyUI-Manager"
+  CFG="$COMFY_HOME/user/default/ComfyUI-Manager/config.ini"
+  if [ ! -f "$CFG" ]; then
+    cat >"$CFG" <<'INI'
+[default]
+preview_method = auto
+git_exe =
+use_uv = False
+channel_url = https://raw.githubusercontent.com/ltdrdata/ComfyUI-Manager/main
+share_option = all
+bypass_ssl = False
+file_logging = True
+component_policy = workflow
+update_policy = stable-comfyui
+windows_selector_event_loop_policy = False
+model_download_by_agent = False
+downgrade_blacklist =
+security_level = normal
+skip_migration_check = False
+always_lazy_install = False
+network_mode = public
+db_mode = cache
+INI
+  fi
+else
+    echo "config.ini already exists. Updating preview_method..."
+    sed -i 's/^preview_method = .*/preview_method = auto/' "$CONFIG_FILE"
+fi
+echo "Config file setup complete!"
+    echo "Default preview method updated to 'auto'"
+else
+    echo "Skipping preview method update (change_preview_method is not 'true')."
+fi
+
+
+#===============================================================================================
+#
+#  7 ) Launch ComfyUI instances (8188 main, 8288 GPU0, 8388 GPU1)
+#
+#===============================================================================================
+
+echo "▶️  Starting ComfyUI"
 
 if ${SCRIPT_DIR}/run_comfy_mux.sh; then
   tg "✅ ComfyUI up on 8188, 8288 (GPU0), 8388 (GPU1 if present)."
