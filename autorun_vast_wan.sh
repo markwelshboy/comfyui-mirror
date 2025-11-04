@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+touch ~/.no_auto_tmux
+
 # -----------------------------
 # 0) OS prereqs & workspace
 # -----------------------------
