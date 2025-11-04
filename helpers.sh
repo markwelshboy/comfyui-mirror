@@ -297,7 +297,6 @@ install_custom_nodes_set() {
   local src_name="${1:-}"
   local -a NODES_LIST
   if [[ -n "$src_name" ]]; then
-    # nameref to caller-provided array
     local -n _src="$src_name"
     NODES_LIST=("${_src[@]}")
   else
@@ -313,12 +312,13 @@ install_custom_nodes_set() {
   fi
   echo "[custom-nodes] Using concurrency: ${max_jobs}"
 
-  # semaphore
+  # robust two-FD FIFO semaphore
   local SEM="/tmp/.nodes.sem.$$"
   mkfifo "$SEM"
-  exec 9<>"$SEM"
+  exec 9<"$SEM"      # read-only
+  exec 10>"$SEM"     # write-only
   rm -f "$SEM"
-  for _ in $(seq 1 "$max_jobs"); do printf . >&9; done
+  for _ in $(seq 1 "$max_jobs"); do printf . >&10; done
 
   local -a pids=()
   local errs=0
@@ -327,15 +327,15 @@ install_custom_nodes_set() {
     [[ -n "$repo" ]] || continue
     [[ "$repo" =~ ^# ]] && continue
 
-    # acquire token (never block unless we mis-prefilled)
+    # acquire token
     read -r _ <&9
 
     (
       # always release a token when this subshell exits
-      release() { printf . >&9; }
+      release() { printf . >&10; }
       trap release EXIT
-
       set -e
+
       local name dst rec
       name="$(repo_dir_name "$repo")"
       dst="$CUSTOM_DIR/$name"
@@ -344,12 +344,10 @@ install_custom_nodes_set() {
       echo "[custom-nodes] START $name → $dst"
       mkdir -p "$dst"
 
-      # Add timeouts to avoid silent hangs on network hiccups
-      GIT_TERMINAL_PROMPT=0 clone_or_pull "$repo" "$dst" "$rec"
+      GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/echo clone_or_pull "$repo" "$dst" "$rec"
 
-      # requirements/install with logs
       if ! build_node "$dst"; then
-        echo "[custom-nodes] ERROR building $name (see ${CUSTOM_LOG_DIR}/${name}.log)"
+        echo "[custom-nodes] ERROR $name (see ${CUSTOM_LOG_DIR}/${name}.log)"
         exit 1
       fi
 
@@ -359,7 +357,6 @@ install_custom_nodes_set() {
   done
 
   echo "[custom-nodes] Waiting for parallel node installs to complete…"
-
   local pid
   for pid in "${pids[@]}"; do
     if ! wait "$pid"; then
@@ -367,8 +364,8 @@ install_custom_nodes_set() {
     fi
   done
 
-  # close semaphore FD
-  exec 9>&-
+  # close semaphore FDs
+  exec 9>&- 10>&-
 
   if (( errs > 0 )); then
     echo "[custom-nodes] Completed with ${errs} error(s). Check logs: $CUSTOM_LOG_DIR"
