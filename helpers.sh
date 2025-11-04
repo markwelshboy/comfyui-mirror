@@ -267,33 +267,57 @@ build_node() {
 
 # resolve_nodes_list: Resolve source of truth for repo URLs into an array name
 #   Usage: local -a nodes; resolve_nodes_list nodes
+# resolve_nodes_list OUT_ARRAY_NAME
 resolve_nodes_list() {
-  local -n _out="$1"
-  _out=()
-  if [[ -n "${CUSTOM_NODE_LIST_FILE:-}" && -f "${CUSTOM_NODE_LIST_FILE:-}" ]]; then
-    mapfile -t _out < <(grep -vE '^\s*(#|$)' "$CUSTOM_NODE_LIST_FILE")
+  local out_name="${1:-}"
+  local -a out=()
+  if [[ -n "${CUSTOM_NODE_LIST_FILE:-}" && -s "${CUSTOM_NODE_LIST_FILE:-}" ]]; then
+    mapfile -t out < <(grep -vE '^\s*(#|$)' "$CUSTOM_NODE_LIST_FILE")
   elif [[ -n "${CUSTOM_NODE_LIST:-}" ]]; then
     # shellcheck disable=SC2206
-    _out=(${CUSTOM_NODE_LIST})
+    out=(${CUSTOM_NODE_LIST})
   else
-    _out=("${DEFAULT_NODES[@]}")
+    out=("${DEFAULT_NODES[@]}")
+  fi
+
+  # Return via nameref or print
+  if [[ -n "$out_name" ]]; then
+    local -n ref="$out_name"
+    ref=("${out[@]}")
+  else
+    printf '%s\n' "${out[@]}"
   fi
 }
 
 # install_custom_nodes_set: bounded parallel installer
 #   Optional: install_custom_nodes_set MY_NODE_ARRAY
+# install_custom_nodes_set: bounded parallel installer
+#   Usage: install_custom_nodes_set NODES_ARRAY_NAME
 install_custom_nodes_set() {
+  local src_name="${1:-}"
   local -a NODES_LIST
-  if [[ -n "${1:-}" ]]; then
-    local -n _src="$1"; NODES_LIST=("${_src[@]}")
+  if [[ -n "$src_name" ]]; then
+    # nameref to caller-provided array
+    local -n _src="$src_name"
+    NODES_LIST=("${_src[@]}")
   else
     resolve_nodes_list NODES_LIST
   fi
 
+  echo "[custom-nodes] install_custom_nodes_set(): ${#NODES_LIST[@]} node(s)"
+
   mkdir -p "${CUSTOM_DIR:?}" "${CUSTOM_LOG_DIR:?}"
   local max_jobs="${MAX_NODE_JOBS:-8}"
+  if ! [[ "$max_jobs" =~ ^[0-9]+$ ]] || (( max_jobs < 1 )); then
+    max_jobs=8
+  fi
+  echo "[custom-nodes] Using concurrency: ${max_jobs}"
+
+  # semaphore
   local SEM="/tmp/.nodes.sem.$$"
-  mkfifo "$SEM"; exec 9<>"$SEM"; rm -f "$SEM"
+  mkfifo "$SEM"
+  exec 9<>"$SEM"
+  rm -f "$SEM"
   for _ in $(seq 1 "$max_jobs"); do printf . >&9; done
 
   local -a pids=()
@@ -302,31 +326,52 @@ install_custom_nodes_set() {
   for repo in "${NODES_LIST[@]}"; do
     [[ -n "$repo" ]] || continue
     [[ "$repo" =~ ^# ]] && continue
-    read -r _ <&9   # acquire token
+
+    # acquire token (never block unless we mis-prefilled)
+    read -r _ <&9
+
     (
-      trap 'printf . >&9' EXIT  # always release token
+      # always release a token when this subshell exits
+      release() { printf . >&9; }
+      trap release EXIT
+
       set -e
       local name dst rec
       name="$(repo_dir_name "$repo")"
       dst="$CUSTOM_DIR/$name"
       rec="$(needs_recursive "$repo")"
-      echo "[custom-nodes] $name → $dst"
-      clone_or_pull "$repo" "$dst" "$rec"
-      build_node "$dst" || { echo "[custom-nodes] ERROR $name (see ${CUSTOM_LOG_DIR}/${name}.log)"; exit 1; }
+
+      echo "[custom-nodes] START $name → $dst"
+      mkdir -p "$dst"
+
+      # Add timeouts to avoid silent hangs on network hiccups
+      GIT_TERMINAL_PROMPT=0 clone_or_pull "$repo" "$dst" "$rec"
+
+      # requirements/install with logs
+      if ! build_node "$dst"; then
+        echo "[custom-nodes] ERROR building $name (see ${CUSTOM_LOG_DIR}/${name}.log)"
+        exit 1
+      fi
+
       echo "[custom-nodes] OK $name"
     ) &
     pids+=("$!")
   done
 
   echo "[custom-nodes] Waiting for parallel node installs to complete…"
+
   local pid
   for pid in "${pids[@]}"; do
-    if ! wait "$pid"; then errs=$((errs+1)); fi
+    if ! wait "$pid"; then
+      errs=$((errs+1))
+    fi
   done
+
+  # close semaphore FD
   exec 9>&-
 
   if (( errs > 0 )); then
-    echo "[custom-nodes] Completed with $errs error(s). Check logs: $CUSTOM_LOG_DIR"
+    echo "[custom-nodes] Completed with ${errs} error(s). Check logs: $CUSTOM_LOG_DIR"
     return 2
   else
     echo "[custom-nodes] All nodes installed successfully."
@@ -497,8 +542,16 @@ ensure_nodes_from_bundle_or_build() {
     return 0
   fi
 
-  echo "[custom-nodes] No matching bundle found. Building from NODES…"
-  install_custom_nodes_set || return $?
+  # Resolve the list once, log how many we got, then pass it in.
+  local -a RESOLVED_NODES=()
+  resolve_nodes_list RESOLVED_NODES
+  echo "[custom-nodes] RESOLVED_NODES count: ${#RESOLVED_NODES[@]}"
+  if (( ${#RESOLVED_NODES[@]} == 0 )); then
+    echo "[custom-nodes] ERROR: Node list is empty. Check CUSTOM_NODE_LIST_FILE / CUSTOM_NODE_LIST / DEFAULT_NODES."
+    return 2
+  fi
+
+  install_custom_nodes_set RESOLVED_NODES || return $?
 
   if [[ "${PUSH_BUNDLE:-0}" = "1" ]]; then
     local base tarpath manifest reqs sha
