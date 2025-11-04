@@ -24,7 +24,7 @@ export COMFY=$COMFY_HOME
 export COMFYUI_PATH=$COMFY_HOME
 
 # =========================
-#  For custom_nodes management
+#  For COMFY custom_nodes management
 # =========================
 
 CUSTOM_DIR="${CUSTOM_DIR:-$COMFY_HOME/custom_nodes}"
@@ -463,10 +463,57 @@ ensure_comfy() {
 
 ensure_comfy
 
-# 3) Ensure tools available for HF downloads
+# =============================================================================================
+#  Custom nodes management
+# =============================================================================================
+# 0) Prepare dirs
+mkdir -p /workspace/logs "$COMFY/output" "$COMFY/cache" "$COMFY/bundles" "$CUSTOM_DIR" "$CUSTOM_LOG_DIR" 
+
+# 0.5) Ensure tools available
 need_tools_for_hf
 
-mkdir -p /workspace/logs "$COMFY/output" "$COMFY/cache" "$CUSTOM_DIR" "$CUSTOM_LOG_DIR"
+# 1) Always try to use a remote nodes list; fallback to empty file
+NODES_LIST="$(hf_fetch_nodes_list)"
+if [ -z "$NODES_LIST" ]; then
+  echo "No remote custom_nodes.txt found on HF; will only use bundle (if present) or keep existing nodes."
+fi
+
+# 2) Try fetch a matching bundle for current pins
+PINS="$(pins_signature)"
+BUNDLE_PATH_REPO="$(hf_latest_bundle_for_pins "$PINS")"
+if [ -n "$BUNDLE_PATH_REPO" ]; then
+  echo "Found matching bundle for pins [$PINS]: $BUNDLE_PATH_REPO"
+  LOCAL_TGZ="/workspace/cache/$(basename "$BUNDLE_PATH_REPO")"
+  hf_download_to "$BUNDLE_PATH_REPO" "$LOCAL_TGZ"
+  extract_custom_nodes_bundle "$LOCAL_TGZ"
+  # Best-effort: fetch its .sha256 (optional)
+  hf_download_to "${BUNDLE_PATH_REPO}.sha256" "${LOCAL_TGZ}.sha256" || true
+  # Best-effort: fetch its consolidated requirements (optional fixed name)
+  hf_download_to "bundles/consolidated_requirements.txt" "/workspace/cache/consolidated_requirements.txt" || true
+  safe_install_consolidated_reqs
+else
+  echo "No bundle on HF for pins [$PINS]."
+  # If you provided custom_nodes.txt, install/refresh those repos now
+  if [ -f "$NODES_LIST" ]; then
+    echo "Installing nodes from $NODES_LIST..."
+    while read -r repo; do
+      [[ -z "$repo" || "$repo" =~ ^# ]] && continue
+      install_node "$repo"
+    done < "$NODES_LIST"
+  else
+    echo "No nodes list provided; leaving existing custom_nodes as-is."
+  fi
+fi
+
+# 3) Optional manual push: run script with PUSH_BUNDLE=1 (or call function below)
+push_bundle_if_requested() {
+  [ "${PUSH_BUNDLE:-0}" = "1" ] || return 0
+  local TGZ="$(build_custom_nodes_bundle "$PINS")"
+  hf_push_files "bundle ${PINS}" "$TGZ" "${TGZ}.sha256" "/workspace/cache/custom_nodes_manifest.json" "/workspace/cache/consolidated_requirements.txt"
+  echo "Uploaded bundle for pins [$PINS]: $(basename "$TGZ")"
+}
+# call automatically only if asked
+push_bundle_if_requested
 
 # ---------- 4) Node set ----------
 DEFAULT_NODES=(
@@ -502,6 +549,7 @@ DEFAULT_NODES=(
   https://github.com/wildminder/ComfyUI-VibeVoice.git
   https://github.com/kijai/ComfyUI-WanAnimatePreprocess.git
 )
+
 # --- Source of truth for nodes ---
 # 1) CUSTOM_NODE_LIST_FILE (one repo per line)
 # 2) CUSTOM_NODE_LIST (space/newline separated)
