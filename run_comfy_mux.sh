@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 export PATH="/opt/venv/bin:$PATH"
-BASE=${COMFY_DIR}
+BASE=${COMFY}
 LOGS=${COMFY_LOGS}
 
 /usr/bin/printf "GPUs: "
