@@ -1129,6 +1129,111 @@ helpers_progress_snapshot_loop() {
 }
 
 # ---------- RPC helpers ----------
+
+_aria2_endpoint() { printf "http://%s:%s/jsonrpc" "${ARIA2_HOST:-127.0.0.1}" "${ARIA2_PORT:-6800}"; }
+_aria2_tok()      { [[ -n "${ARIA2_SECRET:-}" ]] && printf '"token:%s",' "$ARIA2_SECRET"; }
+
+# Call: _aria2_rpc <method> [params_json_without_token_prefix]
+# Example: _aria2_rpc aria2.getGlobalStat
+#          _aria2_rpc aria2.tellWaiting '0,1000,["gid","status"]'
+_aria2_rpc() {
+  local m="$1"; shift || true
+  local params="$*"
+  local tok; tok="$(_aria2_tok)"
+  [[ -n "$params" ]] && params=",$params"
+  curl -sS --fail "$(_aria2_endpoint)" -H 'Content-Type: application/json' \
+    --data "{\"jsonrpc\":\"2.0\",\"id\":\"x\",\"method\":\"$m\",\"params\":[${tok%?}${params#,*}]}" \
+    || echo 'null'
+}
+
+# Utility: return array (one per line) of GIDs for a tell* result
+_aria2_gids_from() {
+  jq -r 'try (.result // .) | if type=="array" then . else [] end | .[].gid // empty catch empty'
+}
+
+# ----- Stop/kill all ACTIVE + WAITING -----
+aria2_stop_all() {
+  echo "⏹️  Stopping all active + waiting downloads…"
+  # Active
+  _aria2_rpc aria2.tellActive '["gid","status"]' | _aria2_gids_from | while read -r gid; do
+    echo "  • forceRemove ACTIVE $gid"
+    _aria2_rpc aria2.forceRemove "\"$gid\"" >/dev/null || true
+  done
+  # Waiting (queue)
+  _aria2_rpc aria2.tellWaiting '0,1000,["gid","status"]' | _aria2_gids_from | while read -r gid; do
+    echo "  • remove WAITING $gid"
+    _aria2_rpc aria2.remove "\"$gid\"" >/dev/null || true
+  done
+  # A tiny grace
+  sleep 1
+}
+
+# ----- Clear COMPLETED + FAILED results from aria2 memory -----
+aria2_clear_results() {
+  echo "🧹 Clearing stopped (completed/failed) results…"
+  # Remove per-GID records (keeps finished files on disk)
+  _aria2_rpc aria2.tellStopped '0,1000,["gid","status"]' | _aria2_gids_from | while read -r gid; do
+    echo "  • removeDownloadResult $gid"
+    _aria2_rpc aria2.removeDownloadResult "\"$gid\"" >/dev/null || true
+  done
+  # Purge any leftover result cache
+  echo "  • purgeDownloadResult"
+  _aria2_rpc aria2.purgeDownloadResult >/dev/null || true
+}
+
+# ----- Full nuke convenience: stop -> clear -> optional partial cleanup -> daemon shutdown -----
+aria2_nuke_all() {
+  local partial_root="${1:-${COMFY_HOME:-/workspace/ComfyUI}/models}"
+
+  aria2_stop_all
+  aria2_clear_results
+
+  # Optional: cleanup *.aria2 partial stubs under models
+  if [[ -d "$partial_root" ]]; then
+    echo "🧽 Removing *.aria2 partial files under: $partial_root"
+    find "$partial_root" -type f -name '*.aria2' -print -delete 2>/dev/null || true
+  fi
+
+  # Try graceful shutdown of the RPC daemon (won’t delete logs/files)
+  echo "🛑 Shutting down aria2 daemon…"
+  _aria2_rpc aria2.shutdown >/dev/null || true
+
+  # Fallback: hard kill lingering aria2c RPC daemons
+  sleep 1
+  pkill -f 'aria2c .*--enable-rpc' 2>/dev/null || true
+  echo "✅ All queues cleared and daemon stopped."
+}
+
+# ----- Tiny diagnostics (optional) -----
+aria2_show_counts() {
+  local s; s="$(_aria2_rpc aria2.getGlobalStat)"
+  printf "Active:%s Waiting:%s Stopped:%s\n" \
+    "$(jq -r '(.result//.).numActive  // "0"'  <<<"$s")" \
+    "$(jq -r '(.result//.).numWaiting // "0"'  <<<"$s")" \
+    "$(jq -r '(.result//.).numStopped // "0"' <<<"$s")"
+}
+
+aria2_inspect_gid() {
+  local gid="$1"
+  [[ -z "$gid" ]] && { echo "Usage: aria2_inspect_gid <gid>"; return 1; }
+  local endpoint="http://${ARIA2_HOST:-127.0.0.1}:${ARIA2_PORT:-6800}/jsonrpc"
+  local tok=""; [[ -n "${ARIA2_SECRET:-}" ]] && tok="token:${ARIA2_SECRET}"
+  curl -s "$endpoint" -H 'Content-Type: application/json' \
+    --data "{\"jsonrpc\":\"2.0\",\"id\":\"st\",\"method\":\"aria2.tellStatus\",\"params\":[\"$tok\",\"$gid\",[\"status\",\"errorMessage\",\"totalLength\",\"completedLength\",\"files\",\"followedBy\",\"bittorrent\"]]}"
+  echo
+}
+
+aria2_last_errors() {
+  local endpoint="http://${ARIA2_HOST:-127.0.0.1}:${ARIA2_PORT:-6800}/jsonrpc"
+  local tok=""; [[ -n "${ARIA2_SECRET:-}" ]] && tok="token:${ARIA2_SECRET}"
+  curl -s "$endpoint" -H 'Content-Type: application/json' \
+    --data "{\"jsonrpc\":\"2.0\",\"id\":\"s\",\"method\":\"aria2.tellStopped\",\"params\":[\"$tok\",0,50,[\"status\",\"errorMessage\",\"files\"]]}" \
+  | jq -r '.result[]
+     | select(.status=="error")
+     | {name:(.files[0].path|split("/")|last), err:(.errorMessage//"Unknown")}
+     | "✖ \(.name): \(.err)"'
+}
+
 helpers_watch_gids() {
   _helpers_need jq; _helpers_need curl
   local gids=("$@")
