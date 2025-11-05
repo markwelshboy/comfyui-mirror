@@ -773,21 +773,28 @@ helpers_resolve_placeholders() {
 
 # Quick size/partial cleanup; returns 0 if should download, 1 if skip
 helpers_ensure_target_ready() {
-  local full_path="$1"
-  local sz
-  mkdir -p "$(dirname -- "$full_path")"
-  if [[ -f "$full_path" ]]; then
-    sz=$(stat -c%s "$full_path" 2>/dev/null || stat -f%z "$full_path" 2>/dev/null || echo 0)
-    if (( sz > 10485760 )); then
-      echo "✅ $(basename -- "$full_path") exists (${sz}B), skipping."
-      return 1
-    else
-      echo "🗑️  Deleting small/partial file: $full_path"
-      rm -f -- "$full_path"
-    fi
+  # Args: <full_path>
+  local path="$1"
+  # If an .aria2 control file exists, remove both partial + control
+  if [[ -f "${path}.aria2" ]]; then
+    echo "🗑️  Removing stale control: ${path}.aria2"
+    rm -f -- "${path}.aria2" "${path}"
   fi
-  [[ -f "${full_path}.aria2" ]] && rm -f -- "${full_path}.aria2" || true
-  return 0
+
+  if [[ -f "$path" ]]; then
+    # Cross-distro stat (BSD/GNU)
+    local size_bytes
+    size_bytes="$(stat -f%z "$path" 2>/dev/null || stat -c%s "$path" 2>/dev/null || echo 0)"
+    # Consider anything <10MB suspicious (your previous rule); adjust if you like
+    if (( size_bytes < 10485760 )); then
+      echo "🗑️  Deleting too-small file ($(helpers_human_bytes "$size_bytes") < 10 MB): $path"
+      rm -f -- "$path"
+      return 0
+    fi
+    echo "✅ $(basename -- "$path") exists ($(helpers_human_bytes "$size_bytes")), skipping."
+    return 1   # tell caller: don't enqueue
+  fi
+  return 0     # ok to enqueue
 }
 
 # ---------- MAIN: download selected sections from manifest ----------
@@ -887,30 +894,35 @@ helpers_download_from_manifest() {
   echo "✅ Enqueued selected sections."
 }
 
+helpers_human_bytes() {
+  # usage: helpers_human_bytes <bytes>
+  local n=${1:-0}
+  if (( n < 1024 )); then printf "%d B" "$n"
+  elif (( n < 1048576 )); then printf "%d KB" $((n/1024))
+  elif (( n < 1073741824 )); then printf "%d MB" $((n/1048576))
+  else printf "%d GB" $((n/1073741824))
+  fi
+}
+
 # ---------- Progress snapshots (append-friendly; no clear by default) ----------
 helpers_progress_snapshot_loop() {
   _helpers_need curl; _helpers_need jq
 
-  local interval="${1:-${ARIA2_PROGRESS_INTERVAL:-10}}"
-  local bar_w="${2:-${ARIA2_PROGRESS_BAR_WIDTH:-40}}"
+  local interval="${1:-${PROGRESS_INTERVAL:-5}}"
+  local bar_w="${2:-${PROGRESS_BAR_WIDTH:-40}}"
   local log_file="${3:-}"
+  local fname_w="${ARIA2_NAME_COL_WIDTH:-56}"   # align names to fixed width
+  local comfy_root="${COMFY_HOME:-/workspace/ComfyUI}"
 
   local endpoint="http://${ARIA2_HOST:-127.0.0.1}:${ARIA2_PORT:-6800}/jsonrpc"
   local tok=""; [[ -n "${ARIA2_SECRET:-}" ]] && tok="token:${ARIA2_SECRET}"
 
-  human_bytes() {
-    local n; n=${1:-0}
-    if (( n < 1024 )); then printf "%d B" "$n"
-    elif (( n < 1048576 )); then printf "%d KB" $((n/1024))
-    elif (( n < 1073741824 )); then printf "%d MB" $((n/1048576))
-    else printf "%d GB" $((n/1073741824))
-    fi
-  }
   draw_bar() {
     local done=${1:-0} total=${2:-0} width=${3:-40}
     local pct=0 fill=0 empty=$width
     (( total > 0 )) && pct=$(( done*100/total ))
-    fill=$(( pct*width/100 )); empty=$(( width-fill ))
+    fill=$(( pct*width/100 )); (( fill > width )) && fill=$width
+    empty=$(( width-fill ))
     printf "%3d%% [" "$pct"
     printf '%*s' "$fill" '' | tr ' ' '#'
     printf '%*s' "$empty" '' | tr ' ' ' '
@@ -921,18 +933,18 @@ helpers_progress_snapshot_loop() {
   local idle_streak=0
 
   while :; do
-    # ---- Global stat (robust counts) ----
+    # ---- Global stat ----
     local payload_g='{"jsonrpc":"2.0","id":"g","method":"aria2.getGlobalStat","params":['
     [[ -n "$tok" ]] && payload_g+="\"$tok\""
     payload_g+=']}'
     local resp_g; resp_g="$(curl -sS --fail "$endpoint" -H 'Content-Type: application/json' \
                        --data-binary "$payload_g" 2>/dev/null || echo 'null')"
     local active_n waiting_n stopped_n
-    active_n="$( jq -r 'try ((.result // .).numActive    | tonumber) catch 0' <<<"$resp_g" )"
-    waiting_n="$(jq -r 'try ((.result // .).numWaiting   | tonumber) catch 0' <<<"$resp_g" )"
-    stopped_n="$(jq -r 'try ((.result // .).numStopped   | tonumber) catch 0' <<<"$resp_g" )"
+    active_n="$( jq -r 'try ((.result // .).numActive  | tonumber) catch 0' <<<"$resp_g" )"
+    waiting_n="$(jq -r 'try ((.result // .).numWaiting | tonumber) catch 0' <<<"$resp_g" )"
+    stopped_n="$(jq -r 'try ((.result // .).numStopped | tonumber) catch 0' <<<"$resp_g" )"
 
-    # ---- List active items for per-file progress ----
+    # ---- Active list ----
     local payload_a='{"jsonrpc":"2.0","id":"a","method":"aria2.tellActive","params":['
     [[ -n "$tok" ]] && payload_a+="\"$tok\","
     payload_a+='["gid","status","totalLength","completedLength","downloadSpeed","files"]]}'
@@ -940,7 +952,6 @@ helpers_progress_snapshot_loop() {
                       --data-binary "$payload_a" 2>/dev/null || echo 'null')"
     local A; A="$(jq -c 'try ((.result // .) | if type=="array" then . else [] end) catch []' <<<"$resp_a")"
 
-    # totals across active
     local total_speed total_done total_size
     total_speed="$(jq '[.[].downloadSpeed|tonumber? // 0] | add' <<<"$A")"
     total_done="$( jq '[.[].completedLength|tonumber? // 0] | add' <<<"$A")"
@@ -952,33 +963,102 @@ helpers_progress_snapshot_loop() {
       echo "=== aria2 progress @ $now ==="
       echo "Active ($active_n)"
       echo "--------------------------------------------------------------------------------"
+      # name,done,tot,spd
       jq -r '
         .[]
         | . as $it
-        | ($it.totalLength|tonumber? // 0) as $tot
+        | ($it.totalLength   |tonumber? // 0) as $tot
         | ($it.completedLength|tonumber? // 0) as $done
-        | ($it.downloadSpeed|tonumber? // 0) as $spd
+        | ($it.downloadSpeed |tonumber? // 0) as $spd
         | ( if ($it.files|type)=="array" and ($it.files|length)>0
-            then ($it.files[0].path // "unknown") | split("/") | last
-            else "unknown" end ) as $name
-        | [$name, ($done|tostring), ($tot|tostring), ($spd|tostring)] | @tsv
-      ' <<<"$A" | while IFS=$'\t' read -r name done tot spd; do
+            then ($it.files[0].path // "unknown")
+            else "unknown" end ) as $path
+        | $path | split("/") | last as $name
+        | [$name, ($done|tostring), ($tot|tostring), ($spd|tostring), $path] | @tsv
+      ' <<<"$A" | while IFS=$'\t' read -r name done tot spd fullpath; do
           draw_bar "$done" "$tot" "$bar_w"
-          printf "  %6s/s  (%s / %s)  %s\n" \
-            "$(human_bytes "$spd")" "$(human_bytes "$done")" "$(human_bytes "$tot")" "$name"
+          printf "  %6s/s  (%s / %s)  " \
+            "$(helpers_human_bytes "$spd")" "$(helpers_human_bytes "$done")" "$(helpers_human_bytes "$tot")"
+          # left-align filename to fixed width
+          printf "%-*s" "$fname_w" "$name"
+          # (optional) show short relative path if it helps: strip comfy root
+          if [[ -n "$comfy_root" && "$fullpath" == "$comfy_root"* ]]; then
+            local rel="${fullpath#$comfy_root/}"
+            printf "  [%s]" "$rel"
+          fi
+          printf "\n"
         done
       echo "--------------------------------------------------------------------------------"
       printf "Group total: speed %s/s, done %s / %s\n" \
-        "$(human_bytes "$total_speed")" "$(human_bytes "$total_done")" "$(human_bytes "$total_size")"
+        "$(helpers_human_bytes "$total_speed")" \
+        "$(helpers_human_bytes "$total_done")" \
+        "$(helpers_human_bytes "$total_size")"
       if (( total_speed > 0 )) && (( total_size >= total_done )) && (( total_size > 0 )); then
         local remain=$(( total_size - total_done ))
         local eta=$(( remain / total_speed ))
         printf "ETA: %02d:%02d\n" $((eta/60)) $((eta%60))
       fi
+
+      # ---- Completed block (this session) ----
+      # Show up to 12 most recent stopped=complete; compare on-disk size vs reported length
+      local payload_s='{"jsonrpc":"2.0","id":"s","method":"aria2.tellStopped","params":['
+      [[ -n "$tok" ]] && payload_s+="\"$tok\","
+      payload_s+='0,200,["status","totalLength","files"]]}'
+      local resp_s; resp_s="$(curl -sS --fail "$endpoint" -H 'Content-Type: application/json' \
+                        --data-binary "$payload_s" 2>/dev/null || echo 'null')"
+      local S; S="$(jq -c 'try ((.result // .) | if type=="array" then . else [] end) catch []' <<<"$resp_s")"
+
+      # Filter completes; we’ll take last 12 entries by natural order
+      local shown=0
+      local lines
+      lines="$(jq -r '
+        [ .[]
+          | select(.status=="complete")
+          | ( if (.files|type)=="array" and (.files|length)>0
+              then .files[0].path else "" end ) as $path
+          | ($path|split("/")|last) as $name
+          | ($path) as $fpath
+          | (.totalLength|tonumber? // 0) as $len
+          | [$name, ($len|tostring), $fpath] ] 
+        | .[-12:] // []
+        | .[] | @tsv
+      ' <<<"$S")"
+
+      if [[ -n "$lines" ]]; then
+        echo
+        echo "Completed (this session)"
+        echo "--------------------------------------------------------------------------------"
+        while IFS=$'\t' read -r name len fpath; do
+          # get actual on-disk size if exists
+          local actual=0
+          if [[ -n "$fpath" && -f "$fpath" ]]; then
+            actual="$(stat -f%z "$fpath" 2>/dev/null || stat -c%s "$fpath" 2>/dev/null || echo 0)"
+          fi
+          # relative path under models if possible
+          local rel="$fpath"
+          if [[ -n "$comfy_root" && "$fpath" == "$comfy_root"* ]]; then
+            rel="${fpath#$comfy_root/}"
+          fi
+          # mismatch flag
+          local flag=""
+          if (( actual > 0 && len > 0 && actual != len )); then
+            flag="  ⚠ size on disk $(helpers_human_bytes "$actual") ≠ expected $(helpers_human_bytes "$len")"
+          fi
+          printf "✔ %-*s  %s  (%s)%s\n" "$fname_w" "$name" "$rel" "$(helpers_human_bytes "$len")" "$flag"
+          ((shown++))
+        done <<<"$lines"
+      fi
+
       echo
     } | { if [[ -n "$log_file" ]]; then tee -a "$log_file"; else cat; fi; }
 
-    # ---- Exit logic (use global stat) ----
+    # ---- Exit logic ----
+    # manual stop
+    if [[ -f /tmp/.aria2_progress.stop ]]; then
+      echo "🛑 Stop file detected — exiting progress loop."
+      rm -f /tmp/.aria2_progress.stop
+      break
+    fi
     if (( active_n == 0 && waiting_n == 0 )); then
       ((idle_streak++))
     else
@@ -988,18 +1068,12 @@ helpers_progress_snapshot_loop() {
       echo "✅ All downloads complete — exiting progress loop."
       break
     fi
-
-    # manual stop
-    if [[ -f /tmp/.aria2_progress.stop ]]; then
-      echo "🛑 Stop file detected — exiting progress loop."
-      rm -f /tmp/.aria2_progress.stop
-      break
-    fi
-
+    [[ -f /tmp/.aria2_progress.stop ]] && { echo "🛑 Stop file detected — exiting."; rm -f /tmp/.aria2_progress.stop; break; }
     sleep "$interval"
   done
 }
 
+# ---------- RPC helpers ----------
 helpers_watch_gids() {
   _helpers_need jq; _helpers_need curl
   local gids=("$@")
