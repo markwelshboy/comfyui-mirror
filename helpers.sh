@@ -1174,10 +1174,15 @@ aria2_enqueue_and_wait_from_manifest() {
     return 1
   fi
 
+  # fetch manifest
   local MAN; MAN="$(mktemp)"
-  curl -fsSL "${MODEL_MANIFEST_URL}" -o "$MAN" || { echo "Failed to fetch manifest"; return 1; }
+  if ! curl -fsSL "${MODEL_MANIFEST_URL}" -o "$MAN"; then
+    echo "Failed to fetch manifest" >&2
+    rm -f "$MAN"
+    return 1
+  fi
 
-  # vars + paths → map, then uppercase ENV overrides
+  # vars + paths map, uppercase ENV overrides
   local VARS_JSON
   VARS_JSON="$(
     jq -n --slurpfile m "$MAN" '
@@ -1191,16 +1196,18 @@ aria2_enqueue_and_wait_from_manifest() {
     VARS_JSON="$(jq --arg k "$k" --arg v "$v" '. + {($k):$v}' <<<"$VARS_JSON")"
   done < <(env)
 
-  # find enabled sections
+  # enabled sections
   local SECTIONS_ALL ENABLED sec
   SECTIONS_ALL="$(jq -r '.sections | keys[]' "$MAN")"
   ENABLED=()
   while read -r sec; do
     if [[ "${!sec:-}" == "true" || "${!sec:-}" == "1" ]]; then ENABLED+=("$sec"); fi
-    local dl_var="download_${sec}"
-    if [[ "${!dl_var:-}" == "true" || "${!dl_var:-}" == "1" ]]; then ENABLED+=("$sec"); fi
+    local dl="download_${sec}"
+    if [[ "${!dl:-}" == "true" || "${!dl:-}" == "1" ]]; then ENABLED+=("$sec"); fi
   done <<<"$SECTIONS_ALL"
   mapfile -t ENABLED < <(printf '%s\n' "${ENABLED[@]}" | awk '!seen[$0]++')
+
+  helpers_have_aria2_rpc || helpers_start_aria2_daemon
 
   if ((${#ENABLED[@]}==0)); then
     echo "No sections enabled. Available:"; echo "$SECTIONS_ALL" | sed 's/^/  - /'
@@ -1208,45 +1215,34 @@ aria2_enqueue_and_wait_from_manifest() {
     return 0
   fi
 
-  helpers_have_aria2_rpc || helpers_start_aria2_daemon
-
-  # curl head check knobs (DNS can be slow on some pods)
-  local HEAD_TIMEOUT="${ARIA_HEAD_TIMEOUT:-10}"     # seconds
-  local HEAD_RETRIES="${ARIA_HEAD_RETRIES:-2}"
-
-  local queued=0
+  # enqueue without any curl HEAD precheck (quiet + fast)
+  local attempted=0
   for sec in "${ENABLED[@]}"; do
     echo ">>> Enqueue section: $sec"
     jq -r --arg sec "$sec" '
       (.sections[$sec] // [])[]
       | [.url, (.path // ((.dir // "") + (if .out then "/" + .out else "" end)))]
       | @tsv
-    ' "$MAN" | \
-    while IFS=$'\t' read -r url raw_path; do
+    ' "$MAN" | while IFS=$'\t' read -r url raw_path; do
       [[ -z "$url" || -z "$raw_path" ]] && continue
       local path dir out
       path="$(helpers_resolve_placeholders "$raw_path" "$VARS_JSON")" || continue
       dir="$(dirname -- "$path")"; out="$(basename -- "$path")"
       mkdir -p -- "$dir"
 
-      if ! helpers_ensure_target_ready "$path"; then
-        continue
+      if helpers_ensure_target_ready "$path"; then
+        echo "📥 Queue: $out"
+        # Try to enqueue; we don’t care about GID here—aria2 will tell us pending count next.
+        helpers_rpc_add_uri "$url" "$dir" "$out" "" >/dev/null || true
+        ((attempted++))
       fi
-
-      # (Optional) quick HEAD check; don’t fail hard on DNS hiccups
-      if ! curl -fsSI --max-time "$HEAD_TIMEOUT" --retry "$HEAD_RETRIES" --retry-delay 1 "$url" >/dev/null 2>&1; then
-        echo "curl: head check failed or timed out — enqueuing anyway: $out"
-      fi
-
-      echo "📥 Queue: $out"
-      local gid; gid="$(helpers_rpc_add_uri "$url" "$dir" "$out" "")"
-      [[ -n "$gid" ]] && ((queued++))
     done
   done
-
   rm -f "$MAN"
 
-  if (( queued == 0 )); then
+  # ask aria2 if there is anything pending; only then run the progress loop
+  local pending; pending="$(helpers_rpc_count_pending)"
+  if (( pending == 0 )); then
     echo "Nothing enqueued. Exiting without starting progress loop."
     return 0
   fi
@@ -1256,8 +1252,29 @@ aria2_enqueue_and_wait_from_manifest() {
   local logfile="${COMFY_LOGS:-/workspace/logs}/aria2_progress.log"
   mkdir -p -- "$(dirname -- "$logfile")"
 
-  # foreground, blocks until done
   helpers_progress_snapshot_loop "$interval" "$width" "$logfile"
+}
+
+helpers_rpc_count_pending() {
+  _helpers_need curl; _helpers_need jq
+  local endpoint="http://${ARIA2_HOST:-127.0.0.1}:${ARIA2_PORT:-6800}/jsonrpc"
+  local tok=""; [[ -n "${ARIA2_SECRET:-}" ]] && tok="token:${ARIA2_SECRET}"
+
+  # tellActive
+  local payload_a='{"jsonrpc":"2.0","id":"a","method":"aria2.tellActive","params":['
+  [[ -n "$tok" ]] && payload_a+="\"$tok\","
+  payload_a+='["gid"]]}'
+  local ra; ra="$(curl -sS --fail "$endpoint" -H 'Content-Type: application/json' --data-binary "$payload_a" 2>/dev/null || echo 'null')"
+  local A_len; A_len="$(jq 'try ((.result // .) | length) catch 0' <<<"$ra")"
+
+  # tellWaiting
+  local payload_w='{"jsonrpc":"2.0","id":"w","method":"aria2.tellWaiting","params":['
+  [[ -n "$tok" ]] && payload_w+="\"$tok\","
+  payload_w+='0,200,["gid"]]}'
+  local rw; rw="$(curl -sS --fail "$endpoint" -H 'Content-Type: application/json' --data-binary "$payload_w" 2>/dev/null || echo 'null')"
+  local W_len; W_len="$(jq 'try ((.result // .) | length) catch 0' <<<"$rw")"
+
+  echo $(( A_len + W_len ))
 }
 
 # ---------- CivitAI ID downloader (via /usr/local/bin/download_with_aria.py) ----------
