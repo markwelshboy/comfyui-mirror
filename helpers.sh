@@ -908,11 +908,10 @@ helpers_human_bytes() {
 helpers_progress_snapshot_loop() {
   _helpers_need curl; _helpers_need jq
 
-  local interval="${1:-${ARIA2_PROGRESS_INTERVAL:-10}}"
+  local interval="${1:-${ARIA2_PROGRESS_INTERVAL:-5}}"
   local bar_w="${2:-${ARIA2_PROGRESS_BAR_WIDTH:-40}}"
   local log_file="${3:-}"
   local comfy_root="${COMFY_HOME:-/workspace/ComfyUI}"
-  local models_root="$comfy_root/models"
 
   local endpoint="http://${ARIA2_HOST:-127.0.0.1}:${ARIA2_PORT:-6800}/jsonrpc"
   local tok=""; [[ -n "${ARIA2_SECRET:-}" ]] && tok="token:${ARIA2_SECRET}"
@@ -929,24 +928,28 @@ helpers_progress_snapshot_loop() {
     printf "]"
   }
 
-  # require 2 consecutive idle polls before exit
   local idle_streak=0
 
   while :; do
     local loop_start; loop_start="$(date +%s)"
 
-    # ---- Global stat ----
+    # ----- Global stat -----
     local payload_g='{"jsonrpc":"2.0","id":"g","method":"aria2.getGlobalStat","params":['
     [[ -n "$tok" ]] && payload_g+="\"$tok\""
     payload_g+=']}'
     local resp_g; resp_g="$(curl -sS --fail "$endpoint" -H 'Content-Type: application/json' \
                        --data-binary "$payload_g" 2>/dev/null || echo 'null')"
+
+    # Coerce to numeric 0 even if null/empty
     local active_n waiting_n stopped_n
     active_n="$( jq -r 'try ((.result // .).numActive  | tonumber) catch 0' <<<"$resp_g" )"
     waiting_n="$(jq -r 'try ((.result // .).numWaiting | tonumber) catch 0' <<<"$resp_g" )"
     stopped_n="$(jq -r 'try ((.result // .).numStopped | tonumber) catch 0' <<<"$resp_g" )"
+    [[ -z "$active_n"  ]] && active_n=0
+    [[ -z "$waiting_n" ]] && waiting_n=0
+    [[ -z "$stopped_n" ]] && stopped_n=0
 
-    # ---- Active list ----
+    # ----- Active list -----
     local payload_a='{"jsonrpc":"2.0","id":"a","method":"aria2.tellActive","params":['
     [[ -n "$tok" ]] && payload_a+="\"$tok\","
     payload_a+='["gid","status","totalLength","completedLength","downloadSpeed","files"]]}'
@@ -954,16 +957,24 @@ helpers_progress_snapshot_loop() {
                       --data-binary "$payload_a" 2>/dev/null || echo 'null')"
     local A; A="$(jq -c 'try ((.result // .) | if type=="array" then . else [] end) catch []' <<<"$resp_a")"
 
-    # Pre-extract active rows to bash, and compute max name len for alignment
-    local -a act_name act_done act_tot act_spd act_path act_destdir
-    local i=0 max_name_len=0 max_dest_len=0
+    # Reset arrays every tick (prevents stale lines)
+    local -a act_name=() act_done=() act_tot=() act_spd=() act_path=() act_destdir=()
+    local i=0 max_name_len=0
+
     while IFS=$'\t' read -r name done tot spd fullpath; do
-      # Derive destination dir relative to models_root (or comfy root), no filename
+      # guard numbers
+      [[ -z "$done" ]] && done=0
+      [[ -z "$tot"  ]] && tot=0
+      [[ -z "$spd"  ]] && spd=0
+
+      # Derive destination (relative to COMFY_HOME)
       local rel="$fullpath"
-      [[ -n "$comfy_root" && "$fullpath" == "$comfy_root"* ]] && rel="${fullpath#$comfy_root/}"
-      local destdir="$(dirname -- "$rel")"
-      # Prefer strip leading "models/" so it reads like examples
-      [[ "$destdir" == models/* ]] && destdir="${destdir#models/}" && destdir="models/${destdir}"
+      if [[ -n "$comfy_root" && "$rel" == "$comfy_root"* ]]; then
+        rel="${rel#$comfy_root/}"
+      fi
+      local destdir; destdir="$(dirname -- "$rel")"
+      [[ "$destdir" == models/* ]] || destdir="$rel"
+      [[ "$destdir" == */ ]] && destdir="${destdir%/}"
 
       act_name[i]="$name"
       act_done[i]="$done"
@@ -972,7 +983,6 @@ helpers_progress_snapshot_loop() {
       act_path[i]="$fullpath"
       act_destdir[i]="$destdir"
       (( ${#name} > max_name_len )) && max_name_len=${#name}
-      (( ${#destdir} > max_dest_len )) && max_dest_len=${#destdir}
       ((i++))
     done < <( jq -r '
         .[]
@@ -987,22 +997,24 @@ helpers_progress_snapshot_loop() {
         | [$name, ($done|tostring), ($tot|tostring), ($spd|tostring), $path] | @tsv
       ' <<<"$A" )
 
+    # Totals (force 0 if empty)
     local total_speed total_done total_size
-    total_speed="$(jq '[.[].downloadSpeed|tonumber? // 0] | add' <<<"$A")"
-    total_done="$( jq '[.[].completedLength|tonumber? // 0] | add' <<<"$A")"
-    total_size="$( jq '[.[].totalLength    |tonumber? // 0] | add' <<<"$A")"
+    total_speed="$(jq -r '[.[].downloadSpeed|tonumber? // 0] | add // 0' <<<"$A")"; [[ -z "$total_speed" ]] && total_speed=0
+    total_done="$( jq -r '[.[].completedLength|tonumber? // 0] | add // 0' <<<"$A")"; [[ -z "$total_done"  ]] && total_done=0
+    total_size="$( jq -r '[.[].totalLength    |tonumber? // 0] | add // 0' <<<"$A")"; [[ -z "$total_size"  ]] && total_size=0
 
-    # ---- Completed rows (up to last 12) & longest filename for alignment
+    # ----- Completed (last 12) & longest name -----
     local payload_s='{"jsonrpc":"2.0","id":"s","method":"aria2.tellStopped","params":['
     [[ -n "$tok" ]] && payload_s+="\"$tok\","
-    payload_s+='0,200,["status","totalLength","files"]]}'
+    payload_s+='0,200,["status","totalLength","files","errorMessage"]]}'
     local resp_s; resp_s="$(curl -sS --fail "$endpoint" -H 'Content-Type: application/json' \
                       --data-binary "$payload_s" 2>/dev/null || echo 'null')"
     local S; S="$(jq -c 'try ((.result // .) | if type=="array" then . else [] end) catch []' <<<"$resp_s")"
 
-    local -a comp_name comp_len comp_path
+    local -a comp_name=() comp_len=() comp_path=()
     local comp_count=0 comp_max_name=0
     while IFS=$'\t' read -r cname clen cpath; do
+      [[ -z "$clen" ]] && clen=0
       comp_name[comp_count]="$cname"
       comp_len[comp_count]="$clen"
       comp_path[comp_count]="$cpath"
@@ -1015,48 +1027,68 @@ helpers_progress_snapshot_loop() {
               then .files[0].path else "" end ) as $path
           | ($path|split("/")|last) as $name
           | (.totalLength|tonumber? // 0) as $len
-          | [$name, ($len|tostring), $path] ] 
+          | [$name, ($len|tostring), $path] ]
         | .[-12:] // [] | .[] | @tsv
       ' <<<"$S" )
 
-    # ---- Render snapshot ----
+    # ----- Failed (last 10 errors) -----
+    local failed_block
+    failed_block="$( jq -r '
+        [ .[]
+          | select(.status=="error")
+          | ( if (.files|type)=="array" and (.files|length)>0
+              then .files[0].path else "" end ) as $path
+          | (.errorMessage // "Unknown error") as $msg
+          | ($path|split("/")|last) as $name
+          | [$name, $msg, $path] ] | .[-10:] // []
+          | if length==0 then "" else
+              ( "Failed (recent):\n--------------------------------------------------------------------------------\n"
+                + ( map("✖ " + .[0] + "  —  " + .[1]) | join("\n") ) + "\n" )
+            end
+      ' <<<"$S")"
+
+    # ----- Render snapshot -----
     {
       local now; now="$(date '+%Y-%m-%d %H:%M:%S')"
       echo "=== aria2 progress @ $now ==="
-      echo "Active ($active_n)"
-      echo "--------------------------------------------------------------------------------"
-      local rows="${#act_name[@]}"
-      for ((i=0;i<rows;i++)); do
-        draw_bar "${act_done[i]}" "${act_tot[i]}" "$bar_w"
-        printf "  %6s/s  (%s / %s)  " \
-          "$(helpers_human_bytes "${act_spd[i]}")" \
-          "$(helpers_human_bytes "${act_done[i]}")" \
-          "$(helpers_human_bytes "${act_tot[i]}")"
 
-        # RHS: [ Destination -> <dir> ] <filename>, aligned by filename width
-        # Show destination dir relative, omit filename there
-        printf "[ Destination -> %s ] " "${act_destdir[i]}"
-        printf "%-*s\n" "$max_name_len" "${act_name[i]}"
-      done
-      echo "--------------------------------------------------------------------------------"
+      if (( ${#act_name[@]} > 0 )); then
+        echo "Active (${#act_name[@]})"
+        echo "--------------------------------------------------------------------------------"
+        local rows="${#act_name[@]}"
+        for ((i=0;i<rows;i++)); do
+          draw_bar "${act_done[i]}" "${act_tot[i]}" "$bar_w"
+          printf "  %6s/s  (%s / %s)  " \
+            "$(helpers_human_bytes "${act_spd[i]}")" \
+            "$(helpers_human_bytes "${act_done[i]}")" \
+            "$(helpers_human_bytes "${act_tot[i]}")"
+          printf "[ Destination -> %s ] " "${act_destdir[i]}"
+          printf "%-*s\n" "$max_name_len" "${act_name[i]}"
+        done
+        echo "--------------------------------------------------------------------------------"
+      else
+        echo "Active (0)"
+        echo "--------------------------------------------------------------------------------"
+      fi
+
       printf "Group total: speed %s/s, done %s / %s\n" \
         "$(helpers_human_bytes "$total_speed")" \
         "$(helpers_human_bytes "$total_done")" \
         "$(helpers_human_bytes "$total_size")"
+
       if (( total_speed > 0 )) && (( total_size >= total_done )) && (( total_size > 0 )); then
         local remain=$(( total_size - total_done ))
         local eta=$(( remain / total_speed ))
         printf "ETA: %02d:%02d\n" $((eta/60)) $((eta%60))
       fi
 
-      # ---- Completed block (aligned by longest filename in the list)
+      # Completed (aligned names)
       if (( comp_count > 0 )); then
         echo
         echo "Completed (this session)"
         echo "--------------------------------------------------------------------------------"
         local j=0
         while (( j < comp_count )); do
-          # Convert to relative path under models if possible
           local rel="${comp_path[j]}"
           [[ -n "$comfy_root" && "$rel" == "$comfy_root"* ]] && rel="${rel#$comfy_root/}"
           printf "✔ %-*s  %s  (%s)\n" \
@@ -1066,10 +1098,17 @@ helpers_progress_snapshot_loop() {
           ((j++))
         done
       fi
+
+      # Failed summary (if any)
+      if [[ -n "$failed_block" ]]; then
+        echo
+        printf "%s" "$failed_block"
+      fi
+
       echo
     } | { if [[ -n "$log_file" ]]; then tee -a "$log_file"; else cat; fi; }
 
-    # ---- Exit logic ----
+    # ----- Exit logic -----
     if (( active_n == 0 && waiting_n == 0 )); then
       ((idle_streak++))
     else
@@ -1080,7 +1119,7 @@ helpers_progress_snapshot_loop() {
       break
     fi
 
-    # Honor precise interval: subtract work time
+    # precise interval
     local loop_end; loop_end="$(date +%s)"
     local elapsed=$(( loop_end - loop_start ))
     local sleep_for=$(( interval - elapsed ))
