@@ -257,7 +257,7 @@ mkdir -p "$DIFFUSION_MODELS_DIR" "$TEXT_ENCODERS_DIR" "$CLIP_VISION_DIR" "$VAE_D
 
 aria2_enqueue_and_wait_from_manifest
 
-echo "✅ All models from manifest downloaded."
+echo "✅ All Huggingface models from manifest downloaded."
 
 #===============================================================================================
 #  6.2) CivitAI model downloader
@@ -282,7 +282,7 @@ while pgrep -x "aria2c" >/dev/null; do
   echo "🔽 Downloads still running..."
   sleep 5
 done
-echo "✅ All models downloaded successfully!"
+echo "✅ All CivitAI models downloaded successfully!"
 
 #===============================================================================================
 #  6.2.1) Rename any .zip loras to .safetensors

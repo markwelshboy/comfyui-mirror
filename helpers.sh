@@ -795,11 +795,15 @@ helpers_download_from_manifest() {
   _helpers_need curl; _helpers_need jq; _helpers_need awk
 
   if [[ -z "${MODEL_MANIFEST_URL:-}" ]]; then
-    echo "MODEL_MANIFEST_URL is not set." >&2; return 1
+    echo "MODEL_MANIFEST_URL is not set." >&2
+    return 1
   fi
 
   local MAN; MAN="$(mktemp)"
-  curl -fsSL "$MODEL_MANIFEST_URL" -o "$MAN" || { echo "Failed to fetch manifest: $MODEL_MANIFEST_URL" >&2; return 1; }
+  curl -fsSL "$MODEL_MANIFEST_URL" -o "$MAN" || {
+    echo "Failed to fetch manifest: $MODEL_MANIFEST_URL" >&2
+    return 1
+  }
 
   # Build placeholder map = vars + paths + current env (env can override)
   local VARS_JSON
@@ -810,7 +814,7 @@ helpers_download_from_manifest() {
       | ($v + $p)
     '
   )"
-  # merge uppercase env into map
+  # Merge uppercase env into map (env wins)
   while IFS='=' read -r k v; do
     [[ "$k" =~ ^[A-Z0-9_]+$ ]] || continue
     VARS_JSON="$(jq --arg k "$k" --arg v "$v" '. + {($k):$v}' <<<"$VARS_JSON")"
@@ -827,24 +831,63 @@ helpers_download_from_manifest() {
   done <<<"$SECTIONS_ALL"
 
   if ((${#ENABLED[@]}==0)); then
-    echo "No sections enabled. Available:"; echo "$SECTIONS_ALL" | sed 's/^/  - /'
+    echo "No sections enabled. Available:"
+    echo "$SECTIONS_ALL" | sed 's/^/  - /'
     return 0
   fi
   mapfile -t ENABLED < <(printf '%s\n' "${ENABLED[@]}" | awk '!seen[$0]++')
 
   helpers_have_aria2_rpc || helpers_start_aria2_daemon
-
   helpers_reset_enqueued
 
-  local url raw_path checksum path dir out gid
+  local url raw_path path dir out gid
   for sec in "${ENABLED[@]}"; do
     echo ">>> Enqueue section: $sec"
-    jq -r --arg sec "$sec" '
-      (.sections[$sec] // [])
-      | [.url, (.path // ((.dir // "") + (if .out then "/" + .out else "" end))), (.sha256 // "")]
-      | @tsv
-    ' "$MAN" | while IFS=$'\t' read -r url raw_path checksum; do
-          [[ -z "$url" || -z "$raw_path" ]] && continue
+
+    jq -r --arg sec "$sec" --arg default_dir "${DEFAULT_DOWNLOAD_DIR:-$COMFY}" '
+      def norm($default_dir):
+        if (type=="object") then
+          . as $o
+          | ($o.url // "") as $u
+          | ( $o.path // ( ($o.dir // "") + (if $o.out then ("/" + $o.out) else "" end) ) ) as $p0
+          | { u: $u
+            , p: ( if ($p0|length) > 0 then $p0
+                   else ( if ($default_dir|length) > 0
+                          then ($default_dir + "/" + ($u|sub("^.*/";"")))
+                          else (               ($u|sub("^.*/";"")) )
+                          end )
+                   end )
+            }
+        elif (type=="array") then
+          (.[0] // "") as $u
+          | (.[1] // "") as $p0
+          | { u: $u
+            , p: ( if ($p0|length) > 0 then $p0
+                   else ( if ($default_dir|length) > 0
+                          then ($default_dir + "/" + ($u|sub("^.*/";"")))
+                          else (               ($u|sub("^.*/";"")) )
+                          end )
+                   end )
+            }
+        elif (type=="string") then
+          . as $u
+          | { u: $u
+            , p: ( if ($default_dir|length) > 0
+                   then ($default_dir + "/" + ($u|sub("^.*/";"")))
+                   else (               ($u|sub("^.*/";"")) )
+                   end )
+            }
+        else
+          {u:"", p:""}
+        end;
+
+      (.sections[$sec] // [])[]
+      | norm($default_dir)
+      | select(.u|length>0 and .p|length>0)
+      | [.u, .p] | @tsv
+    ' "$MAN" | while IFS=$'\t' read -r url raw_path; do
+          [[ -z "$url" || -z "$raw_path" ]] && { echo "⚠️  Skipping invalid item"; continue; }
+
           path="$(helpers_resolve_placeholders "$raw_path" "$VARS_JSON")"
           dir="$(dirname -- "$path")"
           out="$(basename -- "$path")"
@@ -852,7 +895,7 @@ helpers_download_from_manifest() {
 
           if helpers_ensure_target_ready "$path"; then
             echo "📥 Queue: $(basename -- "$path")"
-            gid="$(helpers_rpc_add_uri "$url" "$dir" "$out" "${checksum:-}")"
+            gid="$(helpers_rpc_add_uri "$url" "$dir" "$out" "")"
             helpers_record_gid "$gid"
           fi
        done
@@ -1078,13 +1121,13 @@ helpers_record_gid() {
 # Returns 0 if all completed OK, 1 if any ended in error/removed.
 helpers_wait_for_gids() {
   _helpers_need curl; _helpers_need jq
-  local interval="${1:-${ARIA2_PROGRESS_INTERVAL:-5}}"; shift || true
+  local interval="${1:-${PROGRESS_INTERVAL:-5}}"; shift || true
   local gids=("$@")
   [[ ${#gids[@]} -eq 0 ]] && { echo "No GIDs to wait on." >&2; return 0; }
 
   declare -A done ok
   while :; do
-    # Build system.multicall payload for all not-done GIDs
+    # Build system.multicall for all not-done GIDs
     local payload='{"jsonrpc":"2.0","id":"mc","method":"system.multicall","params":[['
     local first=1
     for g in "${gids[@]}"; do
@@ -1092,11 +1135,9 @@ helpers_wait_for_gids() {
       [[ $first -eq 0 ]] && payload+=','
       first=0
       if [[ -n "${ARIA2_SECRET:-}" ]]; then
-        payload+='{"methodName":"aria2.tellStatus","params":["token:'"${ARIA2_SECRET}"'","'"$g"'",
-          ["status","errorMessage","totalLength","completedLength","files"]]}'
+        payload+='{"methodName":"aria2.tellStatus","params":["token:'"${ARIA2_SECRET}"'","'"$g"'",["status","errorMessage","totalLength","completedLength","files"]]}'
       else
-        payload+='{"methodName":"aria2.tellStatus","params":["'"$g"'",
-          ["status","errorMessage","totalLength","completedLength","files"]]}'
+        payload+='{"methodName":"aria2.tellStatus","params":["'"$g"'",["status","errorMessage","totalLength","completedLength","files"]]}'
       fi
     done
     payload+=']]}'
@@ -1110,14 +1151,11 @@ helpers_wait_for_gids() {
     resp="$(curl -s "http://${ARIA2_HOST:-127.0.0.1}:${ARIA2_PORT:-6800}/jsonrpc" \
             -H 'Content-Type: application/json' --data-binary "$payload")"
 
-    # system.multicall returns: { result: [ { result:{...} } , { error:{...} } , ... ] }
     local i=0
     for g in "${gids[@]}"; do
       [[ ${done[$g]} ]] && { i=$((i+1)); continue; }
-      # Pull i-th entry
       local node status errmsg
       node="$(jq -r --argjson idx "$i" '.result[$idx]' <<<"$resp")"
-      # If there's an error entry at this index, mark error
       if [[ "$(jq -r 'has("error")' <<<"$node")" == "true" ]]; then
         done[$g]=1; ok[$g]=0
         i=$((i+1))
@@ -1127,44 +1165,34 @@ helpers_wait_for_gids() {
       errmsg="$(jq -r '.result.errorMessage // ""' <<<"$node")"
 
       case "$status" in
-        complete)
-          done[$g]=1; ok[$g]=1 ;;
-        error|removed)
-          done[$g]=1; ok[$g]=0
-          [[ -n "$errmsg" ]] && echo "✖ $g error: $errmsg" >&2 ;;
-        *) ;; # active/waiting
+        complete) done[$g]=1; ok[$g]=1 ;;
+        error|removed) done[$g]=1; ok[$g]=0; [[ -n "$errmsg" ]] && echo "✖ $g error: $errmsg" >&2 ;;
+        *) ;;
       esac
       i=$((i+1))
     done
 
     # All done?
-    local all=1
-    for g in "${gids[@]}"; do
-      [[ ${done[$g]} ]] || { all=0; break; }
-    done
+    local all=1; for g in "${gids[@]}"; do [[ ${done[$g]} ]] || { all=0; break; }; done
     (( all )) && break
 
     sleep "$interval"
   done
 
-  # Exit 0 if all OK, else 1
-  local any_bad=0
-  for g in "${gids[@]}"; do
-    [[ "${ok[$g]}" == "1" ]] || any_bad=1
-  done
+  local any_bad=0; for g in "${gids[@]}"; do [[ "${ok[$g]}" == "1" ]] || any_bad=1; done
   return $any_bad
 }
 
 # Convenience: wait on everything recorded in $ARIA2_GID_FILE
 helpers_wait_for_enqueued() {
-  local interval="${1:-${PROGRESS_INTERVAL:-5}}"
+  local interval="${1:-${ARIA2_PROGRESS_INTERVAL:-5}}"
   [[ -f "$ARIA2_GID_FILE" ]] || { echo "No GID file: $ARIA2_GID_FILE" >&2; return 0; }
   mapfile -t gids < <(awk 'NF' "$ARIA2_GID_FILE" | awk '!seen[$0]++')
   helpers_wait_for_gids "$interval" "${gids[@]}"
 }
 
-# Run your pretty progress loop until specific GIDs finish, then exit
-aria2_progress_until_done() {
+# Run progress UI until specific GIDs finish, then exit
+helpers_progress_until_done() {
   local interval="${1:-${ARIA2_PROGRESS_INTERVAL:-5}}"; shift || true
   local gids=("$@")
   [[ ${#gids[@]} -eq 0 ]] && { echo "No GIDs to watch." >&2; return 0; }
@@ -1178,11 +1206,14 @@ aria2_progress_until_done() {
 }
 
 aria2_enqueue_and_wait_from_manifest() {
-  local interval="${1:-${ARIA2_PROGRESS_INTERVAL:-5}}"
+  local interval="${1:-${ARIA2_PROGRESS_INTERVAL:-10}}"
   helpers_download_from_manifest
-  # pull unique gids and wait with UI
+
+  # Pull unique gids we just enqueued
   mapfile -t gids < <(awk 'NF' "${ARIA2_GID_FILE:-/tmp/.aria2_enqueued_gids}" | awk '!seen[$0]++')
-  aria2_progress_until_done "$interval" "${gids[@]}"
+
+  # Run your pretty snapshot loop until those GIDs finish
+  helpers_progress_until_done "$interval" "${gids[@]}"
 }
 
 # ---------- CivitAI ID downloader (via /usr/local/bin/download_with_aria.py) ----------
