@@ -845,46 +845,29 @@ helpers_download_from_manifest() {
     echo ">>> Enqueue section: $sec"
 
     jq -r --arg sec "$sec" --arg default_dir "${DEFAULT_DOWNLOAD_DIR:-$COMFY}" '
-      def norm($default_dir):
+      # Normalize each entry to an object {url, path}
+      def as_obj:
         if (type=="object") then
-          . as $o
-          | ($o.url // "") as $u
-          | ( $o.path // ( ($o.dir // "") + (if $o.out then ("/" + $o.out) else "" end) ) ) as $p0
-          | { u: $u
-            , p: ( if ($p0|length) > 0 then $p0
-                   else ( if ($default_dir|length) > 0
-                          then ($default_dir + "/" + ($u|sub("^.*/";"")))
-                          else (               ($u|sub("^.*/";"")) )
-                          end )
-                   end )
-            }
+          {url:(.url // ""), path:(.path // ((.dir // "") + (if .out then "/" + .out else "" end)))}
         elif (type=="array") then
-          (.[0] // "") as $u
-          | (.[1] // "") as $p0
-          | { u: $u
-            , p: ( if ($p0|length) > 0 then $p0
-                   else ( if ($default_dir|length) > 0
-                          then ($default_dir + "/" + ($u|sub("^.*/";"")))
-                          else (               ($u|sub("^.*/";"")) )
-                          end )
-                   end )
-            }
+          {url:(.[0] // ""), path:(.[1] // "")}
         elif (type=="string") then
-          . as $u
-          | { u: $u
-            , p: ( if ($default_dir|length) > 0
-                   then ($default_dir + "/" + ($u|sub("^.*/";"")))
-                   else (               ($u|sub("^.*/";"")) )
-                   end )
-            }
+          {url:., path:""}
         else
-          {u:"", p:""}
+          {url:"", path:""}
         end;
 
       (.sections[$sec] // [])[]
-      | norm($default_dir)
-      | select(.u|length>0 and .p|length>0)
-      | [.u, .p] | @tsv
+      | as_obj
+      | .url as $u
+      | ( if (.path|length) > 0 then .path
+          else ( if ($default_dir|length) > 0
+                then ($default_dir + "/" + ($u|sub("^.*/";"")))
+                else (               ($u|sub("^.*/";"")) )
+                end )
+          end ) as $p
+      | select(($u|type)=="string" and ($p|type)=="string" and ($u|length)>0 and ($p|length)>0)
+      | [$u, $p] | @tsv
     ' "$MAN" | while IFS=$'\t' read -r url raw_path; do
           [[ -z "$url" || -z "$raw_path" ]] && { echo "⚠️  Skipping invalid item"; continue; }
 
@@ -898,7 +881,7 @@ helpers_download_from_manifest() {
             gid="$(helpers_rpc_add_uri "$url" "$dir" "$out" "")"
             helpers_record_gid "$gid"
           fi
-       done
+      done
   done
 
   echo "✅ Enqueued selected sections."
