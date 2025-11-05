@@ -889,135 +889,219 @@ helpers_download_from_manifest() {
 
 # ---------- Progress snapshots (append-friendly; no clear by default) ----------
 helpers_progress_snapshot_loop() {
-  _helpers_need curl; _helpers_need jq; _helpers_need gawk
-  local interval="${1:-${ARIA2_PROGRESS_INTERVAL:-5}}"
-  local barw="${2:-${ARIA2_PROGRESS_BAR_WIDTH:-40}}"
-  local outlog="${3:-${COMFY_LOGS:-/workspace/logs}/aria2_progress.log}"
-  [[ "$interval" =~ ^[0-9]+$ ]] || interval=5
-  [[ "$barw" =~ ^[0-9]+$ ]] || barw=40
-  mkdir -p "$(dirname "$outlog")"
+  _helpers_need curl; _helpers_need jq
+  local interval="${1:-${PROGRESS_INTERVAL:-5}}"
+  local bar_w="${2:-${PROGRESS_BAR_WIDTH:-40}}"
+  local log_file="${3:-}"
 
-  local keys='["gid","status","totalLength","completedLength","downloadSpeed","files"]'
-  local seen_file="/tmp/.aria2_seen_completed_paths"
-  touch "$seen_file"
+  local endpoint="http://${ARIA2_HOST:-127.0.0.1}:${ARIA2_PORT:-6800}/jsonrpc"
+  local token_prefix=""
+  [[ -n "${ARIA2_SECRET:-}" ]] && token_prefix="token:${ARIA2_SECRET}"
 
-  human_bytes(){ gawk 'function h(x){s="B KB MB GB TB PB";split(s,a," ");i=1;while(x>=1024&&i<6){x/=1024;i++}
-    return (i==1?sprintf("%d %s",x,a[i]):sprintf("%.2f %s",x,a[i]))} {print h($1)}' ;}
-  print_bar(){ local p="$1" w="$2"; local f=$(( (p*w)/100 )); local e=$(( w-f ))
-    printf "[%s%s]" "$(printf '█%.0s' $(seq 1 $f))" "$(printf ' %.0s' $(seq 1 $e))"; }
+  # jq filter to normalize ANY rpc response to a flat array of result objects
+  local JQ_NORM='
+    def norm:
+      # If it is an object with "result", unwrap it; else leave as-is
+      ( if (type=="object" and has("result")) then .result else . end )
+      # Ensure array
+      | ( if (type=="array") then . else [.] end )
+      # Elements might be {"result": {...}} (system.multicall), unwrap
+      | map( if (type=="object" and has("result")) then .result else . end );
 
-  while :; do
-    {
-      echo "=== aria2 progress @ $(date '+%Y-%m-%d %H:%M:%S') ==="
+    norm
+  '
 
-      # Active jobs
-      ACTIVE_JSON="$(curl -s "http://${ARIA2_HOST}:${ARIA2_PORT}/jsonrpc" \
-        -H 'Content-Type: application/json' \
-        --data "{ \"jsonrpc\":\"2.0\",\"id\":\"a\",\"method\":\"aria2.tellActive\",\"params\":[ $(_helpers_tok_json) $keys ] }")"
-      local count; count="$(jq '.result|length' <<<"$ACTIVE_JSON")"
-      echo "Active (${count})"
-      echo "--------------------------------------------------------------------------------"
+  # Helpers
+  human_bytes() {
+    # bytes -> human (B/KB/MB/GB)
+    awk 'function hb(n){ s="B KB MB GB TB"; i=0; while(n>=1024 && i<4){n/=1024; i++} return (i? sprintf("%.2f %s", n, substr(s, i*3+1, 2)): sprintf("%d B", n)) }
+         {printf "%s", hb($1)}'
+  }
 
-      local total_speed=0 total_done=0 total_size=0
-      while IFS=$'\t' read -r status total done speed name; do
-        pct=0; [[ "$total" =~ ^[0-9]+$ && "$total" -gt 0 ]] && pct=$(( (done*100)/total ))
-        bar="$(print_bar "$pct" "$barw")"
-        sh="$(printf "%s/s" "$(printf "%s" "$speed" | human_bytes)")"
-        dh="$(printf "%s" "$done" | human_bytes)"
-        th="$(printf "%s" "$total" | human_bytes)"
-        printf "%-50.50s  %3d%% %s  %8s  (%s / %s)\n" "$(basename "$name")" "$pct" "$bar" "$sh" "$dh" "$th"
-        total_speed=$(( total_speed + speed ))
-        total_done=$(( total_done + done ))
-        total_size=$(( total_size + total ))
-      done < <(
-        jq -r '
-          (.result // [])
-          | map({
-              status,
-              total: (.totalLength|tonumber? // 0),
-              done:  (.completedLength|tonumber? // 0),
-              speed: (.downloadSpeed|tonumber? // 0),
-              name:  ( .files[0].path // (.files[0].uris[0].uri // "unknown") )
-            })
-          | .[]
-          | [ .status, (.total|tostring), (.done|tostring), (.speed|tostring), .name ]
-          | @tsv
-        ' <<<"$ACTIVE_JSON"
-      )
-
-      # ---- totals already accumulated above: total_speed, total_done, total_size ----
-      local sp dsum tsum
-      sp="$(printf "%s/s" "$(printf "%s" "$total_speed" | human_bytes)")"
-      dsum="$(printf "%s" "$total_done" | human_bytes)"
-      tsum="$(printf "%s" "$total_size" | human_bytes)"
-      echo "--------------------------------------------------------------------------------"
-      echo "Group total: speed ${sp}, done ${dsum} / ${tsum}"
-
-      # ETA (hh:mm:ss) using totals; guard against divide-by-zero & weirdness
-      if (( total_speed > 0 && total_size > 0 )); then
-        local remain eta_sec
-        remain=$(( total_size - total_done ))
-        (( remain < 0 )) && remain=0
-        # ceil division for nicer ETA (round up to next second)
-        eta_sec=$(( (remain + total_speed - 1) / total_speed ))
-        printf "ETA: %02d:%02d:%02d\n" $((eta_sec/3600)) $(((eta_sec%3600)/60)) $((eta_sec%60))
-      fi
-      echo  
-      
-      # Completed section
-      STOP_JSON="$(curl -s "http://${ARIA2_HOST}:${ARIA2_PORT}/jsonrpc" \
-        -H 'Content-Type: application/json' \
-        --data "{ \"jsonrpc\":\"2.0\",\"id\":\"s\",\"method\":\"aria2.tellStopped\",\"params\":[ $(_helpers_tok_json) 0,100,[\"gid\",\"status\",\"files\",\"totalLength\"] ] }")"
-      mapfile -t NEW_DONE < <(
-        jq -r '
-          (.result // [])
-          | map(select(.status=="complete"))
-          | .[]
-          | [ (.files[0].path // (.files[0].uris[0].uri // "unknown")),
-              (.totalLength|tonumber? // 0) ]
-          | @tsv
-        ' <<<"$STOP_JSON" \
-        | while IFS=$'\t' read -r fpath bytes; do
-            if ! grep -Fxq -- "$fpath" "$seen_file"; then
-              printf "%s\t%s\n" "$fpath" "$bytes"
-              echo "$fpath" >> "$seen_file"
-            fi
-          done
-      )
-      if ((${#NEW_DONE[@]})); then
-        echo "Completed (${#NEW_DONE[@]})"
-        echo "--------------------------------------------------------------------------------"
-        for line in "${NEW_DONE[@]}"; do
-          fpath="${line%%$'\t'*}"
-          bytes="${line##*$'\t'}"
-          size_h="$(printf "%s" "$bytes" | human_bytes)"
-          printf "✔ %-50.50s  (%s)\n" "$(basename "$fpath")" "$size_h"
-        done
-        echo
-      fi
-    } | tee -a "$outlog"
-
-    # Exit when no active/waiting jobs remain
-    active_count="$(jq '.result | length' <<<"$ACTIVE_JSON")"
-    WAITING_JSON="$(curl -s "http://${ARIA2_HOST}:${ARIA2_PORT}/jsonrpc" \
-      -H 'Content-Type: application/json' \
-      --data "{ \"jsonrpc\":\"2.0\",\"id\":\"w\",\"method\":\"aria2.tellWaiting\",\"params\":[ $(_helpers_tok_json) 0,1, $keys ] }")"
-    waiting_count="$(jq '.result | length' <<<"$WAITING_JSON")"
-    if [[ "$active_count" -eq 0 && "$waiting_count" -eq 0 ]]; then
-      sleep "$interval"
-      ACTIVE_JSON="$(curl -s "http://${ARIA2_HOST}:${ARIA2_PORT}/jsonrpc" \
-        -H 'Content-Type: application/json' \
-        --data "{ \"jsonrpc\":\"2.0\",\"id\":\"a\",\"method\":\"aria2.tellActive\",\"params\":[ $(_helpers_tok_json) $keys ] }")"
-      active_count="$(jq '.result | length' <<<"$ACTIVE_JSON")"
-      WAITING_JSON="$(curl -s "http://${ARIA2_HOST}:${ARIA2_PORT}/jsonrpc" \
-        -H 'Content-Type: application/json' \
-        --data "{ \"jsonrpc\":\"2.0\",\"id\":\"w\",\"method\":\"aria2.tellWaiting\",\"params\":[ $(_helpers_tok_json) 0,1, $keys ] }")"
-      waiting_count="$(jq '.result | length' <<<"$WAITING_JSON")"
-      if [[ "$active_count" -eq 0 && "$waiting_count" -eq 0 ]]; then
-        echo "All downloads are idle/finished." | tee -a "$outlog"
-        break
-      fi
+  draw_bar() {
+    local done="$1" total="$2" width="$3"
+    local pct=0
+    if (( total > 0 )); then
+      pct=$(( done * 100 / total ))
     fi
+    local fill=$(( (pct * width) / 100 ))
+    local empty=$(( width - fill ))
+    printf "%3d%% [" "$pct"
+    printf '%*s' "$fill" '' | tr ' ' '█'
+    printf '%*s' "$empty" '' | tr ' ' ' '
+    printf "]"
+  }
+
+  # poll loop
+  while :; do
+    # --- Fetch active/waiting/stopped in one go (system.multicall)
+    # active
+    local active_payload; active_payload='{"jsonrpc":"2.0","id":"a","method":"aria2.tellActive","params":['
+    if [[ -n "$token_prefix" ]]; then
+      active_payload+="\"$token_prefix\","
+    fi
+    active_payload+='["gid","status","totalLength","completedLength","downloadSpeed","files"]]}'
+
+    # waiting
+    local waiting_payload; waiting_payload='{"jsonrpc":"2.0","id":"w","method":"aria2.tellWaiting","params":['
+    if [[ -n "$token_prefix" ]]; then
+      waiting_payload+="\"$token_prefix\","
+    fi
+    waiting_payload+='0,100,["gid","status","totalLength","completedLength","downloadSpeed","files"]]}'
+
+    # stopped (we only need a few recent)
+    local stopped_payload; stopped_payload='{"jsonrpc":"2.0","id":"s","method":"aria2.tellStopped","params":['
+    if [[ -n "$token_prefix" ]]; then
+      stopped_payload+="\"$token_prefix\","
+    fi
+    stopped_payload+='0,25,["gid","status","totalLength","completedLength","downloadSpeed","files"]]}'
+
+    local mc; mc='{"jsonrpc":"2.0","id":"mc","method":"system.multicall","params":[['
+    mc+="$active_payload,$waiting_payload,$stopped_payload"
+    mc+=']]}'
+
+    local resp
+    resp="$(curl -s "$endpoint" -H 'Content-Type: application/json' --data-binary "$mc")"
+
+    # Normalize each call’s result independently
+    # We expect system.multicall to return something like:
+    # {"result":[{"result":[<active>...]},{"result":[<waiting>...]},{"result":[<stopped>...]}]}
+    # But we defend against variants.
+    local json_active json_wait json_stop
+    json_active="$(jq -c '
+      def pick(i):
+        if (has("result")) then .result else . end
+        | (if type=="array" then . else [.] end)
+        | ( .[i] // {} )
+        | (if (type=="object" and has("result")) then .result else . end);
+      pick(0) | '"$JQ_NORM" <<<"$resp")"
+    json_wait="$(jq -c '
+      def pick(i):
+        if (has("result")) then .result else . end
+        | (if type=="array" then . else [.] end)
+        | ( .[i] // {} )
+        | (if (type=="object" and has("result")) then .result else . end);
+      pick(1) | '"$JQ_NORM" <<<"$resp")"
+    json_stop="$(jq -c '
+      def pick(i):
+        if (has("result")) then .result else . end
+        | (if type=="array" then . else [.] end)
+        | ( .[i] // {} )
+        | (if (type=="object" and has("result")) then .result else . end);
+      pick(2) | '"$JQ_NORM" <<<"$resp")"
+
+    # Compose a single list we’ll render: prefer active; if none, show completed summary
+    local now; now="$(date '+%Y-%m-%d %H:%M:%S')"
+    {
+      echo "=== aria2 progress @ $now ==="
+
+      # Active table
+      local active_count; active_count="$(jq 'length' <<<"$json_active")"
+      echo "Active ($active_count)"
+      echo "--------------------------------------------------------------------------------"
+
+      # Totals
+      local total_speed total_done total_size
+      total_speed="$(jq '[.[].downloadSpeed|tonumber? // 0] | add' <<<"$json_active")"
+      total_done="$(jq '[.[].completedLength|tonumber? // 0] | add' <<<"$json_active")"
+      total_size="$(jq '[.[].totalLength|tonumber? // 0] | add' <<<"$json_active")"
+
+      # Per-file bars
+      jq -r --arg width "$bar_w" '
+        def hb(n):
+          if n==null then "0 B"
+          else
+            n as $x
+            | if $x<1024 then "\($x) B"
+              elif $x<1048576 then "\(($x/1024)|floor) KB"
+              elif $x<1073741824 then "\(($x/1048576)|floor) MB"
+              else "\(($x/1073741824)|floor) GB"
+              end
+          end;
+
+        .[]
+        | . as $it
+        | ($it.totalLength|tonumber? // 0) as $tot
+        | ($it.completedLength|tonumber? // 0) as $done
+        | ($it.downloadSpeed|tonumber? // 0) as $spd
+        | ( if ($it.files|type)=="array" and ($it.files|length)>0
+            then ($it.files[0].path // "unknown")
+            else "unknown"
+          ) as $path
+        | ($path | split("/") | last) as $name
+        | ($tot; $done; $spd; $name)
+        | @json
+      ' <<<"$json_active" |
+      while read -r line; do
+        # shell side: render progress bar
+        read -r tot done sp name <<<"$(python3 - <<'PY' "$line" "$bar_w"
+import json,sys
+obj=json.loads(sys.argv[1])
+barw=int(sys.argv[2])
+tot=int(obj[0]); done=int(obj[1]); sp=int(obj[2]); name=obj[3]
+pct=(done*100//tot) if tot>0 else 0
+fill=(pct*barw)//100
+bar=("█"*fill)+(" "*(barw-fill))
+def hb(n):
+  if n<1024: return f"{n} B"
+  if n<1048576: return f"{n//1024} KB"
+  if n<1073741824: return f"{n//1048576} MB"
+  return f"{n//1073741824} GB"
+print(tot,done,sp,name,bar,pct)
+PY
+)"
+        # Print line
+        printf "%-52s %3d%% [%s] %6s/s  (%s / %s)\n" \
+          "$(printf '%.52s' "$name")" \
+          "$pct" "$bar" \
+          "$(printf "%s" "$sp" | human_bytes)" \
+          "$(printf "%s" "$done" | human_bytes)" \
+          "$(printf "%s" "$tot"  | human_bytes)"
+      done
+
+      echo "--------------------------------------------------------------------------------"
+
+      # Group totals + ETA
+      local sp_h dsum_h tsum_h eta
+      sp_h="$(printf "%s" "$total_speed" | human_bytes)"
+      dsum_h="$(printf "%s" "$total_done"  | human_bytes)"
+      tsum_h="$(printf "%s" "$total_size"  | human_bytes)"
+      echo "Group total: speed ${sp_h}/s, done ${dsum_h} / ${tsum_h}"
+
+      if [[ "$total_speed" =~ ^[0-9]+$ ]] && [[ "$total_size" =~ ^[0-9]+$ ]] && [[ "$total_done" =~ ^[0-9]+$ ]] && (( total_speed > 0 )) && (( total_size >= total_done )); then
+        local remain=$(( total_size - total_done ))
+        local eta_sec=$(( remain / total_speed ))
+        printf "ETA: %02d:%02d\n" $((eta_sec/60)) $((eta_sec%60))
+      fi
+      echo
+
+      # If no active, show small "Completed" section snapshot
+      if (( active_count == 0 )); then
+        local completed_lines
+        completed_lines="$(jq -r '
+          .[]
+          | select(.status=="complete")
+          | ( if (.files|type)=="array" and (.files|length)>0 then .files[0].path else "" end ) as $p
+          | ($p|split("/")|last) as $n
+          | ($n + "  (" + ((.totalLength|tonumber? // 0)|tostring) + " bytes)")
+        ' <<<"$json_stop")"
+        if [[ -n "$completed_lines" ]]; then
+          echo "Completed ($(printf "%s" "$completed_lines" | wc -l))"
+          echo "--------------------------------------------------------------------------------"
+          printf '%s\n' "$completed_lines" | sed 's/^/✔ /'
+          echo
+        fi
+      fi
+    } | tee -a ${log_file:-/dev/null}
+
+    # Exit condition: nothing active or waiting for a while → break
+    local active_n wait_n
+    active_n="$(jq 'length' <<<"$json_active")"
+    wait_n="$(jq 'length' <<<"$json_wait")"
+    if (( active_n==0 && wait_n==0 )); then
+      break
+    fi
+
     sleep "$interval"
   done
 }
