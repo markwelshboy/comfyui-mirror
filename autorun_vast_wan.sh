@@ -227,40 +227,7 @@ else
   echo "[custom-nodes] No remote nodes list found on HF; will use local CUSTOM_NODE_LIST or DEFAULT_NODES."
 fi
 
-# -- Default/fallback nodes (must be exported before helpers that resolve lists)
-export DEFAULT_NODES=(
-  https://github.com/ssitu/ComfyUI_UltimateSDUpscale.git
-  https://github.com/chflame163/ComfyUI_LayerStyle.git
-  https://github.com/chflame163/ComfyUI_LayerStyle_Advance.git
-  https://github.com/kijai/ComfyUI-KJNodes.git
-  https://github.com/rgthree/rgthree-comfy.git
-  https://github.com/JPS-GER/ComfyUI_JPS-Nodes.git
-  https://github.com/Suzie1/ComfyUI_Comfyroll_CustomNodes.git
-  https://github.com/Jordach/comfy-plasma.git
-  https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git
-  https://github.com/bash-j/mikey_nodes.git
-  https://github.com/ltdrdata/ComfyUI-Impact-Pack.git
-  https://github.com/Fannovel16/comfyui_controlnet_aux.git
-  https://github.com/yolain/ComfyUI-Easy-Use.git
-  https://github.com/kijai/ComfyUI-Florence2.git
-  https://github.com/ShmuelRonen/ComfyUI-LatentSyncWrapper.git
-  https://github.com/WASasquatch/was-node-suite-comfyui.git
-  https://github.com/theUpsider/ComfyUI-Logic.git
-  https://github.com/cubiq/ComfyUI_essentials.git
-  https://github.com/chrisgoringe/cg-image-picker.git
-  https://github.com/chrisgoringe/cg-use-everywhere.git
-  https://github.com/kijai/ComfyUI-segment-anything-2.git
-  https://github.com/ClownsharkBatwing/RES4LYF
-  https://github.com/welltop-cn/ComfyUI-TeaCache.git
-  https://github.com/Fannovel16/ComfyUI-Frame-Interpolation.git
-  https://github.com/Jonseed/ComfyUI-Detail-Daemon.git
-  https://github.com/kijai/ComfyUI-WanVideoWrapper.git
-  https://github.com/BadCafeCode/masquerade-nodes-comfyui.git
-  https://github.com/1038lab/ComfyUI-RMBG.git
-  https://github.com/M1kep/ComfyLiterals.git
-  https://github.com/wildminder/ComfyUI-VibeVoice.git
-  https://github.com/kijai/ComfyUI-WanAnimatePreprocess.git
-)
+# ------------- DEFAULT_NODES in .env
 
 # 1) Compute pins once (helpers read $PY inside pins_signature)
 export PINS="$(pins_signature)"
@@ -288,9 +255,9 @@ mkdir -p "$DIFFUSION_MODELS_DIR" "$TEXT_ENCODERS_DIR" "$CLIP_VISION_DIR" "$VAE_D
 #  6.1) Huggingface Model downloader from manifest (uses helpers.sh)
 #===============================================================================================
 
-helpers_download_from_manifest
-# Run snapshot loop in foreground (or background by appending &)
-helpers_progress_snapshot_loop "$ARIA_PROGRESS_INTERVAL" "$ARIA_PROGRESS_BAR_WIDTH" "$LOG_DIR/aria2_progress.log"
+aria2_enqueue_and_wait_from_manifest
+
+echo "✅ All models from manifest downloaded."
 
 #===============================================================================================
 #  6.2) CivitAI model downloader
@@ -307,7 +274,7 @@ mkdir -p "${CIVITAI_LOG_DIR}"
 echo "Downloading models from CivitAI..."
 
 # Using env-defined lists (checkpoints + loras):
-helpers_download_civitai_ids
+download_civitai_ids
 
 # Optional: wait until aria2 RPC daemon is idle
 echo "⏳ Waiting for background aria2 downloads to finish..."
@@ -335,14 +302,14 @@ cd /workspace
 
 echo "Relocate upscaling model(s) to the correct directory..."
 if [ ! -f "$UPSCALE_DIR/4xLSDIR.pth" ]; then
-    if [ -f "/workspace/comfyui-mirror/4xLSDIR.pth" ]; then
-        mv "/workspace/comfyui-mirror/4xLSDIR.pth" "$UPSCALE_DIR/4xLSDIR.pth"
-        echo "Moved 4xLSDIR.pth to the correct location."
-    else
-        echo "4xLSDIR.pth not found in the comfyui-mirror git directory."
-    fi
+  if [ -f "/workspace/comfyui-mirror/4xLSDIR.pth" ]; then
+    mv "/workspace/comfyui-mirror/4xLSDIR.pth" "$UPSCALE_DIR/4xLSDIR.pth"
+    echo "Moved 4xLSDIR.pth to the correct location."
+  else
+    echo "4xLSDIR.pth not found in the comfyui-mirror git directory."
+  fi
 else
-    echo "4xLSDIR.pth already exists. Skipping."
+  echo "4xLSDIR.pth already exists. Skipping."
 fi
 
 #===============================================================================================
@@ -381,7 +348,6 @@ for dir in "$SOURCE_DIR"/*/; do
     fi
 done
 
-
 #===============================================================================================
 #  6.5) Change default preview method to 'auto' in VHS Latent Preview node
 #===============================================================================================
@@ -412,17 +378,17 @@ always_lazy_install = False
 network_mode = public
 db_mode = cache
 INI
-  fi
-else
+  else
     echo "config.ini already exists. Updating preview_method..."
     sed -i 's/^preview_method = .*/preview_method = auto/' "$CONFIG_FILE"
-fi
-echo "Config file setup complete!"
-    echo "Default preview method updated to 'auto'"
-else
-    echo "Skipping preview method update (change_preview_method is not 'true')."
-fi
+  fi
+  
+  echo "Config file setup complete!"
+  echo "Default preview method updated to 'auto'"
 
+else
+  echo "Skipping preview method update (change_preview_method is not 'true')."
+fi
 
 #===============================================================================================
 #
