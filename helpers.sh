@@ -1102,6 +1102,16 @@ PY
       break
     fi
 
+    # Detect idle state (no progress, no active/waiting)
+    if (( active_n==0 && wait_n==0 )); then
+      # Check if any download finished in the last poll
+      if [[ "${_last_done:-}" == "$total_done" ]]; then
+        echo "✅ All downloads complete — exiting progress loop."
+        break
+      fi
+      _last_done="$total_done"
+    fi
+
     sleep "$interval"
   done
 }
