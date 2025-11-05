@@ -891,8 +891,8 @@ helpers_download_from_manifest() {
 helpers_progress_snapshot_loop() {
   _helpers_need curl; _helpers_need jq
 
-  local interval="${1:-${PROGRESS_INTERVAL:-5}}"
-  local bar_w="${2:-${PROGRESS_BAR_WIDTH:-40}}"
+  local interval="${1:-${ARIA2_PROGRESS_INTERVAL:-5}}"
+  local bar_w="${2:-${ARIA2_PROGRESS_BAR_WIDTH:-40}}"
   local log_file="${3:-}"
 
   local endpoint="http://${ARIA2_HOST:-127.0.0.1}:${ARIA2_PORT:-6800}/jsonrpc"
@@ -912,40 +912,46 @@ helpers_progress_snapshot_loop() {
     (( total > 0 )) && pct=$(( done*100/total ))
     fill=$(( pct*width/100 )); empty=$(( width-fill ))
     printf "%3d%% [" "$pct"
-    printf '%*s' "$fill" '' | tr ' ' '█'
+    printf '%*s' "$fill" '' | tr ' ' '#'
     printf '%*s' "$empty" '' | tr ' ' ' '
     printf "]"
   }
 
-  local _last_total_done=""
-  while :; do
-    # ----- ACTIVE -----
-    local payload_active='{"jsonrpc":"2.0","id":"a","method":"aria2.tellActive","params":['
-    [[ -n "$tok" ]] && payload_active+="\"$tok\","
-    payload_active+='["gid","status","totalLength","completedLength","downloadSpeed","files"]]}'
+  # require 2 consecutive idle polls before exit
+  local idle_streak=0
 
-    # curl may fail → ensure A is a JSON array anyway
-    local resp_a; resp_a="$(curl -sS --fail "$endpoint" \
-        -H 'Content-Type: application/json' \
-        --data-binary "$payload_active" 2>/dev/null || echo 'null')"
+  while :; do
+    # ---- Global stat (robust counts) ----
+    local payload_g='{"jsonrpc":"2.0","id":"g","method":"aria2.getGlobalStat","params":['
+    [[ -n "$tok" ]] && payload_g+="\"$tok\""
+    payload_g+=']}'
+    local resp_g; resp_g="$(curl -sS --fail "$endpoint" -H 'Content-Type: application/json' \
+                       --data-binary "$payload_g" 2>/dev/null || echo 'null')"
+    local active_n waiting_n stopped_n
+    active_n="$( jq -r 'try ((.result // .).numActive    | tonumber) catch 0' <<<"$resp_g" )"
+    waiting_n="$(jq -r 'try ((.result // .).numWaiting   | tonumber) catch 0' <<<"$resp_g" )"
+    stopped_n="$(jq -r 'try ((.result // .).numStopped   | tonumber) catch 0' <<<"$resp_g" )"
+
+    # ---- List active items for per-file progress ----
+    local payload_a='{"jsonrpc":"2.0","id":"a","method":"aria2.tellActive","params":['
+    [[ -n "$tok" ]] && payload_a+="\"$tok\","
+    payload_a+='["gid","status","totalLength","completedLength","downloadSpeed","files"]]}'
+    local resp_a; resp_a="$(curl -sS --fail "$endpoint" -H 'Content-Type: application/json' \
+                      --data-binary "$payload_a" 2>/dev/null || echo 'null')"
     local A; A="$(jq -c 'try ((.result // .) | if type=="array" then . else [] end) catch []' <<<"$resp_a")"
 
-    # ----- WAITING -----
-    local payload_wait='{"jsonrpc":"2.0","id":"w","method":"aria2.tellWaiting","params":['
-    [[ -n "$tok" ]] && payload_wait+="\"$tok\","
-    payload_wait+='0,200,["gid","status","totalLength","completedLength","downloadSpeed","files"]]}'
-    local resp_w; resp_w="$(curl -sS --fail "$endpoint" \
-        -H 'Content-Type: application/json' \
-        --data-binary "$payload_wait" 2>/dev/null || echo 'null')"
-    local W; W="$(jq -c 'try ((.result // .) | if type=="array" then . else [] end) catch []' <<<"$resp_w")"
+    # totals across active
+    local total_speed total_done total_size
+    total_speed="$(jq '[.[].downloadSpeed|tonumber? // 0] | add' <<<"$A")"
+    total_done="$( jq '[.[].completedLength|tonumber? // 0] | add' <<<"$A")"
+    total_size="$( jq '[.[].totalLength    |tonumber? // 0] | add' <<<"$A")"
 
-    local now; now="$(date '+%Y-%m-%d %H:%M:%S')"
+    # ---- Render snapshot ----
     {
+      local now; now="$(date '+%Y-%m-%d %H:%M:%S')"
       echo "=== aria2 progress @ $now ==="
-      local active_n; active_n="$(jq 'length' <<<"$A")"
       echo "Active ($active_n)"
       echo "--------------------------------------------------------------------------------"
-
       jq -r '
         .[]
         | . as $it
@@ -961,16 +967,9 @@ helpers_progress_snapshot_loop() {
           printf "  %6s/s  (%s / %s)  %s\n" \
             "$(human_bytes "$spd")" "$(human_bytes "$done")" "$(human_bytes "$tot")" "$name"
         done
-
       echo "--------------------------------------------------------------------------------"
-      local total_speed total_done total_size
-      total_speed="$(jq '[.[].downloadSpeed|tonumber? // 0] | add' <<<"$A")"
-      total_done="$( jq '[.[].completedLength|tonumber? // 0] | add' <<<"$A")"
-      total_size="$( jq '[.[].totalLength    |tonumber? // 0] | add' <<<"$A")"
-
       printf "Group total: speed %s/s, done %s / %s\n" \
         "$(human_bytes "$total_speed")" "$(human_bytes "$total_done")" "$(human_bytes "$total_size")"
-
       if (( total_speed > 0 )) && (( total_size >= total_done )) && (( total_size > 0 )); then
         local remain=$(( total_size - total_done ))
         local eta=$(( remain / total_speed ))
@@ -979,17 +978,18 @@ helpers_progress_snapshot_loop() {
       echo
     } | { if [[ -n "$log_file" ]]; then tee -a "$log_file"; else cat; fi; }
 
-    # exit cleanly once idle for one full poll
-    local wait_n; wait_n="$(jq 'length' <<<"$W")"
-    if (( active_n==0 && wait_n==0 )); then
-      if [[ -z "$_last_total_done" || "$_last_total_done" == "$(jq -r '.' <<<"$total_done")" ]]; then
-        echo "✅ All downloads complete — exiting progress loop."
-        break
-      fi
+    # ---- Exit logic (use global stat) ----
+    if (( active_n == 0 && waiting_n == 0 )); then
+      ((idle_streak++))
+    else
+      idle_streak=0
     fi
-    _last_total_done="$(jq -r '.' <<<"$total_done")"
+    if (( idle_streak >= 2 )); then
+      echo "✅ All downloads complete — exiting progress loop."
+      break
+    fi
 
-    # manual stopfile
+    # manual stop
     if [[ -f /tmp/.aria2_progress.stop ]]; then
       echo "🛑 Stop file detected — exiting progress loop."
       rm -f /tmp/.aria2_progress.stop
@@ -1082,7 +1082,7 @@ helpers_record_gid() {
 # Returns 0 if all completed OK, 1 if any ended in error/removed.
 helpers_wait_for_gids() {
   _helpers_need curl; _helpers_need jq
-  local interval="${1:-${PROGRESS_INTERVAL:-5}}"; shift || true
+  local interval="${1:-${ARIA2_PROGRESS_INTERVAL:-5}}"; shift || true
   local gids=("$@")
   [[ ${#gids[@]} -eq 0 ]] && { echo "No GIDs to wait on." >&2; return 0; }
 
@@ -1174,7 +1174,6 @@ aria2_enqueue_and_wait_from_manifest() {
     return 1
   fi
 
-  # fetch manifest
   local MAN; MAN="$(mktemp)"
   if ! curl -fsSL "${MODEL_MANIFEST_URL}" -o "$MAN"; then
     echo "Failed to fetch manifest" >&2
@@ -1182,7 +1181,7 @@ aria2_enqueue_and_wait_from_manifest() {
     return 1
   fi
 
-  # vars + paths map, uppercase ENV overrides
+  # Build var map (vars + paths), then uppercase ENV overrides
   local VARS_JSON
   VARS_JSON="$(
     jq -n --slurpfile m "$MAN" '
@@ -1196,7 +1195,7 @@ aria2_enqueue_and_wait_from_manifest() {
     VARS_JSON="$(jq --arg k "$k" --arg v "$v" '. + {($k):$v}' <<<"$VARS_JSON")"
   done < <(env)
 
-  # enabled sections
+  # Which sections are on?
   local SECTIONS_ALL ENABLED sec
   SECTIONS_ALL="$(jq -r '.sections | keys[]' "$MAN")"
   ENABLED=()
@@ -1215,8 +1214,7 @@ aria2_enqueue_and_wait_from_manifest() {
     return 0
   fi
 
-  # enqueue without any curl HEAD precheck (quiet + fast)
-  local attempted=0
+  # Enqueue (no pre-HEAD).
   for sec in "${ENABLED[@]}"; do
     echo ">>> Enqueue section: $sec"
     jq -r --arg sec "$sec" '
@@ -1232,15 +1230,13 @@ aria2_enqueue_and_wait_from_manifest() {
 
       if helpers_ensure_target_ready "$path"; then
         echo "📥 Queue: $out"
-        # Try to enqueue; we don’t care about GID here—aria2 will tell us pending count next.
         helpers_rpc_add_uri "$url" "$dir" "$out" "" >/dev/null || true
-        ((attempted++))
       fi
     done
   done
   rm -f "$MAN"
 
-  # ask aria2 if there is anything pending; only then run the progress loop
+  # Start loop only if aria2 says there’s something pending
   local pending; pending="$(helpers_rpc_count_pending)"
   if (( pending == 0 )); then
     echo "Nothing enqueued. Exiting without starting progress loop."
@@ -1253,6 +1249,7 @@ aria2_enqueue_and_wait_from_manifest() {
   mkdir -p -- "$(dirname -- "$logfile")"
 
   helpers_progress_snapshot_loop "$interval" "$width" "$logfile"
+  return 0
 }
 
 helpers_rpc_count_pending() {
