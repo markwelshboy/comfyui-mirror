@@ -891,7 +891,7 @@ helpers_download_from_manifest() {
 helpers_progress_snapshot_loop() {
   _helpers_need curl; _helpers_need jq
 
-  local interval="${1:-${ARIA2_PROGRESS_INTERVAL:-5}}"
+  local interval="${1:-${ARIA2_PROGRESS_INTERVAL:-10}}"
   local bar_w="${2:-${ARIA2_PROGRESS_BAR_WIDTH:-40}}"
   local log_file="${3:-}"
 
@@ -1018,7 +1018,7 @@ helpers_watch_gids() {
     done
     for g in "${gids[@]}"; do [[ ${done[$g]} ]] || { all=0; break; }; done
     (( all )) && break
-    sleep "${ARIA2_PROGRESS_INTERVAL:-2}"
+    sleep "${ARIA2_PROGRESS_INTERVAL:-10}"
   done
 }
 
@@ -1082,7 +1082,7 @@ helpers_record_gid() {
 # Returns 0 if all completed OK, 1 if any ended in error/removed.
 helpers_wait_for_gids() {
   _helpers_need curl; _helpers_need jq
-  local interval="${1:-${ARIA2_PROGRESS_INTERVAL:-5}}"; shift || true
+  local interval="${1:-${ARIA2_PROGRESS_INTERVAL:-10}}"; shift || true
   local gids=("$@")
   [[ ${#gids[@]} -eq 0 ]] && { echo "No GIDs to wait on." >&2; return 0; }
 
@@ -1146,7 +1146,7 @@ helpers_wait_for_gids() {
 
 # Convenience: wait on everything recorded in $ARIA2_GID_FILE
 helpers_wait_for_enqueued() {
-  local interval="${1:-${ARIA2_PROGRESS_INTERVAL:-5}}"
+  local interval="${1:-${ARIA2_PROGRESS_INTERVAL:-10}}"
   [[ -f "$ARIA2_GID_FILE" ]] || { echo "No GID file: $ARIA2_GID_FILE" >&2; return 0; }
   mapfile -t gids < <(awk 'NF' "$ARIA2_GID_FILE" | awk '!seen[$0]++')
   helpers_wait_for_gids "$interval" "${gids[@]}"
@@ -1154,7 +1154,7 @@ helpers_wait_for_enqueued() {
 
 # Run progress UI until specific GIDs finish, then exit
 helpers_progress_until_done() {
-  local interval="${1:-${ARIA2_PROGRESS_INTERVAL:-5}}"; shift || true
+  local interval="${1:-${ARIA2_PROGRESS_INTERVAL:-10}}"; shift || true
   local gids=("$@")
   [[ ${#gids[@]} -eq 0 ]] && { echo "No GIDs to watch." >&2; return 0; }
   helpers_progress_snapshot_loop "$interval" "${ARIA2_PROGRESS_BAR_WIDTH:-40}" "${COMFY_LOGS:-/workspace/logs}/aria2_progress.log" &
@@ -1243,7 +1243,7 @@ aria2_enqueue_and_wait_from_manifest() {
     return 0
   fi
 
-  local interval="${ARIA2_PROGRESS_INTERVAL:-5}"
+  local interval="${ARIA2_PROGRESS_INTERVAL:-10}"
   local width="${ARIA2_PROGRESS_BAR_WIDTH:-40}"
   local logfile="${COMFY_LOGS:-/workspace/logs}/aria2_progress.log"
   mkdir -p -- "$(dirname -- "$logfile")"
