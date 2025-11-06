@@ -57,6 +57,17 @@ shopt -s extglob
 PY_BIN="${PY:-/opt/venv/bin/python}"
 PIP_BIN="${PIP:-/opt/venv/bin/pip}"
 
+# ---------- .env loader (optional) ----------
+helpers_load_dotenv() {
+  local file="${1:-.env}"
+  [ -f "$file" ] || return 0
+  # export all non-comment lines
+  set -a
+  # shellcheck disable=SC1090
+  . "$file"
+  set +a
+}
+
 # ------------------------- #
 #  Logging & guard helpers  #
 # ------------------------- #
@@ -561,20 +572,11 @@ push_bundle_if_requested() {
   echo "Uploaded bundle [$base]"
 }
 
-#=====================================================================
-# Section 5: Aria2-Based Model Downloads (uses json manifest)
-#===================================================================== 
-
-# ---------- .env loader (optional) ----------
-helpers_load_dotenv() {
-  local file="${1:-.env}"
-  [ -f "$file" ] || return 0
-  # export all non-comment lines
-  set -a
-  # shellcheck disable=SC1090
-  . "$file"
-  set +a
-}
+#=======================================================================================
+#
+# ---------- Section 5: ARIA2 BASED HUGGINGFACE DOWNLOADS ----------
+#
+#=======================================================================================
 
 # ---------- Internals ----------
 _helpers_need() { command -v "$1" >/dev/null || { echo "Missing $1" >&2; exit 1; }; }
@@ -1492,7 +1494,7 @@ helpers_rpc_add_uri() {
 
 #=======================================================================================
 #
-# ---------- CivitAI ID downloader helpers ----------
+# ---------- Section 6: CivitAI ID downloader helpers ----------
 #
 #=======================================================================================
 
@@ -1527,6 +1529,7 @@ helpers_rpc_add_uri() {
 # - collapse multiple _ -> single _
 # - trim leading/trailing _
 # - preserve/normalize extension case
+
 helpers_sanitize_basename() {
   local in="$1"
   [[ -z "$in" ]] && { printf "model.safetensors"; return; }
