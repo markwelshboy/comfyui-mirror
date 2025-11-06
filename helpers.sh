@@ -1480,7 +1480,7 @@ aria2_enqueue_and_wait_from_civitai() {
   aria2_clear_results >/dev/null 2>&1 || true
   helpers_have_aria2_rpc || helpers_start_aria2_daemon
 
-  # Graceful INT/TERM handling
+  # Graceful INT/TERM
   local trapped=0
   _cleanup_trap_civitai() {
     (( trapped )) && return 0
@@ -1492,26 +1492,28 @@ aria2_enqueue_and_wait_from_civitai() {
   }
   trap _cleanup_trap_civitai INT TERM
 
-  local any=0 added=0
+  local enq_l=0 enq_c=0 total=0
 
-  # LoRAs
   if [[ -n "${LORAS_IDS_TO_DOWNLOAD:-}" ]]; then
-    added="$(helpers_civitai_process_list "${LORAS_IDS_TO_DOWNLOAD}" "$lora_dir" "LoRA id(s)")"
-    [[ "$added" == "1" ]] && any=1
+    enq_l="$(helpers_civitai_process_list "${LORAS_IDS_TO_DOWNLOAD}" "$lora_dir" "LoRA id(s)")"
   fi
-
-  # Checkpoints
   if [[ -n "${CHECKPOINT_IDS_TO_DOWNLOAD:-}" ]]; then
-    added="$(helpers_civitai_process_list "${CHECKPOINT_IDS_TO_DOWNLOAD}" "$ckpt_dir" "Checkpoint id(s)")"
-    [[ "$added" == "1" ]] && any=1
+    enq_c="$(helpers_civitai_process_list "${CHECKPOINT_IDS_TO_DOWNLOAD}" "$ckpt_dir" "Checkpoint id(s)")"
   fi
 
-  if [[ "$any" != "1" ]]; then
+  # numeric safety
+  enq_l="${enq_l:-0}"; enq_c="${enq_c:-0}"
+  [[ "$enq_l" =~ ^[0-9]+$ ]] || enq_l=0
+  [[ "$enq_c" =~ ^[0-9]+$ ]] || enq_c=0
+  total=$(( enq_l + enq_c ))
+
+  if (( total == 0 )); then
     echo "Nothing to enqueue from CivitAI tokens."
     trap - INT TERM
     return 0
   fi
 
+  # Foreground progress loop (your existing function)
   helpers_progress_snapshot_loop "${ARIA2_PROGRESS_INTERVAL:-5}" "${ARIA2_PROGRESS_BAR_WIDTH:-40}" \
     "${COMFY_LOGS:-/workspace/logs}/aria2_progress.log"
 
@@ -1796,45 +1798,29 @@ _helpers_parse_size_bytes() {
 # Add a URI with optional Authorization header (for providers that require it).
 # Usage: helpers_rpc_add_uri_with_auth URL DIR OUT HEADER_JSON_ARRAY
 # Example HEADER_JSON_ARRAY: '["Authorization: Bearer xyz"]' or '[]'
+# Enqueue with optional header JSON (e.g., Authorization: Bearer …)
 helpers_rpc_add_uri_with_auth() {
-  local url="$1" dir="$2" out="$3" header_json="$4"
-  [[ -z "$url" || -z "$dir" || -z "$out" ]] && { echo "helpers_rpc_add_uri_with_auth: missing args" >&2; return 2; }
-  [[ -z "$header_json" ]] && header_json='[]'
-  mkdir -p -- "$dir"
+  local url="$1" dir="$2" out="$3" header_json="${4:-[]}"
+  [[ -z "$url" || -z "$dir" || -z "$out" ]] && { echo ""; return 2; }
 
-  local rpc_host="${ARIA2_HOST:-127.0.0.1}"
-  local rpc_port="${ARIA2_PORT:-6800}"
-  local rpc_secret="${ARIA2_SECRET:-KissMeQuick}"
+  # Build the JSON request (don’t assume jq in the caller)
+  local payload gid
+  payload="$(jq -n \
+    --arg tok "token:${ARIA2_SECRET:-KissMeQuick}" \
+    --arg url "$url" \
+    --arg dir "$dir" \
+    --arg out "$out" \
+    --argjson headers "${header_json:-[]}" \
+    '{jsonrpc:"2.0",id:"add",method:"aria2.addUri",
+      params:[$tok, [$url], {dir:$dir, out:$out, continue:true,
+                             split:16,"max-connection-per-server":16,"min-split-size":1048576,
+                             header:$headers}] }' \
+  )"
 
-  # Build JSON safely
-  local req
-  req="$(jq -n \
-    --arg token   "token:${rpc_secret}" \
-    --arg url     "$url" \
-    --arg dir     "$dir" \
-    --arg out     "$out" \
-    --argjson hdr "$header_json" \
-    '{
-       jsonrpc:"2.0", id:"add", method:"aria2.addUri",
-       params:[ $token, [ $url ],
-         {
-           dir:$dir, out:$out, continue:true,
-           split: (env.SPLIT|tonumber? // 16),
-           "max-connection-per-server": (env.MCONN|tonumber? // 16),
-           "min-split-size": ((env.CHUNK // "1M") | ( .|sub("M$";"000000") | sub("K$";"000") ) | tonumber? // 1048576),
-           header: $hdr
-         }
-       ]
-     }'
-  )" || return 3
-
-  local resp
-  resp="$(curl -fsS "http://${rpc_host}:${rpc_port}/jsonrpc" \
-              -H 'Content-Type: application/json' \
-              --data "$req")" || return 4
-
-  # Return gid to caller via stdout
-  printf '%s\n' "$(jq -r '.result // empty' <<<"$resp")"
+  gid="$(curl -fsS "http://${ARIA2_HOST:-127.0.0.1}:${ARIA2_PORT:-6800}/jsonrpc" \
+          -H 'Content-Type: application/json' \
+          --data "$payload" | jq -r '.result // empty' 2>/dev/null)"
+  printf '%s' "$gid"
 }
 
 # Fetch a CivitAI version JSON into stdout.
@@ -1897,45 +1883,48 @@ helpers_civitai_tokenize_ids() {
 }
 
 helpers_civitai_process_list() {
-  local list="$1" target_dir="$2" kind="$3"   # kind is just for messages
-  [[ -z "$list" || -z "$target_dir" ]] && return 0
+  local list="$1" target_dir="$2" kind="$3"
+  [[ -z "$list" || -z "$target_dir" ]] && { echo 0; return 0; }
 
   local tokens=(); while IFS= read -r t; do tokens+=("$t"); done < <(helpers_civitai_tokenize_ids "$list")
 
-  # Show what we parsed (tiny summary)
   if ((${#tokens[@]}==0)); then
     echo "⏭️ No ${kind:-items} parsed from list."
+    echo 0
     return 0
   else
     echo "→ Parsed ${#tokens[@]} ${kind:-items}: ${tokens[*]}"
   fi
 
-  local any=0 id
+  local gid enq=0 id
   for id in "${tokens[@]}"; do
-    # For now: numeric = version ID. (MODELID:filter can be added later if needed.)
     if [[ "$id" =~ ^[0-9]+$ ]]; then
-      helpers_civitai_enqueue_version "$id" "$target_dir" && any=1
+      gid="$(helpers_civitai_enqueue_version "$id" "$target_dir")"
+      if [[ -n "$gid" ]]; then
+        ((enq++))
+      fi
     else
-      echo "⏭️ Skipping unsupported token '$id' (expecting numeric version id)"
+      echo "⏭️ Skipping unsupported token '$id' (expect numeric version id)"
     fi
   done
 
-  echo "$any"
+  echo "$enq"
 }
 
 # Enqueue one CivitAI version id as a SafeTensor model into DIR.
 # Uses CIVITAI_TOKEN if set. Prints a one-line status and returns 0/1.
 helpers_civitai_enqueue_version() {
   local ver_id="$1" dir="$2"
-  [[ -z "$ver_id" || -z "$dir" ]] && { echo "helpers_civitai_enqueue_version: missing args" >&2; return 2; }
+  [[ -z "$ver_id" || -z "$dir" ]] && { echo ""; return 2; }
 
   local ver_json dl_url fname header_json gid
   if ! ver_json="$(helpers_civitai_get_version_json "$ver_id")"; then
-    echo "❌ CivitAI version $ver_id not found/unauthorized"
+    echo "❌ CivitAI version $ver_id not found/unauthorized" >&2
+    echo ""
     return 1
   fi
 
-  # pick a .safetensors by filename OR format field
+  # Choose a safetensors file
   read -r dl_url fname < <(
     printf '%s' "$ver_json" | jq -r '
       def is_safetensor:
@@ -1952,7 +1941,8 @@ helpers_civitai_enqueue_version() {
   ) || true
 
   if [[ -z "$dl_url" || -z "$fname" ]]; then
-    echo "❌ No .safetensors in version $ver_id"
+    echo "❌ No .safetensors in version $ver_id" >&2
+    echo ""
     return 1
   fi
 
@@ -1964,11 +1954,14 @@ helpers_civitai_enqueue_version() {
   fi
 
   echo "📥 CivitAI v${ver_id} → ${dir}/${fname}"
-  gid="$(helpers_rpc_add_uri_with_auth "$dl_url" "$dir" "$fname" "$header_json")" || {
-    echo "❌ Failed to enqueue v$ver_id"
+  gid="$(helpers_rpc_add_uri_with_auth "$dl_url" "$dir" "$fname" "$header_json")"
+  if [[ -z "$gid" ]]; then
+    echo "❌ Failed to enqueue v$ver_id" >&2
+    echo ""
     return 1
-  }
-  echo "  ↳ enqueued (gid: ${gid:-unknown})"
+  fi
+
+  echo "$gid"   # <<—— IMPORTANT: echo the gid for counting upstream
   return 0
 }
 
