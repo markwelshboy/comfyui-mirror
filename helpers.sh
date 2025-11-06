@@ -734,46 +734,42 @@ helpers_download_from_manifest() {
   for sec in "${ENABLED[@]}"; do
     echo ">>> Enqueue section: $sec"
 
-    jq -r --arg sec "$sec" --arg default_dir "${DEFAULT_DOWNLOAD_DIR:-$COMFY}" '
-      # Normalize each entry to an object {url, path}
-      def as_obj:
-        if (type=="object") then
-          {url:(.url // ""), path:(.path // ((.dir // "") + (if .out then "/" + .out else "" end)))}
-        elif (type=="array") then
-          {url:(.[0] // ""), path:(.[1] // "")}
-        elif (type=="string") then
-          {url:., path:""}
-        else
-          {url:"", path:""}
-        end;
+  jq -r --arg sec "$sec" --arg default_dir "${DEFAULT_DOWNLOAD_DIR:-$COMFY}" '
+    def as_obj:
+      if (type=="object") then
+        {url:(.url // ""), path:(.path // ((.dir // "") + (if .out then "/" + .out else "" end)))}
+      elif (type=="array") then
+        {url:(.[0] // ""), path:(.[1] // "")}
+      elif (type=="string") then
+        {url:., path:""}
+      else
+        {url:"", path:""}
+      end;
+    (.sections[$sec] // [])[] | as_obj
+    | .url as $u
+    | ( if (.path|length) > 0 then .path
+        else ( if ($default_dir|length) > 0
+              then ($default_dir + "/" + ($u|sub("^.*/";"")))
+              else (               ($u|sub("^.*/";"")) )
+              end )
+        end ) as $p
+    | select(($u|type)=="string" and ($p|type)=="string" and ($u|length)>0 and ($p|length)>0)
+    | [$u, $p] | @tsv
+  ' "$MAN" | while IFS=$'\t' read -r url raw_path; do
+        [[ -z "$url" || -z "$raw_path" ]] && { echo "⚠️  Skipping invalid item"; continue; }
 
-      (.sections[$sec] // [])[]
-      | as_obj
-      | .url as $u
-      | ( if (.path|length) > 0 then .path
-          else ( if ($default_dir|length) > 0
-                then ($default_dir + "/" + ($u|sub("^.*/";"")))
-                else (               ($u|sub("^.*/";"")) )
-                end )
-          end ) as $p
-      | select(($u|type)=="string" and ($p|type)=="string" and ($u|length)>0 and ($p|length)>0)
-      | [$u, $p] | @tsv
-    ' "$MAN" | while IFS=$'\t' read -r url raw_path; do
-          [[ -z "$url" || -z "$raw_path" ]] && { echo "⚠️  Skipping invalid item"; continue; }
+        path="$(helpers_resolve_placeholders "$raw_path" "$VARS_JSON")"
+        dir="$(dirname -- "$path")"
+        out="$(basename -- "$path")"
+        mkdir -p -- "$dir"
 
-          path="$(helpers_resolve_placeholders "$raw_path" "$VARS_JSON")"
-          dir="$(dirname -- "$path")"
-          out="$(basename -- "$path")"
-          mkdir -p -- "$dir"
-
-          if helpers_ensure_target_ready "$path"; then
-            echo "📥 Queue: $(basename -- "$path")"
-            gid="$(helpers_rpc_add_uri "$url" "$dir" "$out" "")"
-            helpers_record_gid "$gid"
-          fi
-      done
+        if helpers_ensure_target_ready "$path" "$url"; then
+          echo "📥 Queue: $(basename -- "$path")"
+          gid="$(helpers_rpc_add_uri "$url" "$dir" "$out" "")"
+          helpers_record_gid "$gid"
+        fi
+    done
   done
-
   echo "✅ Enqueued selected sections."
 }
 
