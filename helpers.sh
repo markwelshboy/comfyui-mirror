@@ -750,10 +750,16 @@ helpers_download_from_manifest() {
         out="$(basename -- "$path")"
         mkdir -p -- "$dir"
 
-        if helpers_ensure_target_ready "$path" "$url"; then
-          echo "📥 Queue: $(basename -- "$path")"
-          gid="$(helpers_rpc_add_uri "$url" "$dir" "$out" "")" && helpers_record_gid "$gid"
+        # Skip only if a non-zero file already exists; no curl probes here.
+        if [[ -s "$path" ]]; then
+          sz="$(helpers_human_bytes "$(stat -c%s -- "$path" 2>/dev/null || wc -c <"$path")")"
+          echo "✅ $(basename -- "$path") exists (${sz}), skipping."
+          continue
         fi
+
+        # Always print the Queue line right before RPC add
+        echo "📥 Queue: $out"
+        gid="$(helpers_rpc_add_uri "$url" "$dir" "$out" "")" && helpers_record_gid "$gid"
       done
   done
 
@@ -1450,7 +1456,7 @@ helpers_civitai_make_url() {
 # --- Optional light probe (1-byte range GET); set CIVITAI_PROBE=0 to skip
 helpers_civitai_probe_url() {
   local url="$1"
-  [[ "${CIVITAI_PROBE:-1}" == "0" ]] && return 0
+  [[ "${CIVITAI_PROBE:-0}" == "0" ]] && return 0
   curl -fsSL --range 0-0 \
        -H 'User-Agent: curl/8' -H 'Accept: */*' \
        --retry 2 --retry-delay 1 \
