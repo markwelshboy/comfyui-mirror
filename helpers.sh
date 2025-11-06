@@ -659,7 +659,7 @@ helpers_start_aria2_daemon() {
     --log="$COMFY_LOGS/aria2.log" --log-level=notice \
     >/dev/null 2>&1 || true
   # wait a beat
-  for _ in {1..20}; do helpers_have_aria2_rpc && return 0; sleep 0.2; done
+  for _ in {1..20}; do helpers_have_aria2_rpc && echo "  .. 🚀 aria2 RPC started" && return 0; sleep 0.2; done
   return 1
 }
 
@@ -726,7 +726,6 @@ helpers_progress_snapshot_once() {
   #mapfile -t dones < <(jq -r '(.result // [])[] | (.completedLength // 0)' <<<"$active")
   #mapfile -t speeds < <(jq -r '(.result // [])[] | (.downloadSpeed // 0)' <<<"$active")
 
-  # Replace the 4 mapfile lines in helpers_progress_snapshot_once with:
   mapfile -t names < <(jq -r '
     (.result // [])[]
     | ( .files[0].path
@@ -743,8 +742,11 @@ helpers_progress_snapshot_once() {
   for ((i=0;i<n;i++)); do ((${#names[i]} > maxn)) && maxn=${#names[i]}; done
   (( maxn < 24 )) && maxn=24
 
-  echo "=== aria2 progress @ $(date +"%Y-%m-%d %H:%M:%S") ==="
-  echo "Active ($n)"
+  echo "================================================================================"
+  echo "==="
+  echo "=== Huggingface Model Downloader: aria2 progress @ $(date +"%Y-%m-%d %H:%M:%S") ==="
+  echo "==="
+  echo "=== Active downloads: $n"
   echo "--------------------------------------------------------------------------------"
 
   local total_done=0 total_size=0 total_speed=0
@@ -786,12 +788,12 @@ helpers_progress_snapshot_once() {
     for ((j=0;j<${#cnames[@]};j++)); do ((${#cnames[j]} > m)) && m=${#cnames[j]}; done
     (( m < 24 )) && m=24
     echo
-    echo "Completed (this session)"
+    echo "=== Completed downloads (this session)"
     echo "--------------------------------------------------------------------------------"
     for ((j=0;j<${#cnames[@]};j++)); do
       local rel="${cpaths[j]}"
       [[ -n "$COMFY" && "$rel" == "$COMFY"* ]] && rel="${rel#$COMFY/}"
-      printf "✔ %-*s  %s  (%s)\n" \
+      printf "✅ %-*s  %s  (%s)\n" \
         "$m" "${cnames[j]}" \
         "$rel" \
         "$(helpers_human_bytes "${clens[j]}")"
@@ -924,8 +926,8 @@ helpers_download_from_manifest() {
 aria2_enqueue_and_wait_from_manifest() {
   [[ -z "${MODEL_MANIFEST_URL:-}" ]] && { echo "MODEL_MANIFEST_URL is not set." >&2; return 1; }
   aria2_clear_results >/dev/null 2>&1 || true
-  helpers_have_aria2_rpc || helpers_start_aria2_daemon
   echo "▶ Starting aria2 RPC daemon…"
+  helpers_have_aria2_rpc || helpers_start_aria2_daemon
 
   local any; any="$(helpers_download_from_manifest || echo 0)"
   if [[ "$any" == "0" ]]; then
