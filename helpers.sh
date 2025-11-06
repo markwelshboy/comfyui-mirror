@@ -1924,17 +1924,24 @@ helpers_civitai_enqueue_version() {
     return 1
   fi
 
-  # Choose a safetensors file
+  # Optional debug: show what CivitAI returned for this version
+  if [[ -n "${CIVITAI_DEBUG:-}" ]]; then
+    echo "— CivitAI v$ver_id files —" >&2
+    printf '%s' "$ver_json" | jq -r '.files | map({name,type,metadata,format,downloadUrl})' >&2
+  fi
+
+  # Pick the first file that clearly ends with .safetensors (case-insensitive)
+  # Fall back to metadata.format if name is missing the extension (rare).
   read -r dl_url fname < <(
     printf '%s' "$ver_json" | jq -r '
-      def is_safetensor:
-        ((.metadata.format? // .format? // "") | ascii_downcase) == "safetensor"
-        or ((.name? // "") | test("\\.safetensors$"));
+      def is_safe_name: ((.name? // "") | ascii_downcase | endswith(".safetensors"));
+      def is_safe_meta: (((.metadata.format? // .format? // "") | ascii_downcase) == "safetensor");
 
       (.files // [])
-      | map(select((.type? // "") == "Model" and is_safetensor))
+      | map(select(is_safe_name or is_safe_meta))
       | if length>0 then
-          (.[0].downloadUrl | if test("\\?") then . else . + "?type=Model&format=SafeTensor" end),
+          (.[0].downloadUrl
+             | if test("\\?") then . else . + "?type=Model&format=SafeTensor" end),
           (.[0].name // (.[0].downloadUrl | sub("^.*/";"")))
         else empty end
     '
@@ -1948,6 +1955,7 @@ helpers_civitai_enqueue_version() {
 
   mkdir -p -- "$dir"
 
+  # Prepare Authorization header only if token is present (public works w/o token)
   header_json='[]'
   if [[ -n "${CIVITAI_TOKEN:-}" ]]; then
     header_json="$(jq -n --arg H "Authorization: Bearer ${CIVITAI_TOKEN}" '[ $H ]')"
@@ -1961,7 +1969,7 @@ helpers_civitai_enqueue_version() {
     return 1
   fi
 
-  echo "$gid"   # <<—— IMPORTANT: echo the gid for counting upstream
+  echo "$gid"  # <- echo GID so callers can count
   return 0
 }
 
