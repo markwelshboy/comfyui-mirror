@@ -578,91 +578,223 @@ push_bundle_if_requested() {
 #
 #=======================================================================================
 
-# --- Aria2 RPC helpers (quiet, jq 1.5-safe) ---
+# Defaults (match your daemon)
+: "${ARIA2_HOST:=127.0.0.1}"
+: "${ARIA2_PORT:=6969}"
+: "${ARIA2_SECRET:=KissMeQuick}"
+: "${ARIA2_PROGRESS_INTERVAL:=5}"
+: "${ARIA2_PROGRESS_BAR_WIDTH:=40}"
+: "${COMFY:=/workspace/ComfyUI}"
+: "${COMFY_LOGS:=/workspace/logs}"
+
+mkdir -p "$COMFY_LOGS" "$COMFY/models" >/dev/null 2>&1 || true
+
+# ---- tiny utils ----
+helpers_human_bytes() { # bytes -> human
+  local b=${1:-0} d=0 unit=Bytes
+  local -a u=(Bytes KB MB GB TB PB)
+  while (( b >= 1024 && d < ${#u[@]}-1 )); do b=$((b/1024)); ((d++)); done
+  printf "%d %s" "$b" "${u[$d]}"
+}
+
+# jq/env placeholder substitution: ${FOO} → value
+helpers_resolve_placeholders() {
+  local s="$1" json="$2"
+  jq -r --arg s "$s" --argjson envmap "$json" '
+    def subvars($m):
+      def repl:
+        capture("\\$\\{(?<k>[A-Z0-9_]+)\\}") as $c
+        | ($m[$c.k] // env[$c.k] // $c.k) as $v
+        | .string |= (.string | sub("\\$\\{" + $c.k + "\\}"; ($v|tostring)));
+      reduce range(0;20) as $i ({"string":$s}; repl) | .string;
+    subvars($envmap)
+  ' <<< "{}"
+}
+
+# ---- RPC core ----
 helpers_rpc_post() {
-  # args: json_payload
   local payload="$1"
-  curl -fsS --connect-timeout 2 "http://${ARIA2_HOST:-127.0.0.1}:${ARIA2_PORT:-6800}/jsonrpc" \
-    -H 'Content-Type: application/json' \
-    --data "$payload"
+  curl -fsS --connect-timeout 2 "http://$ARIA2_HOST:$ARIA2_PORT/jsonrpc" \
+    -H 'Content-Type: application/json' --data "$payload"
 }
 
 helpers_rpc_ping() {
-  helpers_rpc_post '{"jsonrpc":"2.0","id":"v","method":"aria2.getVersion","params":["token:'"${ARIA2_SECRET:-KissMeQuick}"'"]}' \
+  helpers_rpc_post '{"jsonrpc":"2.0","id":"v","method":"aria2.getVersion","params":["token:'"$ARIA2_SECRET"'"]}' \
     >/dev/null 2>&1
 }
 
-# Stop all active + waiting, jq 1.5-safe (no try/catch)
+helpers_have_aria2_rpc() { helpers_rpc_ping; }
+
+helpers_start_aria2_daemon() {
+  # don’t double-start
+  if helpers_have_aria2_rpc; then return 0; fi
+  mkdir -p "$COMFY_LOGS" >/dev/null 2>&1 || true
+  aria2c --no-conf \
+    --enable-rpc --rpc-secret="$ARIA2_SECRET" \
+    --rpc-listen-port="$ARIA2_PORT" --rpc-listen-all=false \
+    --daemon=true \
+    --check-certificate=true --min-tls-version=TLSv1.2 \
+    --max-concurrent-downloads="${ARIA2_MAX_CONC:-8}" \
+    --continue=true --file-allocation=none \
+    --summary-interval=0 --show-console-readout=false \
+    --console-log-level=warn \
+    --log="$COMFY_LOGS/aria2.log" --log-level=notice \
+    >/dev/null 2>&1 || true
+  # wait a beat
+  for _ in {1..20}; do helpers_have_aria2_rpc && return 0; sleep 0.2; done
+  return 1
+}
+
+# addUri
+helpers_rpc_add_uri() {
+  local url="$1" dir="$2" out="$3" checksum="$4"
+  local tok="token:${ARIA2_SECRET}"
+  local opts
+  opts=$(jq -nc --arg d "$dir" --arg o "$out" '
+    { "dir": $d, "out": $o, "allow-overwrite": "true", "auto-file-renaming": "false" }')
+  # checksum optional
+  if [[ -n "$checksum" ]]; then
+    opts=$(jq -nc --argjson base "$opts" --arg c "$checksum" '$base + {"checksum":$c}')
+  fi
+  local payload
+  payload=$(jq -nc --arg tok "$tok" --arg u "$url" --argjson o "$opts" \
+    '{jsonrpc:"2.0", id:"add", method:"aria2.addUri", params:[$tok, [$u], $o]}')
+  helpers_rpc_post "$payload" | jq -r '.result // empty'
+}
+
+# clear results
+aria2_clear_results() {
+  helpers_rpc_ping || return 0
+  helpers_rpc_post '{"jsonrpc":"2.0","id":"pd","method":"aria2.purgeDownloadResult","params":["token:'"$ARIA2_SECRET"'"]}' >/dev/null 2>&1 || true
+}
+
+# stop all (jq 1.5-safe)
 aria2_stop_all() {
   echo "⏹️  Stopping all active + waiting downloads…"
-
   helpers_rpc_ping || { echo "⚠️  RPC not reachable"; return 0; }
+  local tok="token:${ARIA2_SECRET}"
 
-  local tok="token:${ARIA2_SECRET:-KissMeQuick}"
-
-  # active gids
   helpers_rpc_post '{"jsonrpc":"2.0","id":"a","method":"aria2.tellActive","params":["'"$tok"'"]}' \
     | jq -r '(.result // []) | .[]? | .gid // empty' \
     | while read -r gid; do
         helpers_rpc_post '{"jsonrpc":"2.0","id":"ra","method":"aria2.remove","params":["'"$tok"'","'"$gid"'"]}' >/dev/null 2>&1 || true
       done
-
-  # waiting gids (first 1000)
   helpers_rpc_post '{"jsonrpc":"2.0","id":"w","method":"aria2.tellWaiting","params":["'"$tok"'",0,1000]}' \
     | jq -r '(.result // []) | .[]? | .gid // empty' \
     | while read -r gid; do
         helpers_rpc_post '{"jsonrpc":"2.0","id":"rw","method":"aria2.remove","params":["'"$tok"'","'"$gid"'"]}' >/dev/null 2>&1 || true
       done
-
-  # pause active (in case any remain)
   helpers_rpc_post '{"jsonrpc":"2.0","id":"p","method":"aria2.pauseAll","params":["'"$tok"'"]}' >/dev/null 2>&1 || true
-  # purge results so next run starts clean
-  helpers_rpc_post '{"jsonrpc":"2.0","id":"p2","method":"aria2.purgeDownloadResult","params":["'"$tok"'"]}' >/dev/null 2>&1 || true
+  helpers_rpc_post '{"jsonrpc":"2.0","id":"pd","method":"aria2.purgeDownloadResult","params":["'"$tok"'"]}' >/dev/null 2>&1 || true
 }
 
-# Foreground progress with proper trap
-helpers_progress_snapshot_loop() {
-  local interval="${1:-5}"
-  local bar_w="${2:-40}"
-  local logf="${3:-/workspace/logs/aria2_progress.log}"
+# (no-op book-keeping hooks; keep for compatibility)
+helpers_reset_enqueued() { return 0; }
+helpers_record_gid() { :; }
+helpers_probe_url() { return 0; }  # silenced
 
-  # run the inner loop in a subshell so we can kill it from trap
+# ---- One-shot progress snapshot (aligned) ----
+helpers_progress_snapshot_once() {
+  local bar_w="${1:-40}"
+  local tok="token:${ARIA2_SECRET}"
+
+  # Active
+  local active; active="$(helpers_rpc_post '{"jsonrpc":"2.0","id":"a","method":"aria2.tellActive","params":["'"$tok"'"]}')" || active='{}'
+  local names=() sizes=() dones=() speeds=() dirs=()
+
+  mapfile -t names < <(jq -r '(.result // [])[] | (.files[0].path // .bittorrent.info.name // .infoHash // "unknown") | split("/") | last' <<<"$active")
+  mapfile -t dirs  < <(jq -r '(.result // [])[] | (.files[0].path // "unknown") | split("/") | .[0:-1] | join("/")' <<<"$active")
+  mapfile -t sizes < <(jq -r '(.result // [])[] | (.totalLength // 0)' <<<"$active")
+  mapfile -t dones < <(jq -r '(.result // [])[] | (.completedLength // 0)' <<<"$active")
+  mapfile -t speeds < <(jq -r '(.result // [])[] | (.downloadSpeed // 0)' <<<"$active")
+
+  local i n="${#names[@]}" maxn=0
+  for ((i=0;i<n;i++)); do ((${#names[i]} > maxn)) && maxn=${#names[i]}; done
+  (( maxn < 24 )) && maxn=24
+
+  echo "=== aria2 progress @ $(date +"%Y-%m-%d %H:%M:%S") ==="
+  echo "Active ($n)"
+  echo "--------------------------------------------------------------------------------"
+
+  local total_done=0 total_size=0 total_speed=0
+  for ((i=0;i<n;i++)); do
+    local name="${names[i]}" size="${sizes[i]:-0}" done="${dones[i]:-0}" sp="${speeds[i]:-0}" dir="${dirs[i]}"
+    (( total_done+=done, total_size+=size, total_speed+=sp ))
+    local pct=0; (( size>0 )) && pct=$(( (done*100)/size ))
+    local fill=$(( (pct*bar_w)/100 ))
+    local bar; printf -v bar "%${fill}s" ""; bar=${bar// /#}
+    local pad; printf -v pad "%$((bar_w-fill))s" ""; pad=${pad// /" "}
+    printf " %3d%% [%s%s] %6s/s  (%s / %s)  [ Destination -> %s ] %s\n" \
+      "$pct" "$bar" "$pad" \
+      "$(helpers_human_bytes "$sp")" \
+      "$(helpers_human_bytes "$done")" \
+      "$(helpers_human_bytes "$size")" \
+      "${dir#$COMFY/}" \
+      "$(printf "%-${maxn}s" "$name")"
+  done
+
+  echo "--------------------------------------------------------------------------------"
+  printf "Group total: speed %s/s, done %s / %s\n" \
+    "$(helpers_human_bytes "$total_speed")" \
+    "$(helpers_human_bytes "$total_done")" \
+    "$(helpers_human_bytes "$total_size")"
+  if (( total_speed > 0 && total_size >= total_done && total_size > 0 )); then
+    local remain=$(( total_size - total_done )) eta=$(( remain / total_speed ))
+    printf "ETA: %02d:%02d\n" $((eta/60)) $((eta%60))
+  fi
+
+  # Completed (this session)
+  local stopped; stopped="$(helpers_rpc_post '{"jsonrpc":"2.0","id":"s","method":"aria2.tellStopped","params":["'"$tok"'",0,999]}' )" || stopped='{}'
+  local cnames=() cpaths=() clens=()
+  mapfile -t cnames < <(jq -r '(.result // [])[] | select(.status=="complete") | (.files[0].path // "unknown") | split("/") | last' <<<"$stopped")
+  mapfile -t cpaths < <(jq -r '(.result // [])[] | select(.status=="complete") | (.files[0].path // "unknown")' <<<"$stopped")
+  mapfile -t clens  < <(jq -r '(.result // [])[] | select(.status=="complete") | (.totalLength // 0)' <<<"$stopped")
+
+  if ((${#cnames[@]} > 0)); then
+    local m=0 j
+    for ((j=0;j<${#cnames[@]};j++)); do ((${#cnames[j]} > m)) && m=${#cnames[j]}; done
+    (( m < 24 )) && m=24
+    echo
+    echo "Completed (this session)"
+    echo "--------------------------------------------------------------------------------"
+    for ((j=0;j<${#cnames[@]};j++)); do
+      local rel="${cpaths[j]}"
+      [[ -n "$COMFY" && "$rel" == "$COMFY"* ]] && rel="${rel#$COMFY/}"
+      printf "✔ %-*s  %s  (%s)\n" \
+        "$m" "${cnames[j]}" \
+        "$rel" \
+        "$(helpers_human_bytes "${clens[j]}")"
+    done
+  fi
+}
+
+# ---- Foreground progress with trap ----
+helpers_progress_snapshot_loop() {
+  local interval="${1:-5}" bar_w="${2:-40}" logf="${3:-$COMFY_LOGS/aria2_progress.log}"
   (
     while :; do
-      helpers_progress_snapshot_once "$bar_w" | tee >(cat >>"$logf")
+      helpers_progress_snapshot_once "$bar_w" | tee -a "$logf"
       sleep "$interval"
-      # exit when queue drained (both active + waiting empty)
-      if ! helpers_rpc_ping; then
-        # if RPC died, we’re done here
-        exit 0
-      fi
-      local tok="token:${ARIA2_SECRET:-KissMeQuick}"
-      local act wait
+      helpers_have_aria2_rpc || exit 0
+      local tok="token:${ARIA2_SECRET}" act wait
       act="$(helpers_rpc_post '{"jsonrpc":"2.0","id":"a","method":"aria2.tellActive","params":["'"$tok"'"]}' \
-              | jq -r '(.result // []) | length' 2>/dev/null)" || act=0
+            | jq -r '(.result // []) | length' 2>/dev/null)" || act=0
       wait="$(helpers_rpc_post '{"jsonrpc":"2.0","id":"w","method":"aria2.tellWaiting","params":["'"$tok"'",0,1]}' \
-              | jq -r '(.result // []) | length' 2>/dev/null)" || wait=0
+            | jq -r '(.result // []) | length' 2>/dev/null)" || wait=0
       if [[ "${act:-0}" -eq 0 && "${wait:-0}" -eq 0 ]]; then
-        echo
-        echo "✅ All downloads complete — exiting progress loop."
-        exit 0
+        echo; echo "✅ All downloads complete — exiting progress loop."; exit 0
       fi
     done
   ) &
   local loop_pid=$!
-
-  # Parent waits; if interrupted, stop aria2 and kill loop
   trap 'echo; echo "⚠️  Interrupted — stopping queue…"; aria2_stop_all; kill -TERM '"$loop_pid"' 2>/dev/null || true; wait '"$loop_pid"' 2>/dev/null; return 130' INT TERM
   wait "$loop_pid"
   trap - INT TERM
 }
 
-# Final override to silence any lingering URL probes
-helpers_probe_url() { return 0; }
-
+# ---- Manifest Enqueue ----
 helpers_download_from_manifest() {
-  _helpers_need curl; _helpers_need jq; _helpers_need awk
-
+  command -v curl >/dev/null && command -v jq >/dev/null || { echo "Need curl + jq"; return 1; }
   [[ -z "${MODEL_MANIFEST_URL:-}" ]] && { echo "MODEL_MANIFEST_URL is not set." >&2; return 1; }
 
   local MAN; MAN="$(mktemp)"
@@ -689,81 +821,65 @@ helpers_download_from_manifest() {
     local dl_var="download_${sec}"
     if [[ "${!dl_var:-}" == "true" || "${!dl_var:-}" == "1" ]]; then ENABLED+=("$sec"); fi
   done <<<"$SECTIONS_ALL"
-
   if ((${#ENABLED[@]}==0)); then
-    echo "No sections enabled. Available:"; echo "$SECTIONS_ALL" | sed 's/^/  - /'
-    return 0
+    echo "No sections enabled. Available:"; echo "$SECTIONS_ALL" | sed 's/^/  - /'; return 0
   fi
   mapfile -t ENABLED < <(printf '%s\n' "${ENABLED[@]}" | awk '!seen[$0]++')
 
   helpers_have_aria2_rpc || helpers_start_aria2_daemon
   helpers_reset_enqueued
 
-  local url raw_path path dir out gid
+  local url raw_path path dir out gid any=0
   for sec in "${ENABLED[@]}"; do
     echo ">>> Enqueue section: $sec"
-
     jq -r --arg sec "$sec" --arg default_dir "${DEFAULT_DOWNLOAD_DIR:-$COMFY}" '
       def as_obj:
         if (type=="object") then {url:(.url // ""), path:(.path // ((.dir // "") + (if .out then "/" + .out else "" end)))}
         elif (type=="array") then {url:(.[0] // ""), path:(.[1] // "")}
         elif (type=="string") then {url:., path:""}
-        else {url:"", path:""}
-        end;
-
+        else {url:"", path:""} end;
       (.sections[$sec] // [])[]
       | as_obj
       | .url as $u
       | ( if (.path|length)>0 then .path
           else ( if ($default_dir|length)>0
                  then ($default_dir + "/" + ($u|sub("^.*/";"")))
-                 else ($u|sub("^.*/";""))
-               end )
+                 else ($u|sub("^.*/";"")) end )
           end ) as $p
       | select(($u|type)=="string" and ($p|type)=="string" and ($u|length)>0 and ($p|length)>0)
       | [$u, $p] | @tsv
     ' "$MAN" | while IFS=$'\t' read -r url raw_path; do
-        [[ -z "$url" || -z "$raw_path" ]] && { echo "⚠️  Skipping invalid item"; continue; }
-
-        path="$(helpers_resolve_placeholders "$raw_path" "$VARS_JSON")"
-        dir="$(dirname -- "$path")"
-        out="$(basename -- "$path")"
-        mkdir -p -- "$dir"
-
-        # Skip only if a non-zero file already exists
-        if [[ -s "$path" ]]; then
-          sz="$(helpers_human_bytes "$(stat -c%s -- "$path" 2>/dev/null || wc -c <"$path")")"
-          echo "✅ $(basename -- "$path") exists (${sz}), skipping."
-          continue
-        fi
-
-        echo "📥 Queue: $out"
-        gid="$(helpers_rpc_add_uri "$url" "$dir" "$out" "")" && helpers_record_gid "$gid"
-      done
+      [[ -z "$url" || -z "$raw_path" ]] && { echo "⚠️  Skipping invalid item"; continue; }
+      path="$(helpers_resolve_placeholders "$raw_path" "$VARS_JSON")"
+      dir="$(dirname -- "$path")"; out="$(basename -- "$path")"
+      mkdir -p -- "$dir"
+      if [[ -s "$path" ]]; then
+        sz="$(helpers_human_bytes "$(stat -c%s -- "$path" 2>/dev/null || wc -c <"$path")")"
+        echo "✅ $(basename -- "$path") exists (${sz}), skipping."; continue
+      fi
+      echo "📥 Queue: $out"
+      gid="$(helpers_rpc_add_uri "$url" "$dir" "$out" "")"
+      [[ -n "$gid" ]] && any=1
+      helpers_record_gid "$gid"
+    done
   done
-
-  echo "✅ Enqueued selected sections."
+  echo "$any"
 }
 
+# ---- Top-level: enqueue + progress ----
 aria2_enqueue_and_wait_from_manifest() {
   [[ -z "${MODEL_MANIFEST_URL:-}" ]] && { echo "MODEL_MANIFEST_URL is not set." >&2; return 1; }
-
   aria2_clear_results >/dev/null 2>&1 || true
   helpers_have_aria2_rpc || helpers_start_aria2_daemon
-
   echo "▶ Starting aria2 RPC daemon…"
 
-  # enqueue (may print “No sections enabled.”)
   local any; any="$(helpers_download_from_manifest || echo 0)"
   if [[ "$any" == "0" ]]; then
     echo "Nothing enqueued. Exiting without starting progress loop."
     return 0
   fi
 
-  # progress + trap lives inside the helper now
-  helpers_progress_snapshot_loop "${ARIA2_PROGRESS_INTERVAL:-5}" "${ARIA2_PROGRESS_BAR_WIDTH:-40}" \
-    "${COMFY_LOGS:-/workspace/logs}/aria2_progress.log"
-
+  helpers_progress_snapshot_loop "$ARIA2_PROGRESS_INTERVAL" "$ARIA2_PROGRESS_BAR_WIDTH" "$COMFY_LOGS/aria2_progress.log"
   aria2_clear_results >/dev/null 2>&1 || true
   return 0
 }
