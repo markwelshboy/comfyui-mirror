@@ -1519,17 +1519,6 @@ aria2_enqueue_and_wait_from_civitai() {
   return 0
 }
 
-# Split a comma/space/newline-separated list, dedupe, echo one-per-line
-_helpers_split_ids() {
-  local s="${1:-}"
-  # drop placeholder tokens
-  s="${s//replace_with_ids/}"
-  # unify separators (comma/newline->space), trim
-  s="$(printf '%s' "$s" | tr ',\n' '  ' | xargs -n1 echo | sed '/^$/d')"
-  # dedupe, preserve order
-  awk '!seen[$0]++' <<<"$s"
-}
-
 # Run a command with a simple concurrency gate
 _helpers_gate() {
   local -n _count_ref=$1
@@ -1635,12 +1624,6 @@ _civitai_postprocess_dir() {
     # rm -f "$z"
   done
   shopt -u nullglob
-}
-
-# Split mixed "ID, ID2 ID3" into one-per-line
-_helpers_split_ids() {
-  local s="$*"
-  tr ',\t' '\n' <<<"$s" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | awk 'NF>0'
 }
 
 # Enqueue a single CivitAI ID into target dir via aria2 RPC.
@@ -1870,24 +1853,28 @@ helpers_civitai_get_version_json() {
 }
 
 # From a version JSON on stdin, pick the first Model/SafeTensor asset.
-# Prints 2 lines to stdout:
-#   line1 = downloadUrl
-#   line2 = suggested file name (from .name or URL basename)
+# Accepts when:
+#   - metadata.format or format (case-insensitive) == "safetensor", OR
+#   - filename ends with ".safetensors"
+# Prints 2 lines:
+#   line1 = downloadUrl (normalized with ?type=Model&format=SafeTensor if missing)
+#   line2 = filename
 # Returns 0 if selected, 1 if none.
 helpers_civitai_pick_safetensor_from_version() {
   jq -r '
-    .files // [] 
-    | map(select(
-        (.type? // "") == "Model" and
-        ((.metadata.format? // .format? // "") | ascii_downcase) == "safetensor" and
-        (.downloadUrl? // "") != ""
-      ))
+    def is_safetensor:
+      ((.metadata.format? // .format? // "") | ascii_downcase) == "safetensor"
+      or ((.name? // "") | test("\\.safetensors$"));
+
+    (.files // [])
+    | map(select((.type? // "") == "Model" and is_safetensor))
     | if length>0 then
-        (.[0].downloadUrl),
+        # Normalize URL to ensure SafeTensor
+        (.[0] | .downloadUrl as $u
+               | .name as $n
+               | ($u | if test("\\?") then . else . + "?type=Model&format=SafeTensor" end) ),
         (.[0].name // (.[0].downloadUrl | sub("^.*/";"")))
-      else
-        empty
-      end
+      else empty end
   ' | {
       read -r url || { exit 1; }
       read -r name || { exit 1; }
@@ -1908,20 +1895,23 @@ helpers_civitai_enqueue_version() {
   fi
 
   local dl_url fname
-  read -r dl_url < <(printf '%s' "$ver_json" | helpers_civitai_pick_safetensor_from_version) || true
-  read -r fname  < <(printf '%s' "$ver_json" | helpers_civitai_pick_safetensor_from_version | sed -n '2p') || true
-
-  if [[ -z "$dl_url" || -z "$fname" ]]; then
+  if ! {
+    read -r dl_url < <(printf '%s' "$ver_json" | helpers_civitai_pick_safetensor_from_version) && false
+  }; then
+    # picker failed to emit both lines; try again to fill fname (won’t block)
+    read -r fname  < <(printf '%s' "$ver_json" | jq -r '(.files // []) | (.[0].name // empty)') || true
     echo "❌ No .safetensors in version $ver_id"
     return 1
   fi
+  read -r fname  < <(printf '%s' "$ver_json" | helpers_civitai_pick_safetensor_from_version | sed -n '2p') || true
+
+  [[ -z "$dl_url" || -z "$fname" ]] && { echo "❌ No .safetensors in version $ver_id"; return 1; }
 
   mkdir -p -- "$dir"
   echo "📥 CivitAI v$ver_id → $dir/$fname"
 
   local header_json='[]'
   if [[ -n "${CIVITAI_TOKEN:-}" ]]; then
-    # Properly JSON-quoted header
     header_json="$(jq -n --arg H "Authorization: Bearer ${CIVITAI_TOKEN}" '[ $H ]')"
   fi
 
