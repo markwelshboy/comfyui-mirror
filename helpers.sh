@@ -1886,7 +1886,8 @@ helpers_civitai_process_list() {
   local list="$1" target_dir="$2" kind="$3"
   [[ -z "$list" || -z "$target_dir" ]] && { echo 0; return 0; }
 
-  local tokens=(); while IFS= read -r t; do tokens+=("$t"); done < <(helpers_civitai_tokenize_ids "$list")
+  local tokens=()
+  while IFS= read -r t; do tokens+=("$t"); done < <(helpers_civitai_tokenize_ids "$list")
 
   if ((${#tokens[@]}==0)); then
     echo "⏭️ No ${kind:-items} parsed from list."
@@ -1896,13 +1897,11 @@ helpers_civitai_process_list() {
     echo "→ Parsed ${#tokens[@]} ${kind:-items}: ${tokens[*]}"
   fi
 
-  local gid enq=0 id
+  local enq=0 id gid
   for id in "${tokens[@]}"; do
     if [[ "$id" =~ ^[0-9]+$ ]]; then
       gid="$(helpers_civitai_enqueue_version "$id" "$target_dir")"
-      if [[ -n "$gid" ]]; then
-        ((enq++))
-      fi
+      [[ -n "$gid" ]] && ((enq++))
     else
       echo "⏭️ Skipping unsupported token '$id' (expect numeric version id)"
     fi
@@ -1917,35 +1916,42 @@ helpers_civitai_enqueue_version() {
   local ver_id="$1" dir="$2"
   [[ -z "$ver_id" || -z "$dir" ]] && { echo ""; return 2; }
 
-  local ver_json dl_url fname header_json gid
+  local ver_json
   if ! ver_json="$(helpers_civitai_get_version_json "$ver_id")"; then
     echo "❌ CivitAI version $ver_id not found/unauthorized" >&2
     echo ""
     return 1
   fi
 
-  # Optional debug: show what CivitAI returned for this version
+  # Optional debug of what CivitAI actually returned
   if [[ -n "${CIVITAI_DEBUG:-}" ]]; then
-    echo "— CivitAI v$ver_id files —" >&2
+    echo "— CivitAI v${ver_id} files —" >&2
     printf '%s' "$ver_json" | jq -r '.files | map({name,type,metadata,format,downloadUrl})' >&2
   fi
 
-  # Pick the first file that clearly ends with .safetensors (case-insensitive)
-  # Fall back to metadata.format if name is missing the extension (rare).
-  read -r dl_url fname < <(
+  # Emit one TSV line: <downloadUrl>\t<filename>
+  local tsv dl_url fname
+  tsv="$(
     printf '%s' "$ver_json" | jq -r '
-      def is_safe_name: ((.name? // "") | ascii_downcase | endswith(".safetensors"));
-      def is_safe_meta: (((.metadata.format? // .format? // "") | ascii_downcase) == "safetensor");
-
+      # choose first file that is clearly a safetensors by name or meta
       (.files // [])
-      | map(select(is_safe_name or is_safe_meta))
+      | map(select(
+          ((.name // "") | ascii_downcase | endswith(".safetensors"))
+          or (((.metadata.format? // .format? // "") | tostring | ascii_downcase) == "safetensor")
+        ))
       | if length>0 then
-          (.[0].downloadUrl
-             | if test("\\?") then . else . + "?type=Model&format=SafeTensor" end),
-          (.[0].name // (.[0].downloadUrl | sub("^.*/";"")))
-        else empty end
+          [ (.[0].downloadUrl
+              | if test("\\?") then . else . + "?type=Model&format=SafeTensor" end),
+            (.[0].name // (.[0].downloadUrl | sub("^.*/";"")))
+          ] | @tsv
+        else
+          empty
+        end
     '
-  ) || true
+  )"
+
+  # Parse TSV safely
+  IFS=$'\t' read -r dl_url fname <<<"$tsv"
 
   if [[ -z "$dl_url" || -z "$fname" ]]; then
     echo "❌ No .safetensors in version $ver_id" >&2
@@ -1955,13 +1961,14 @@ helpers_civitai_enqueue_version() {
 
   mkdir -p -- "$dir"
 
-  # Prepare Authorization header only if token is present (public works w/o token)
-  header_json='[]'
+  # Only add Authorization header if a token is present (public downloads work fine w/o it)
+  local header_json='[]'
   if [[ -n "${CIVITAI_TOKEN:-}" ]]; then
     header_json="$(jq -n --arg H "Authorization: Bearer ${CIVITAI_TOKEN}" '[ $H ]')"
   fi
 
   echo "📥 CivitAI v${ver_id} → ${dir}/${fname}"
+  local gid
   gid="$(helpers_rpc_add_uri_with_auth "$dl_url" "$dir" "$fname" "$header_json")"
   if [[ -z "$gid" ]]; then
     echo "❌ Failed to enqueue v$ver_id" >&2
@@ -1969,7 +1976,7 @@ helpers_civitai_enqueue_version() {
     return 1
   fi
 
-  echo "$gid"  # <- echo GID so callers can count
+  echo "$gid"
   return 0
 }
 
