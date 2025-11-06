@@ -1346,801 +1346,163 @@ helpers_rpc_count_pending() {
 
 #---------------------------------------------------------------------------------------
 
-# If not already defined, create a wrapper that enqueues via aria2 JSON-RPC.
-helpers__rpc_add_uri_core() {
-  # args: url dir out header_json_array
-  local url="$1" dir="$2" out="$3" header_json="${4:-[]}"
-  : "${ARIA2_HOST:=127.0.0.1}"; : "${ARIA2_PORT:=6800}"; : "${ARIA2_SECRET:=KissMeQuick}"
-
-  jq -n \
-    --arg sec "token:${ARIA2_SECRET}" \
-    --arg url "$url" \
-    --arg dir "$dir" \
-    --arg out "$out" \
-    --argjson hdr "$header_json" \
-    '{
-      jsonrpc:"2.0",
-      id:"add",
-      method:"aria2.addUri",
-      params:[ $sec, [ $url ],
-        {
-          dir:$dir, out:$out, continue:true,
-          split:16, "max-connection-per-server":16, "min-split-size":1048576,
-          header: $hdr
-        }
-      ]
-    }' \
-  | curl -fsS "http://${ARIA2_HOST}:${ARIA2_PORT}/jsonrpc" \
-      -H 'Content-Type: application/json' \
-      --data-binary @- \
-  | jq -r '.result // empty'
-}
-
-# Compat shims if your helpers aren’t present
-helpers_rpc_add_uri_with_auth() {
-  if declare -F helpers_rpc_add_uri >/dev/null 2>&1; then
-    # your existing signature: (url dir out header_json)
-    helpers_rpc_add_uri "$@"
-  else
-    helpers__rpc_add_uri_core "$@"
-  fi
-}
-
-
-
-
-# ===============================
-# CivitAI: shared helpers (updated)
-# ===============================
-_civitai_api_base() { printf "https://civitai.com/api/v1"; }
-_civitai_hdr_auth()  { [[ -n "${CIVITAI_TOKEN:-}" ]] && printf '%s' "-H" "Authorization: Bearer ${CIVITAI_TOKEN}"; }
-
-_civitai_get() {
-  local path="$1"; shift
-  local url="$(_civitai_api_base)%s"; url="$(printf "$url" "$path")"
-  curl -sS --fail --retry 3 --retry-delay 1 --max-time 30 "$(_civitai_hdr_auth)" "$url"
-}
-
-_civitai_get_version_json() { _civitai_get "/model-versions/$1"; }
-_civitai_get_model_json()   { _civitai_get "/models/$1"; }
-
-# Prefer .safetensors > .ckpt > .zip. Output TSV: "<url>\t<suggested_name>"
-_civitai_pick_files_from_version_json() {
-  jq -r '
-    .files
-    | ( map(select((.type // "") | ascii_downcase == "model")) ) as $files
-    | def base: (.name // .metadata.filename // .downloadUrl | split("/") | last);
-    ( $files | map(select(.downloadUrl|test("\\.safetensors$"; "i"))) ) as $safes
-    | ( $files | map(select(.downloadUrl|test("\\.ckpt$";        "i"))) ) as $ckpts
-    | ( $files | map(select(.downloadUrl|test("\\.zip$";         "i"))) ) as $zips
-    | if ($safes|length)>0 then $safes
-      elif ($ckpts|length)>0 then $ckpts
-      elif ($zips|length)>0 then $zips
-      else [] end
-    | .[] | [.downloadUrl, base] | @tsv
-  '
-}
-
-# NEW: pick version IDs from a MODEL JSON by desired model TYPE and optional name regex
-#  $1 = TYPE to match exactly (e.g., "LORA" or "Checkpoint")
-#  $2 = optional name regex (case-insensitive)
-_civitai_pick_version_ids_from_model_json() {
-  local want_type="$1" rx="${2:-}"
-  jq -r --arg t "$want_type" --arg rx "$rx" '
-    select(((.type // "") == $t))
-    | .modelVersions[]
-    | ( if ($rx|length)>0 then (.name|test($rx; "i")) else true end )
-    | .id
-  '
-}
-
-_civitai_enqueue_url() {
-  local url="$1" dest_dir="$2" out_name="$3"
-  helpers_rpc_add_uri_with_auth "$url" "$dest_dir" "$out_name" ""
-}
-
-# Post-process: extract any .zip in a given dir/_incoming → only *.safetensors into that dir
-_civitai_post_extract_to_dir() {
-  local target_dir="$1"
-  local incoming="${target_dir}/_incoming"
-  [[ -d "$incoming" ]] || return 0
-  shopt -s nullglob
-  local z
-  for z in "$incoming"/*.zip; do
-    helpers_log "🧩 Extracting safetensors: $(basename "$z") → $(basename "$target_dir")/"
-    unzip -o -j "$z" '*.safetensors' -d "$target_dir" >/dev/null 2>&1 || true
-  done
-  shopt -u nullglob
-}
-
-# Core: process a single token (VERSIONID or MODELID[:filter]) for a specific DEST + TYPE
-#  $1=token, $2=dest_dir, $3=model_type ("LORA" or "Checkpoint")
-# Returns: number enqueued
-_civitai_process_token_for_type() {
-  local token="$1" dest_dir="$2" model_type="$3"
-  local incoming="${dest_dir}/_incoming"
-  mkdir -p "$dest_dir" "$incoming"
-
-  local id="${token%%:*}"
-  local filter=""
-  [[ "$token" == *:* ]] && filter="${token#*:}"
-
-  # Try as VERSION first
-  local vjson
-  if vjson="$(_civitai_get_version_json "$id" 2>/dev/null)"; then
-    local n=0
-    while IFS=$'\t' read -r url fname; do
-      [[ -z "$url" ]] && continue
-      if [[ "$fname" =~ \.zip$ ]]; then
-        helpers_log "📥 ($model_type zip) ${fname}"
-        _civitai_enqueue_url "$url" "$incoming" "$fname" >/dev/null && ((n++))
-      else
-        helpers_log "📥 ($model_type) ${fname}"
-        _civitai_enqueue_url "$url" "$dest_dir" "$fname" >/dev/null && ((n++))
-      fi
-    done < <(printf '%s' "$vjson" | _civitai_pick_files_from_version_json)
-    printf '%d' "$n"; return 0
-  fi
-
-  # Not a VERSION → treat as MODEL
-  local mjson
-  if mjson="$(_civitai_get_model_json "$id" 2>/dev/null)"; then
-    local enq=0
-    while IFS= read -r ver_id; do
-      [[ -z "$ver_id" ]] && continue
-      local vj
-      if vj="$(_civitai_get_version_json "$ver_id" 2>/dev/null)"; then
-        while IFS=$'\t' read -r url fname; do
-          [[ -z "$url" ]] && continue
-          if [[ "$fname" =~ \.zip$ ]]; then
-            helpers_log "📥 ($model_type zip) ${fname}"
-            _civitai_enqueue_url "$url" "$incoming" "$fname" >/devnull && ((enq++))
-          else
-            helpers_log "📥 ($model_type) ${fname}"
-            _civitai_enqueue_url "$url" "$dest_dir" "$fname" >/dev/null && ((enq++))
-          fi
-        done < <(printf '%s' "$vj" | _civitai_pick_files_from_version_json)
-      fi
-    done < <(printf '%s' "$mjson" | _civitai_pick_version_ids_from_model_json "$model_type" "$filter" | awk '!seen[$0]++')
-    printf '%d' "$enq"; return 0
-  fi
-
-  helpers_log "⚠️  Could not resolve '${token}' as version or model for type ${model_type}."
-  printf '0'
-}
-
-# Parse comma/space separated IDs from env and enqueue:
-# - LORAS_IDS_TO_DOWNLOAD -> to .../models/loras
-# - CHECKPOINT_IDS_TO_DOWNLOAD -> to .../models/checkpoints
+# =========================
+# CivitAI (clean slate RPC)
+# =========================
+# Env:
+#   CIVITAI_TOKEN                 (required for private/limited files; optional for public)
+#   LORAS_IDS_TO_DOWNLOAD         e.g. "2361379, 234567"
+#   CHECKPOINT_IDS_TO_DOWNLOAD    e.g. "1234567 7654321"
+#   COMFY_HOME                    default: /workspace/ComfyUI
+#   CIVITAI_DEBUG=1               verbose
+#   CIVITAI_PROBE=0|1             1-byte probe before enqueue (default: 1)
 #
-# Accepts only VERSION IDs (pure numbers). If you later want MODELID logic,
-# we can extend this to call /api/v1/models/{id} and filter versions.
-aria2_enqueue_and_wait_from_civitai() {
-  local enq_total=0 enq
+# Requires (already present in your stack):
+#   helpers_rpc_add_uri, helpers_have_aria2_rpc, helpers_start_aria2_daemon,
+#   helpers_progress_snapshot_loop, aria2_clear_results, aria2_stop_all
 
-  echo "📦 Target (LoRAs): ${COMFY_HOME:-/workspace/ComfyUI}/models/loras"
-  enq="$(helpers_civitai_process_list "${LORAS_IDS_TO_DOWNLOAD:-}" "${COMFY_HOME:-/workspace/ComfyUI}/models/loras" "LoRA id(s)")"
-  # keep only digits; default to 0 if empty
-  enq="${enq//[^0-9]/}"; [[ -z "$enq" ]] && enq=0
-  (( enq_total += enq ))
-
-  echo "📦 Target (Checkpoints): ${COMFY_HOME:-/workspace/ComfyUI}/models/checkpoints"
-  enq="$(helpers_civitai_process_list "${CHECKPOINT_IDS_TO_DOWNLOAD:-}" "${COMFY_HOME:-/workspace/ComfyUI}/models/checkpoints" "Checkpoint id(s)")"
-  enq="${enq//[^0-9]/}"; [[ -z "$enq" ]] && enq=0
-  (( enq_total += enq ))
-
-  if (( enq_total == 0 )); then
-    echo "Nothing to enqueue from CivitAI tokens."
-    return 0
-  fi
-
-  # Make sure aria2 RPC is up (reuses your daemon)
-  helpers_have_aria2_rpc || helpers_start_aria2_daemon
-
-  # Use your existing, Ctrl-C–aware progress loop
-  helpers_progress_snapshot_loop "${ARIA2_PROGRESS_INTERVAL:-5}" "${ARIA2_PROGRESS_BAR_WIDTH:-40}" \
-    "${COMFY_LOGS:-/workspace/logs}/aria2_progress.log"
+# --- ID parsing: "1,2  3,,4" -> "1 2 3 4" (numbers only), drop placeholders
+helpers_civitai_tokenize_ids() {
+  printf '%s' "$1" \
+    | tr ',\n' '  ' \
+    | tr -s ' ' \
+    | grep -Eo '[0-9]+' \
+    || true
 }
 
-# Run a command with a simple concurrency gate
-_helpers_gate() {
-  local -n _count_ref=$1
-  local max="${2:-6}"
-  while (( _count_ref >= max )); do
-    wait -n || true
-    ((_count_ref--))
-  done
+# --- Make a direct VERSION download URL; token goes in query string
+helpers_civitai_make_url() {
+  local ver_id="$1"
+  local tok="${CIVITAI_TOKEN:-}"
+  local url="https://civitai.com/api/download/models/${ver_id}"
+  [[ -n "$tok" ]] && url="${url}?token=${tok}"
+  printf '%s\n' "$url"
 }
 
-# Generic GET wrapper with optional token; prints body, returns curl RC
-_civitai_api_get() {
-  local path="$1"; shift
-  local url="$(_civitai_api_base)%s"          # path already begins with /...
-  url="$(printf "$url" "$path")"
-  local -a curl_args=( -sS --fail --retry 3 --retry-delay 1 --max-time 20 )
-  [[ -n "${CIVITAI_TOKEN:-}" ]] && curl_args+=( -H "Authorization: Bearer ${CIVITAI_TOKEN}" )
-  curl "${curl_args[@]}" "$url"
+# --- Optional light probe (1-byte range GET); set CIVITAI_PROBE=0 to skip
+helpers_civitai_probe_url() {
+  local url="$1"
+  [[ "${CIVITAI_PROBE:-1}" == "0" ]] && return 0
+  curl -fsSL --range 0-0 \
+       -H 'User-Agent: curl/8' -H 'Accept: */*' \
+       --retry 2 --retry-delay 1 \
+       --connect-timeout 6 --max-time 12 \
+       "$url" -o /dev/null
 }
 
-# Returns 0 if ID is a valid model-version (and echoes the JSON), else 1
-_civitai_try_model_version() {
-  local id="$1"
-  local body
-  if body="$(_civitai_api_get "/model-versions/${id}")"; then
-    printf '%s' "$body"
-    return 0
-  fi
-  return 1
-}
-
-# Select version IDs from a model JSON using filters:
-# - type filter (default: LORA) via .type
-# - optional regex against .name (CIVITAI_FILTER_INCLUDE_REGEX)
-# - prefer files with *.safetensors when later enqueuing (handled by aria2 content-disposition)
-_civitai_pick_versions_from_model_json() {
-  local include_type="${CIVITAI_FILTER_TYPE:-LORA}"
-  local include_regex="${CIVITAI_FILTER_INCLUDE_REGEX:-}"
-  jq -r --arg t "$include_type" --arg rx "$include_regex" '
-    . as $m
-    | select((.type // "") == $t)
-    | .modelVersions[] as $v
-    | ( if ($rx|length)>0 then
-          ( $v.name|test($rx) )
-        else
-          true
-        end ) as $ok
-    | select($ok)
-    | $v.id
-  '
-}
-
-# Expand a mixed list (model IDs and/or version IDs) into pure version IDs.
-# Input: newline-separated IDs on stdin
-# Output: newline-separated *version* IDs
-_civitai_expand_to_version_ids() {
-  local id json
-  while IFS= read -r id; do
-    [[ -z "$id" ]] && continue
-    # First, try as model-version
-    if json="$(_civitai_try_model_version "$id" 2>/dev/null)"; then
-      printf '%s\n' "$id"
-      continue
-    fi
-    # Else try as model id
-    if json="$(_civitai_get_model "$id" 2>/dev/null)"; then
-      printf '%s\n' "$(printf '%s' "$json" | _civitai_pick_versions_from_model_json)"
-      continue
-    fi
-    # If neither worked, just warn and skip
-    echo "⚠️  CivitAI: couldn’t resolve id=$id (not a model-version or model?)" >&2
-  done
-}
-
-# Build a civitai enqueue_and_wait_from_civitaiload URL from a ModelVersion ID.
-# You can later extend this to add query params (format/type) if needed.
-_civitai_url_for_id() {
-  local id="$1"
-  printf "https://civitai.com/api/enqueue_and_wait_from_civitaiload/models/%s" "$id"
-}
-
-# Turn CIVITAI_TOKEN into an aria2 header array
-_civitai_header() {
-  if [[ -n "${CIVITAI_TOKEN:-}" ]]; then
-    printf '%s' "-H" "X-API-Key: ${CIVITAI_TOKEN}"
-  fi
-}
-
-# Post-process a target directory: extract any *.zip to a tmp, copy only *.safetensors to target, clean up.
-_civitai_postprocess_dir() {
-  local target="$1"
-  local z
-  shopt -s nullglob
-  for z in "$target"/*.zip "$target"/*.ZIP; do
-    [[ -e "$z" ]] || continue
-    local tmpd; tmpd="$(mktemp -d)"
-    echo "🗜️  Extracting: $(basename "$z")"
-    unzip -o -q "$z" -d "$tmpd" || { echo "  ! unzip failed for $z"; rm -rf "$tmpd"; continue; }
-    # copy only *.safetensors (case-insensitive) into target
-    find "$tmpd" -type f -iregex '.*\.safetensors$' -print -exec mv -f {} "$target"/ \;
-    rm -rf "$tmpd"
-    # keep the zip so you can audit; comment next line to keep
-    # rm -f "$z"
-  done
-  shopt -u nullglob
-}
-
-# Enqueue a single CivitAI ID into target dir via aria2 RPC.
-_civitai_enqueue_one() {
-  local id="$1" dir="$2"
-  mkdir -p "$dir"
-  local url; url="$(_civitai_url_for_id "$id")"
-  local headers; headers="$(_civitai_headers_json)"
-
-  # Let aria2 pick the filename via Content-Disposition; we only set dir & continue
-  helpers_rpc_add_uri_with_headers "$url" "$dir" "" "$headers"
-}
-
-# helpers_rpc_add_uri_with_headers URL DIR OUT headers_json_array
-#   OUT may be empty to let server decide filename
-helpers_rpc_add_uri_with_headers() {
-  local url="$1" dir="$2" out="$3" headers_json="$4"
-  local params
-  if [[ -n "$out" ]]; then
-    params=$(jq -nc --arg dir "$dir" --arg out "$out" --argjson hdrs "$headers_json" \
-      '{dir:$dir, out:$out, continue:true, split:16, "max-connection-per-server":16, "min-split-size":1048576, header:$hdrs}')
-  else
-    params=$(jq -nc --arg dir "$dir" --argjson hdrs "$headers_json" \
-      '{dir:$dir, continue:true, split:16, "max-connection-per-server":16, "min-split-size":1048576, header:$hdrs}')
-  fi
-
-  # Raw RPC
-  local payload; payload=$(jq -nc --arg url "$url" --argjson opts "$params" --arg tok "${ARIA2_SECRET:-}" '
-    {jsonrpc:"2.0", id:"add", method:"aria2.addUri",
-     params:[ ( $tok|length>0 ? "token:"+$tok : empty ), [ $url ], $opts ] }')
-
-  [[ -n "${ARIA2_HOST:-}" ]] || export ARIA2_HOST=127.0.0.1
-  [[ -n "${ARIA2_PORT:-}" ]] || export ARIA2_PORT=6800
-  curl -s "http://${ARIA2_HOST}:${ARIA2_PORT}/jsonrpc" -H 'Content-Type: application/json' --data "$payload" |
-    jq -r '.result // empty'
-}
-
-# ===============================
-# CivitAI: single-var smart fetch
-# ===============================
-# LORAS_IDS_TO_DOWNLOAD supports a mix:
-#   "12345, 67890, 55555:i2v, 77777:t2v, 88888"
-# where:
-#   - numbers w/o suffix -> first try as VERSIONID, else treat as MODELID
-#   - numbers like MODELID:filter -> MODELID with version-name regex filter
-#
-# Files:
-#   - .safetensors are enqueued straight to ${COMFY_HOME}/models/loras
-#   - archives (.zip) go to ${COMFY_HOME}/models/loras/_incoming and are
-#     extracted after the aria2 queue completes (safetensors only).
-
-_civitai_is_number() { [[ "$1" =~ ^[0-9]+$ ]]; }
-
-_civitai_split_token() { # IN: token -> OUT: echo "<id> <filter>"
-  local t="$1" id filt
-  id="${t%%:*}"; filt="${t#*:}"
-  if [[ "$id" == "$filt" ]]; then filt=""; fi
-  echo "$id" "$filt"
-}
-
-_civitai_first_version_id_from_model_json() { # stdin: model json; $1=filter (optional)
-  local filter="${1:-}"
-  if [[ -n "$filter" ]]; then
-    jq -r --arg f "$filter" '
-      (.modelVersions? // []) |
-      map(select((.name // "") | ascii_downcase | test($f; "i"))) |
-      .[0]?.id // empty' 2>/dev/null
-  else
-    jq -r '(.modelVersions? // [])[0]?.id // empty' 2>/dev/null
-  fi
-}
-
-_civitai_pick_file_url_from_version_json() { # stdin: version json; echo url or ""
-  jq -r '
-    .files? // [] |
-    map(select(.primary==true)) + . |
-    map(.downloadUrl) |
-    (.[]? // empty) |
-    select(length>0) ' 2>/dev/null | head -n1
-}
-
-_civitai_enqueue_version_id() { # $1=versionId $2=dest_dir
-  local vid="$1" dstdir="$2"
-  local js url base
-  js="$(_civitai_get "https://civitai.com/api/v1/model-versions/$vid")"
-  [[ -n "$js" ]] || { helpers_log "CivitAI version $vid not found/unauthorized" "❌"; return 1; }
-  url="$(_civitai_pick_file_url_from_version_json <<<"$js")"
-  [[ -n "$url" ]] || { helpers_log "Version $vid has no downloadable file" "❌"; return 1; }
-
-  mkdir -p "$dstdir"
-  base="$(basename "${url%%\?*}")"
-  # ZIP vs safetensors
-  if [[ "$base" =~ \.zip$ ]]; then
-    local tmp="/tmp/${base}"
-    helpers_log "Queue ZIP for $vid → $tmp (will extract .safetensors to ${dstdir})" "📦"
-    helpers_rpc_add_uri_with_auth "$url" "/tmp" "$base" ""
-    # extraction watcher
-    (
-      while [[ ! -f "$tmp" ]]; do sleep 2; done
-      # wait aria2 to finish that gid is trickier; simple delay:
-      sleep 2
-      mkdir -p "/tmp/cvtx_${vid}" && unzip -o "$tmp" -d "/tmp/cvtx_${vid}" >/dev/null 2>&1 || true
-      find "/tmp/cvtx_${vid}" -type f -name '*.safetensors' -exec mv -f {} "$dstdir/" \; || true
-      rm -rf "/tmp/cvtx_${vid}" "$tmp" "$tmp.aria2"
-    ) &
-  else
-    helpers_rpc_add_uri_with_auth "$url" "$dstdir" "$base" ""
-  fi
-}
-
-_civitai_enqueue_model_id() { # $1=modelId $2=filter $3=dest_dir
-  local mid="$1" filter="$2" dstdir="$3"
-  local js vid
-  js="$(_civitai_get "https://civitai.com/api/v1/models/$mid")"
-  [[ -n "$js" ]] || { helpers_log "CivitAI model $mid not found/unauthorized" "❌"; return 1; }
-  vid="$(_civitai_first_version_id_from_model_json <<<"$js" "$filter")"
-  [[ -n "$vid" ]] || { helpers_log "No version matched filter '$filter' for model $mid" "❌"; return 1; }
-  _civitai_enqueue_version_id "$vid" "$dstdir"
-}
-
-_civitai_process_list() { # $1=csv list tokens; $2=destdir
-  local raw="$1" dest="$2"
-  local t id filter
-  IFS=', ' read -r -a arr <<<"$raw"
-  for t in "${arr[@]}"; do
-    [[ -z "$t" ]] && continue
-    read -r id filter < <(_civitai_split_token "$t")
-    if _civitai_is_number "$id"; then
-      # try version first; if that 404s, try model
-      if _civitai_enqueue_version_id "$id" "$dest"; then
-        :
-      else
-        _civitai_enqueue_model_id "$id" "$filter" "$dest" || true
-      fi
-    else
-      helpers_log "Skip token '$t' (not numeric)" "⏭️"
-    fi
-  done
-}
-
-# Post-process: extract any .zip sitting in _incoming to loras/, only *.safetensors
-civitai_post_extract_loras() {
-  local loras_dir="${1:-${COMFY_HOME:-/workspace/ComfyUI}/models/loras}"
-  local incoming="${loras_dir}/_incoming"
-  [[ -d "$incoming" ]] || return 0
-  shopt -s nullglob
-  local z
-  for z in "$incoming"/*.zip; do
-    helpers_log "🧩 Extracting safetensors from: $(basename "$z")"
-    # -j: junk paths; only safetensors
-    unzip -o -j "$z" '*.safetensors' -d "$loras_dir" >/dev/null 2>&1 || true
-  done
-  shopt -u nullglob
-}
-
-#--------------------------------------------------------------------------------------------------------------------------------------
-
-# Size parser stays simple & jq-friendly
-_helpers_parse_size_bytes() {
-  local s="${1:-1M}"
-  case "$s" in
-    *[!0-9KkMmGg]*) printf '%s' "$s" ;;
-    *K|*k) gawk -v n="${s%[Kk]}" 'BEGIN{printf "%d", n*1024}' ;;
-    *M|*m) gawk -v n="${s%[Mm]}" 'BEGIN{printf "%d", n*1024*1024}' ;;
-    *G|*g) gawk -v n="${s%[Gg]}" 'BEGIN{printf "%d", n*1024*1024*1024}' ;;
-  esac
-}
-
-# Add a URI with optional Authorization header (for providers that require it).
-# Usage: helpers_rpc_add_uri_with_auth URL DIR OUT HEADER_JSON_ARRAY
-# Example HEADER_JSON_ARRAY: '["Authorization: Bearer xyz"]' or '[]'
-# Enqueue with optional header JSON (e.g., Authorization: Bearer …)
-helpers_rpc_add_uri_with_auth() {
-  local url="$1" dir="$2" out="$3" header_json="${4:-[]}"
-  [[ -z "$url" || -z "$dir" || -z "$out" ]] && { echo ""; return 2; }
-
-  # Build the JSON request (don’t assume jq in the caller)
-  local payload gid
-  payload="$(jq -n \
-    --arg tok "token:${ARIA2_SECRET:-KissMeQuick}" \
-    --arg url "$url" \
-    --arg dir "$dir" \
-    --arg out "$out" \
-    --argjson headers "${header_json:-[]}" \
-    '{jsonrpc:"2.0",id:"add",method:"aria2.addUri",
-      params:[$tok, [$url], {dir:$dir, out:$out, continue:true,
-                             split:16,"max-connection-per-server":16,"min-split-size":1048576,
-                             header:$headers}] }' \
-  )"
-
-  gid="$(curl -fsS "http://${ARIA2_HOST:-127.0.0.1}:${ARIA2_PORT:-6800}/jsonrpc" \
-          -H 'Content-Type: application/json' \
-          --data "$payload" | jq -r '.result // empty' 2>/dev/null)"
-  printf '%s' "$gid"
-}
-
-# Fetch a CivitAI version JSON into stdout.
-# Returns 0 on success, 1 if not found/unauthorized/network.
+# --- Fetch VERSION json (for filename)
 helpers_civitai_get_version_json() {
   local ver_id="$1"
-  [[ -z "$ver_id" ]] && return 1
-
-  local token="${CIVITAI_TOKEN:-}"
-  local url="https://civitai.com/api/v1/model-versions/${ver_id}"
-
-  if [[ -n "$token" ]]; then
-    curl -sfS "$url" -H "Authorization: Bearer ${token}"
-  else
-    curl -sfS "$url"
-  fi
+  local hdr=()
+  [[ -n "${CIVITAI_TOKEN:-}" ]] && hdr+=(-H "Authorization: Bearer ${CIVITAI_TOKEN}")
+  curl -fsSL "${hdr[@]}" "https://civitai.com/api/v1/model-versions/${ver_id}"
 }
 
-# From a version JSON on stdin, pick the first Model/SafeTensor asset.
-# Accepts when:
-#   - metadata.format or format (case-insensitive) == "safetensor", OR
-#   - filename ends with ".safetensors"
-# Prints 2 lines:
-#   line1 = downloadUrl (normalized with ?type=Model&format=SafeTensor if missing)
-#   line2 = filename
-# Returns 0 if selected, 1 if none.
-helpers_civitai_pick_safetensor_from_version() {
+# --- Choose a filename (prefer *.safetensors; fall back to first file name)
+helpers_civitai_pick_name() {
   jq -r '
-    def is_safetensor:
-      ((.metadata.format? // .format? // "") | ascii_downcase) == "safetensor"
-      or ((.name? // "") | test("\\.safetensors$"));
-
-    (.files // [])
-    | map(select((.type? // "") == "Model" and is_safetensor))
-    | if length>0 then
-        # Normalize URL to ensure SafeTensor
-        (.[0] | .downloadUrl as $u
-               | .name as $n
-               | ($u | if test("\\?") then . else . + "?type=Model&format=SafeTensor" end) ),
-        (.[0].name // (.[0].downloadUrl | sub("^.*/";"")))
-      else empty end
-  ' | {
-      read -r url || { exit 1; }
-      read -r name || { exit 1; }
-      printf '%s\n%s\n' "$url" "$name"
-    }
+    (.files // []) as $f
+    | ( $f | map(select((.name // "" | ascii_downcase | endswith(".safetensors")))) ) as $s
+    | ( ($s | if length>0 then . else $f end) | .[0].name // empty )
+  '
 }
 
-# Split a comma/space/newline list into clean tokens, skipping blanks and placeholders.
-# Accepts:  "12345, 67890"  or  $'12345\n67890'  etc.
-helpers_civitai_tokenize_ids() {
-  local raw="$1"
-  printf '%s\n' "$raw" \
-  | tr ', ' '\n' \
-  | tr -s '\n' \
-  | awk 'NF' \
-  | sed -E 's/^[[:space:]]+|[[:space:]]+$//g' \
-  | grep -v -E '^(replace_with_ids|none|null)$' \
-  || true
-}
-
-helpers_civitai_process_list() {
-  local list="$1" target_dir="$2" kind="$3"
-  [[ -z "$list" || -z "$target_dir" ]] && { printf '0\n'; return 0; }
-
-  # Tokenize -> array
-  local tokens=()
-  while IFS= read -r t; do [[ -n "$t" ]] && tokens+=("$t"); done < <(helpers_civitai_tokenize_ids "$list")
-
-  if ((${#tokens[@]}==0)); then
-    echo "⏭️ No ${kind:-items} parsed from list." >&2
-    printf '0\n'
-    return 0
-  else
-    echo "→ Parsed ${#tokens[@]} ${kind:-items}: ${tokens[*]}" >&2
-  fi
-
-  local enq=0 id gid
-  for id in "${tokens[@]}"; do
-    if [[ "$id" =~ ^[0-9]+$ ]]; then
-      gid="$(helpers_civitai_enqueue_version "$id" "$target_dir")"
-      if [[ -n "$gid" ]]; then
-        ((enq++))
-      fi
-    else
-      echo "⏭️ Skipping unsupported token '$id' (expect numeric version id)" >&2
-    fi
-  done
-
-  printf '%d\n' "$enq"
-}
-
-# Enqueue one CivitAI version id as a SafeTensor model into DIR.
-# Uses CIVITAI_TOKEN if set. Prints a one-line status and returns 0/1.
+# --- Enqueue a single VERSION into aria2 RPC; returns 0 if enqueued
 helpers_civitai_enqueue_version() {
-  # $1 = version_id (numeric), $2 = target_dir
-  local ver_id="$1" dir="$2"
-  [[ -z "$ver_id" || -z "$dir" ]] && { echo "" ; return 1; }
+  local ver_id="$1" dest_dir="$2"
+  local vjson name url
 
-  # 1) Get version JSON (already have a helper; must print JSON to stdout or empty on error)
-  local j
-  if ! j="$(helpers_civitai_get_version_json "$ver_id")" || [[ -z "$j" ]]; then
-    echo "❌ CivitAI version $ver_id not found/unauthorized" >&2
-    echo ""; return 1
-  fi
+  vjson="$(helpers_civitai_get_version_json "$ver_id")" || {
+    [[ -n "$CIVITAI_DEBUG" ]] && echo "❌ v${ver_id}: version JSON fetch failed" >&2
+    return 1
+  }
 
-  # 2) Choose the first file that is safetensors (by extension or metadata)
-  local name dl_url
-  name="$(printf '%s' "$j" | jq -r '
-    (.files // []) |
-    map(select(
-      ((.name // "") | ascii_downcase | endswith(".safetensors")) or
-      (((.metadata.format? // .format? // "") | tostring | ascii_downcase) == "safetensor")
-    )) | (.[0].name // empty)
-  ')"
-  dl_url="$(printf '%s' "$j" | jq -r '(.files // []) | (.[0].downloadUrl // empty)')"
-
-  if [[ -z "$name" || -z "$dl_url" ]]; then
-    echo "❌ No .safetensors in version $ver_id" >&2
-    echo ""; return 1
-  fi
-
-  mkdir -p "$dir"
-
-  # 3) Build candidate URLs (some versions reject certain query combos)
-  local candidates=(
-    "${dl_url}?type=Model&format=SafeTensor"
-    "${dl_url}?format=SafeTensor"
-    "${dl_url}"
-  )
-
-  # 4) Headers: auth (if token), UA, referer
-  local ua hdr_auth hdr_referer
-  ua="${CIVITAI_UA:-Mozilla/5.0 (X11; Linux x86_64) aria2-helper}"
-  hdr_referer="Referer: https://civitai.com/"
-  if [[ -n "${CIVITAI_TOKEN:-}" ]]; then
-    hdr_auth="Authorization: Bearer ${CIVITAI_TOKEN}"
-  fi
-
-  # 5) Probe candidates with HEAD (follow redirects). Accept 2xx/3xx.
-  local good_url="" code=""
-  for u in "${candidates[@]}"; do
-    code="$(
-      curl -sSIL -o /dev/null -w '%{http_code}' -L \
-        -H "User-Agent: $ua" \
-        -H "$hdr_referer" \
-        ${hdr_auth:+-H "$hdr_auth"} \
-        --max-time 20 --retry 2 --retry-delay 1 \
-        "$u" || echo ""
-    )"
-    # accept 2xx/3xx
-    if [[ "$code" =~ ^2|3[0-9]{2}$ ]]; then
-      good_url="$u"
-      break
-    fi
-  done
-
-  if [[ -z "$good_url" ]]; then
-    echo "❌ CivitAI v${ver_id} URL probe failed (last code: ${code:-none})" >&2
-    echo ""; return 1
-  fi
-
-  # 6) If name is empty, try to infer from Content-Disposition (rare)
+  name="$(printf '%s' "$vjson" | helpers_civitai_pick_name)"
   if [[ -z "$name" ]]; then
-    name="$(
-      curl -sSIL -L \
-        -H "User-Agent: $ua" -H "$hdr_referer" ${hdr_auth:+-H "$hdr_auth"} \
-        "$good_url" | awk -F'filename=' '/Content-Disposition/ {print $2}' | tr -d '";'\'''
-    )"
-    [[ -z "$name" ]] && name="civitai_${ver_id}.safetensors"
+    [[ -n "$CIVITAI_DEBUG" ]] && echo "❌ v${ver_id}: no filename in files[]" >&2
+    return 1
   fi
 
-  # 7) Enqueue to aria2 RPC using the same headers
-  local out_path="$dir/$name"
-  local gid
-  gid="$(helpers_rpc_add_uri "$good_url" "$dir" "$name" "$(cat <<EOF
-$([[ -n "$hdr_auth" ]] && printf '%s\n' "$hdr_auth")
-User-Agent: $ua
-$hdr_referer
-EOF
-)")"
+  url="$(helpers_civitai_make_url "$ver_id")"
+  if ! helpers_civitai_probe_url "$url"; then
+    [[ -n "$CIVITAI_DEBUG" ]] && echo "❌ v${ver_id}: URL probe failed" >&2
+    return 1
+  fi
 
-  if [[ -n "$gid" ]]; then
-    echo "📥 CivitAI v${ver_id}" >&2
-    echo "   URL : $good_url" >&2
-    echo "   OUT : $out_path" >&2
-    printf '%s\n' "$gid"
+  mkdir -p "$dest_dir"
+  # Friendly headers only; NO Authorization header (token is already in URL)
+  if helpers_rpc_add_uri "$url" "$dest_dir" "$name" \
+       "User-Agent: curl/8" "Accept: */*" "Referer: https://civitai.com"
+  then
+    [[ -n "$CIVITAI_DEBUG" ]] && {
+      echo "📥 CivitAI v${ver_id}"
+      echo "   URL : $url"
+      echo "   OUT : ${dest_dir%/}/$name"
+    }
     return 0
   else
-    echo "❌ Failed to enqueue v${ver_id} to aria2" >&2
-    echo ""; return 1
+    [[ -n "$CIVITAI_DEBUG" ]] && echo "❌ v${ver_id}: addUri failed" >&2
+    return 1
   fi
 }
 
+# --- Batch: parse env lists, enqueue to correct dirs, run your progress loop
+aria2_enqueue_and_wait_from_civitai() {
+  aria2_clear_results >/dev/null 2>&1 || true
+  helpers_have_aria2_rpc || helpers_start_aria2_daemon
 
-helpers_rpc_add_uri() {
-  local url="$1" dir="$2" out="$3" checksum="${4:-}"
-
-  # Concurrency knobs (global defaults)
-  local split_n="${SPLIT:-16}"
-  local mconn_n="${MCONN:-16}"
-  local chunk_sz="${CHUNK:-1M}"
-
-  # If host is HF, optionally downshift (gentler on their CDN)
-  local host; host="$(_helpers_url_host "$url")"
-  if [[ "$host" =~ (^|\.)(huggingface\.co)$ ]]; then
-    split_n="${HF_SPLIT:-${split_n}}"
-    mconn_n="${HF_MCONN:-${mconn_n}}"
-    chunk_sz="${HF_CHUNK:-${chunk_sz}}"
-  fi
-
-  # bytes → integer for aria2 RPC
-  _helpers_parse_size_bytes() {
-    local s="${1:-1M}"
-    case "$s" in
-      *K|*k) gawk -v n="${s%[Kk]}" 'BEGIN{printf "%d", n*1024}' ;;
-      *M|*m) gawk -v n="${s%[Mm]}" 'BEGIN{printf "%d", n*1024*1024}' ;;
-      *G|*g) gawk -v n="${s%[Gg]}" 'BEGIN{printf "%d", n*1024*1024*1024}' ;;
-      *)     printf '%s' "$s" ;;
-    esac
+  local trapped=0
+  _cleanup_trap_civitai() {
+    (( trapped )) && return 0
+    trapped=1
+    echo; echo "⚠️  Interrupted — stopping queue and cleaning results…"
+    aria2_stop_all >/dev/null 2>&1 || true
+    aria2_clear_results >/dev/null 2>&1 || true
+    return 130
   }
-  local chunk_b; chunk_b="$(_helpers_parse_size_bytes "$chunk_sz")"
+  trap _cleanup_trap_civitai INT TERM
 
-  # Decide whether to attach Authorization for this specific URL
-  local send_auth; send_auth="$(_helpers_hf_needs_auth "$url")"
-  if [[ "$send_auth" == "1" && -z "${HF_TOKEN:-}" ]]; then
-    echo "⚠️  HF auth required by probe, but HF_TOKEN is not set. Proceeding without Authorization; may fail." >&2
-    send_auth=0
+  local comfy="${COMFY_HOME:-/workspace/ComfyUI}"
+  local lora_dir="$comfy/models/loras"
+  local ckpt_dir="$comfy/models/checkpoints"
+  echo "📦 Target (LoRAs): $lora_dir"
+  echo "📦 Target (Checkpoints): $ckpt_dir"
+
+  local any=0 ids vid
+
+  # LoRA version IDs
+  ids="$(helpers_civitai_tokenize_ids "${LORAS_IDS_TO_DOWNLOAD:-}")"
+  if [[ -n "${ids// }" ]]; then
+    [[ -n "$CIVITAI_DEBUG" ]] && echo "→ Parsed $(wc -w <<<"$ids") LoRA id(s): $ids"
+    for vid in $ids; do
+      if helpers_civitai_enqueue_version "$vid" "$lora_dir"; then any=1; fi
+    done
+  else
+    [[ -n "$CIVITAI_DEBUG" ]] && echo "⏭️ No LoRA id(s) parsed."
   fi
 
-  # Build per-download options
-  local opt req resp gid err
-  opt="$(
-    jq -n \
-      --arg dir "$dir" \
-      --arg out "$out" \
-      --arg hf "${HF_TOKEN:-}" \
-      --arg chk "$checksum" \
-      --arg host "$host" \
-      --argjson split "$split_n" \
-      --argjson mconn "$mconn_n" \
-      --argjson chunk "$chunk_b" \
-      --argjson send_auth "$send_auth" '
-        {
-          dir: $dir,
-          out: $out,
-          continue: true,
-          split: $split,
-          "max-connection-per-server": $mconn,
-          "min-split-size": $chunk
-        }
-        | if $send_auth==1 then .header = [ "Authorization: Bearer \($hf)" ] else . end
-        | if ($chk|length)>0 then .checksum=("sha-256="+$chk) else . end
-      '
-  )"
-
-  req="$(
-    jq -n \
-      --arg url "$url" \
-      --argjson opt "$opt" \
-      --arg tok "${ARIA2_SECRET:-}" '
-        {
-          jsonrpc:"2.0",
-          id:"add",
-          method:"aria2.addUri",
-          params: (
-            ( if ($tok|length)>0 then ["token:"+$tok] else [] end )
-            + [[ $url ]]
-            + [ $opt ]
-          )
-        }'
-  )"
-
-  resp="$(
-    printf '%s' "$req" \
-    | curl -s "http://${ARIA2_HOST:-127.0.0.1}:${ARIA2_PORT:-6800}/jsonrpc" \
-            -H 'Content-Type: application/json' \
-            --data-binary @-
-  )"
-
-  # Optional debug
-  if [[ "${DEBUG_ARIA2:-0}" == "1" ]]; then
-    echo "---- addUri request ----" >&2;  echo "$req"  | jq . >&2
-    echo "---- addUri response ----" >&2; echo "$resp" | jq . >&2 || echo "$resp" >&2
+  # Checkpoint version IDs
+  ids="$(helpers_civitai_tokenize_ids "${CHECKPOINT_IDS_TO_DOWNLOAD:-}")"
+  if [[ -n "${ids// }" ]]; then
+    [[ -n "$CIVITAI_DEBUG" ]] && echo "→ Parsed $(wc -w <<<"$ids") Checkpoint id(s): $ids"
+    for vid in $ids; do
+      if helpers_civitai_enqueue_version "$vid" "$ckpt_dir"; then any=1; fi
+    done
+  else
+    [[ -n "$CIVITAI_DEBUG" ]] && echo "⏭️ No Checkpoint id(s) parsed."
   fi
 
-  gid="$(jq -r 'select(.result) | .result' <<<"$resp" 2>/dev/null || true)"
-  err="$(jq -r 'select(.error)  | .error.message' <<<"$resp" 2>/dev/null || true)"
-
-  if [[ -n "$gid" && "$gid" != "null" ]]; then
-    echo "$gid"
+  if [[ "$any" != "1" ]]; then
+    echo "Nothing to enqueue from CivitAI tokens."
+    trap - INT TERM
     return 0
   fi
 
-  echo "❌ aria2.addUri failed for: $out" >&2
-  echo "    URL: $url" >&2
-  if [[ -n "$err" && "$err" != "null" ]]; then
-    echo "    Error: $err" >&2
-  else
-    echo "    Raw response: $resp" >&2
-  fi
-  return 1
+  # Use your existing nice progress UI
+  helpers_progress_snapshot_loop "${ARIA2_PROGRESS_INTERVAL:-5}" "${ARIA2_PROGRESS_BAR_WIDTH:-40}" \
+    "${COMFY_LOGS:-/workspace/logs}/aria2_progress.log"
+
+  aria2_clear_results >/dev/null 2>&1 || true
+  trap - INT TERM
+  return 0
 }
