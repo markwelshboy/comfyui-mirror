@@ -152,3 +152,144 @@ gbrowse() {
   else echo "$url"
   fi
 }
+
+# Git check: see local + remote differences and file changes
+gck() {
+  echo "🔍 Checking repo status..."
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "❌ Not a git repository."; return 1; }
+
+  # Fetch latest info from remote
+  git fetch origin >/dev/null 2>&1 || { echo "⚠️  Couldn't fetch from remote."; return 1; }
+
+  local LOCAL=$(git rev-parse @ 2>/dev/null)
+  local REMOTE=$(git rev-parse @{u} 2>/dev/null || echo "")
+  local BASE=$(git merge-base @ @{u} 2>/dev/null || echo "")
+  local changed=0
+
+  # --- 1. Local uncommitted changes ---
+  if ! git diff --quiet || ! git diff --cached --quiet; then
+    echo "🧩 You have local uncommitted changes:"
+    git status -s
+    echo
+    changed=1
+  fi
+
+  # --- 2. Check for remote updates ---
+  if [ -z "$REMOTE" ]; then
+    echo "⚠️  No upstream branch set. Use: git push -u origin main"
+    return 1
+  fi
+
+  if [ "$LOCAL" = "$REMOTE" ]; then
+    echo "✅ Up to date with remote."
+  elif [ "$LOCAL" = "$BASE" ]; then
+    echo "⬇️  Remote has new commits you don't have. Files changed since your last pull:"
+    git diff --stat $LOCAL..$REMOTE
+    changed=1
+  elif [ "$REMOTE" = "$BASE" ]; then
+    echo "⬆️  You have local commits not pushed yet:"
+    git log --oneline @{u}..@
+    changed=1
+  else
+    echo "⚠️  Local and remote have diverged (both changed). You’ll need to pull/rebase carefully."
+    changed=1
+  fi
+
+  # --- 3. Summary ---
+  echo
+  if [ "$changed" -eq 0 ]; then
+    echo "✨ Everything clean and up to date!"
+  else
+    echo "📋 Summary: some changes detected — review above before pulling."
+  fi
+}
+
+# Simple confirm helper (reuse if you already have one)
+_confirm() {
+  read -r -p "${1:-Are you sure?} [y/N] " ans
+  [[ "$ans" == "y" || "$ans" == "Y" ]]
+}
+
+# gup: update (pull --rebase) with safety checks
+# Usage:
+#   gup          # pulls/rebases if needed
+#   gup more     # pulls + then shows short “what changed” summary
+gup() {
+  local show_more=0
+  [[ "$1" == "more" ]] && show_more=1
+
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "❌ Not a git repo."; return 1; }
+
+  # Refresh knowledge of remote
+  git fetch origin >/dev/null 2>&1 || { echo "⚠️ Unable to fetch remote."; return 1; }
+
+  # Snapshot state
+  local LOCAL REMOTE BASE
+  LOCAL=$(git rev-parse @ 2>/dev/null) || return 1
+  REMOTE=$(git rev-parse @{u} 2>/dev/null || echo "")
+  BASE=$(git merge-base @ @{u} 2>/dev/null || echo "")
+
+  if [[ -z "$REMOTE" ]]; then
+    echo "⚠️  No upstream set. First time push:"
+    echo "    git push -u origin $(git rev-parse --abbrev-ref HEAD)"
+    return 1
+  fi
+
+  # Detect local un/staged edits (these will be autostashed, but warn anyway)
+  local has_local_edits=0
+  if ! git diff --quiet || ! git diff --cached --quiet; then
+    has_local_edits=1
+    echo "🧩 Local uncommitted changes detected:"
+    git status -s
+    echo
+  fi
+
+  # Decide situation
+  if [[ "$LOCAL" == "$REMOTE" ]]; then
+    echo "✅ Already up to date."
+    return 0
+  elif [[ "$LOCAL" == "$BASE" ]]; then
+    echo "⬇️  Remote has new commits (fast-forward)."
+    # Safe; optional confirm only if local edits present
+    if (( has_local_edits )); then
+      _confirm "Proceed with pull (your uncommitted changes will be autostashed)?" || { echo "Canceled."; return 1; }
+    fi
+  elif [[ "$REMOTE" == "$BASE" ]]; then
+    echo "⬆️  You are ahead (local commits not pushed). No pull needed."
+    return 0
+  else
+    echo "⚠️  Diverged: both you and remote have commits."
+    echo "    A rebase will rewrite your local commits on top of remote."
+    git log --oneline --decorate --graph --boundary @{u}..@ 2>/dev/null | sed 's/^/  local: /'
+    git log --oneline --decorate --graph --boundary @..@{u} 2>/dev/null | sed 's/^/  remote: /'
+    echo
+    _confirm "Rebase your local commits onto the updated upstream now?" || { echo "Canceled."; return 1; }
+  fi
+
+  # Do the pull (rebase + autostash)
+  local BEFORE AFTER
+  BEFORE=$(git rev-parse HEAD)
+  echo "⬇️  Pulling (rebase + autostash)…"
+  if ! git pull --rebase --autostash; then
+    echo "❌ Pull/rebase failed. Resolve conflicts, then:  git rebase --continue"
+    echo "   Or abort with:                               git rebase --abort"
+    return 1
+  fi
+  AFTER=$(git rev-parse HEAD)
+
+  # Optional “more” report
+  if (( show_more )); then
+    if [[ "$BEFORE" != "$AFTER" ]]; then
+      echo
+      echo "📦 Updated to: $(git rev-parse --short HEAD)"
+      echo "📝 Commits pulled:"
+      git log --oneline --decorate "${BEFORE}..${AFTER}"
+      echo
+      echo "📊 File changes (diffstat):"
+      git diff --stat --color "${BEFORE}..${AFTER}"
+    else
+      echo "ℹ️  No changes applied by pull."
+    fi
+  fi
+}
+
