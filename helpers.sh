@@ -1210,6 +1210,8 @@ aria2_enqueue_and_wait_from_manifest() {
   return 0
 }
 
+helpers_probe_url() { return 0; }
+
 #=======================================================================================
 #
 # ---------- Section 6: CivitAI ID downloader helpers ----------
