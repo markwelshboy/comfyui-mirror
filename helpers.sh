@@ -1424,16 +1424,18 @@ helpers_civitai_enqueue_version() {
   fi
 
   url="$(helpers_civitai_make_url "$ver_id")"
+
+  # Optional 1-byte probe; disable with CIVITAI_PROBE=0
   if ! helpers_civitai_probe_url "$url"; then
     [[ -n "$CIVITAI_DEBUG" ]] && echo "❌ v${ver_id}: URL probe failed" >&2
     return 1
   fi
 
   mkdir -p "$dest_dir"
-  # Friendly headers only; NO Authorization header (token is already in URL)
-  if helpers_rpc_add_uri "$url" "$dest_dir" "$name" \
-       "User-Agent: curl/8" "Accept: */*" "Referer: https://civitai.com"
-  then
+
+  # IMPORTANT: 4th param is checksum in your helpers; pass empty string.
+  # Do NOT pass headers here (token is already in the URL).
+  if helpers_rpc_add_uri "$url" "$dest_dir" "$name" ""; then
     [[ -n "$CIVITAI_DEBUG" ]] && {
       echo "📥 CivitAI v${ver_id}"
       echo "   URL : $url"
