@@ -675,7 +675,7 @@ helpers_ensure_target_ready() {
   if ! helpers_probe_url "$src_url"; then
     # Don’t block the queue; just proceed silently (aria2 will handle retries/auth)
     : # no-op
-  end
+  fi
 
   return 0
 }
