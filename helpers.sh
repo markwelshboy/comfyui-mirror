@@ -111,161 +111,6 @@ copy_hearmeman_assets_if_any(){
 # Section 1: Generic utilities
 # ======================================================================
 
-# dl: Multi-connection downloader via aria2c
-dl() {
-  aria2c -x16 -s16 -k1M --continue=true \
-    -d "$(dirname "$2")" -o "$(basename "$2")" "$1"
-}
-
-# Function to download a model using huggingface-cli
-download_model() {
-    local url="$1"
-    local full_path="$2"
-
-    local destination_dir=$(dirname "$full_path")
-    local destination_file=$(basename "$full_path")
-
-    mkdir -p "$destination_dir"
-
-    # Simple corruption check: file < 10MB or .aria2 files
-    if [ -f "$full_path" ]; then
-        local size_bytes=$(stat -f%z "$full_path" 2>/dev/null || stat -c%s "$full_path" 2>/dev/null || echo 0)
-        local size_mb=$((size_bytes / 1024 / 1024))
-
-        if [ "$size_bytes" -lt 10485760 ]; then  # Less than 10MB
-            echo "🗑️  Deleting corrupted file (${size_mb}MB < 10MB): $full_path"
-            rm -f "$full_path"
-        else
-            echo "✅ $destination_file already exists (${size_mb}MB), skipping download."
-            return 0
-        fi
-    fi
-
-    # Check for and remove .aria2 control files
-    if [ -f "${full_path}.aria2" ]; then
-        echo "🗑️  Deleting .aria2 control file: ${full_path}.aria2"
-        rm -f "${full_path}.aria2"
-        rm -f "$full_path"  # Also remove any partial file
-    fi
-
-    echo "📥 Downloading $destination_file to $destination_dir..."
-
-    # Download without falloc (since it's not supported in your environment)
-    aria2c -x 16 -s 16 -k 1M --continue=true -d "$destination_dir" -o "$destination_file" "$url" &
-
-    echo "Download started in background for $destination_file"
-}
-
-download_models_if_requested() {
-
-  # Download 480p native models
-  if [ "${download_480p_native_models:-false}" == "true" ]; then
-    echo "Downloading 480p native models..."
-    download_model "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/diffusion_models/wan2.1_i2v_480p_14B_bf16.safetensors" "$DIFFUSION_MODELS_DIR/wan2.1_i2v_480p_14B_bf16.safetensors"
-    download_model "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/diffusion_models/wan2.1_t2v_14B_bf16.safetensors"      "$DIFFUSION_MODELS_DIR/wan2.1_t2v_14B_bf16.safetensors"
-    download_model "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/diffusion_models/wan2.1_t2v_1.3B_bf16.safetensors"     "$DIFFUSION_MODELS_DIR/wan2.1_t2v_1.3B_bf16.safetensors"
-    download_model "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors"  "$TEXT_ENCODERS_DIR/umt5_xxl_fp8_e4m3fn_scaled.safetensors"
-    download_model "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/umt5-xxl-enc-bf16.safetensors"                                                     "$TEXT_ENCODERS_DIR/umt5-xxl-enc-bf16.safetensors"
-    download_model "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors"  "$TEXT_ENCODERS_DIR/umt5_xxl_fp8_e4m3fn_scaled.safetensors"
-    download_model "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/clip_vision/clip_vision_h.safetensors"                 "$CLIP_VISION_DIR/clip_vision_h.safetensors"
-    download_model "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors"                           "$VAE_DIR/wan_2.1_vae.safetensors"
-    download_model "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Wan2_1_VAE_bf16.safetensors"                                                       "$VAE_DIR/Wan2_1_VAE_bf16.safetensors"
-  fi
-
-  # Download 720p native models
-  if [ "${download_720p_native_models:-false}" == "true" ]; then
-    echo "Downloading 720p native models..."
-    download_model "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/diffusion_models/wan2.1_i2v_720p_14B_bf16.safetensors" "$DIFFUSION_MODELS_DIR/wan2.1_i2v_720p_14B_bf16.safetensors"
-    download_model "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/diffusion_models/wan2.1_t2v_14B_bf16.safetensors"      "$DIFFUSION_MODELS_DIR/wan2.1_t2v_14B_bf16.safetensors"
-    download_model "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/diffusion_models/wan2.1_t2v_1.3B_bf16.safetensors"     "$DIFFUSION_MODELS_DIR/wan2.1_t2v_1.3B_bf16.safetensors"
-    download_model "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors"  "$TEXT_ENCODERS_DIR/umt5_xxl_fp8_e4m3fn_scaled.safetensors"
-    download_model "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/umt5-xxl-enc-bf16.safetensors"                                                     "$TEXT_ENCODERS_DIR/umt5-xxl-enc-bf16.safetensors"
-    download_model "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors"  "$TEXT_ENCODERS_DIR/umt5_xxl_fp8_e4m3fn_scaled.safetensors"
-    download_model "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/clip_vision/clip_vision_h.safetensors"                 "$CLIP_VISION_DIR/clip_vision_h.safetensors"
-    download_model "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors"                           "$VAE_DIR/wan_2.1_vae.safetensors"
-    download_model "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Wan2_1_VAE_bf16.safetensors"                                                       "$VAE_DIR/Wan2_1_VAE_bf16.safetensors"
-  fi
-
-  # Handle full download (with SDXL)
-  if [ "${download_wan_fun_and_sdxl_helper:-false}" == "true" ]; then
-    echo "Downloading Wan Fun 14B Model"
-    download_model "https://huggingface.co/alibaba-pai/Wan2.1-Fun-14B-Control/resolve/main/diffusion_pytorch_model.safetensors" "$DIFFUSION_MODELS_DIR/diffusion_pytorch_model.safetensors"
-
-    UNION_DIR="$COMFY/models/controlnet/SDXL/controlnet-union-sdxl-1.0"
-    mkdir -p "$UNION_DIR"
-    if [ ! -f "$UNION_DIR/diffusion_pytorch_model_promax.safetensors" ]; then
-      download_model "https://huggingface.co/xinsir/controlnet-union-sdxl-1.0/resolve/main/diffusion_pytorch_model_promax.safetensors" "$UNION_DIR/diffusion_pytorch_model_promax.safetensors"
-    fi
-  fi
-
-  if [ "${download_wan22:-false}" == "true" ]; then
-    echo "Downloading Wan 2.2"
-    download_model "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_t2v_high_noise_14B_fp16.safetensors" "$DIFFUSION_MODELS_DIR/wan2.2_t2v_high_noise_14B_fp16.safetensors"
-    download_model "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_t2v_low_noise_14B_fp16.safetensors"  "$DIFFUSION_MODELS_DIR/wan2.2_t2v_low_noise_14B_fp16.safetensors"
-    download_model "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_i2v_high_noise_14B_fp16.safetensors" "$DIFFUSION_MODELS_DIR/wan2.2_i2v_high_noise_14B_fp16.safetensors"
-    download_model "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_i2v_low_noise_14B_fp16.safetensors"  "$DIFFUSION_MODELS_DIR/wan2.2_i2v_low_noise_14B_fp16.safetensors"
-    download_model "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors"            "$DIFFUSION_MODELS_DIR/wan2.2_ti2v_5B_fp16.safetensors"
-    download_model "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors"        "$TEXT_ENCODERS_DIR/umt5_xxl_fp8_e4m3fn_scaled.safetensors"
-    download_model "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/umt5-xxl-enc-bf16.safetensors"                                                           "$TEXT_ENCODERS_DIR/umt5-xxl-enc-bf16.safetensors"
-    download_model "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/clip_vision/clip_vision_h.safetensors"                       "$CLIP_VISION_DIR/clip_vision_h.safetensors"
-    download_model "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors"                                 "$VAE_DIR/wan_2.1_vae.safetensors"
-    download_model "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Wan2_1_VAE_bf16.safetensors"                                                             "$VAE_DIR/Wan2_1_VAE_bf16.safetensors"
-  fi
-
-  if [ "${download_vace:-false}" == "true" ]; then
-    echo "Downloading Wan 1.3B and 14B"
-    download_model "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/diffusion_models/wan2.1_t2v_1.3B_bf16.safetensors"           "$DIFFUSION_MODELS_DIR/wan2.1_t2v_1.3B_bf16.safetensors"
-    download_model "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/diffusion_models/wan2.1_t2v_14B_bf16.safetensors"            "$DIFFUSION_MODELS_DIR/wan2.1_t2v_14B_bf16.safetensors"
-    echo "Downloading VACE 14B Model"
-    download_model "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Wan2_1-VACE_module_14B_bf16.safetensors"                                                 "$DIFFUSION_MODELS_DIR/Wan2_1-VACE_module_14B_bf16.safetensors"
-    download_model "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Wan2_1-VACE_module_1_3B_bf16.safetensors"                                                "$DIFFUSION_MODELS_DIR/Wan2_1-VACE_module_1_3B_bf16.safetensors"
-    download_model "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors"        "$TEXT_ENCODERS_DIR/umt5_xxl_fp8_e4m3fn_scaled.safetensors"
-    download_model "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/umt5-xxl-enc-bf16.safetensors"                                                           "$TEXT_ENCODERS_DIR/umt5-xxl-enc-bf16.safetensors"
-    download_model "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/clip_vision/clip_vision_h.safetensors"                       "$CLIP_VISION_DIR/clip_vision_h.safetensors"
-    download_model "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors"                                 "$VAE_DIR/wan_2.1_vae.safetensors"
-    download_model "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Wan2_1_VAE_bf16.safetensors"                                                             "$VAE_DIR/Wan2_1_VAE_bf16.safetensors"
-  fi
-
-  # Download Wan Animate model
-  if [ "${download_wan_animate:-false}" == "true" ]; then
-    echo "Downloading Wan Animate model..."
-    download_model "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_animate_14B_bf16.safetensors"        "$DIFFUSION_MODELS_DIR/wan2.2_animate_14B_bf16.safetensors"
-    download_model "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/umt5-xxl-enc-bf16.safetensors"                                                           "$TEXT_ENCODERS_DIR/umt5-xxl-enc-bf16.safetensors"
-    download_model "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/clip_vision/clip_vision_h.safetensors"                       "$CLIP_VISION_DIR/clip_vision_h.safetensors"
-    download_model "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors"                                 "$VAE_DIR/wan_2.1_vae.safetensors"
-    download_model "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Wan2_1_VAE_bf16.safetensors"                                                             "$VAE_DIR/Wan2_1_VAE_bf16.safetensors"
-  fi
-
-  # Download Optimization Loras
-  if [ "${download_optimization_loras:-false}" == "true" ]; then
-    echo "Downloading optimization loras"
-    download_model "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Wan21_CausVid_14B_T2V_lora_rank32.safetensors"                                       "$LORAS_DIR/Wan21_CausVid_14B_T2V_lora_rank32.safetensors"
-    download_model "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Wan21_T2V_14B_lightx2v_cfg_step_distill_lora_rank32.safetensors"                     "$LORAS_DIR/Wan21_T2V_14B_lightx2v_cfg_step_distill_lora_rank32.safetensors"
-    download_model "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/loras/wan2.2_animate_14B_relight_lora_bf16.safetensors"  "$LORAS_DIR/wan2.2_animate_14B_relight_lora_bf16.safetensors"
-    download_model "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Lightx2v/lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors"             "$LORAS_DIR/lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors"
-    download_model "https://huggingface.co/lightx2v/Wan2.2-Lightning/resolve/main/Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V1.1/high_noise_model.safetensors"      "$LORAS_DIR/t2v_lightx2v_high_noise_model.safetensors"
-    download_model "https://huggingface.co/lightx2v/Wan2.2-Lightning/resolve/main/Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V1.1/low_noise_model.safetensors"       "$LORAS_DIR/t2v_lightx2v_low_noise_model.safetensors"
-    download_model "https://huggingface.co/lightx2v/Wan2.2-Distill-Loras/resolve/main/wan2.2_i2v_A14b_high_noise_lora_rank64_lightx2v_4step_1022.safetensors"     "$LORAS_DIR/i2v_lightx2v_high_noise_model.safetensors"
-    download_model "https://huggingface.co/lightx2v/Wan2.2-Distill-Loras/resolve/main/wan2.2_i2v_A14b_low_noise_lora_rank64_lightx2v_4step_1022.safetensors"      "$LORAS_DIR/i2v_lightx2v_low_noise_model.safetensors"
-  fi
-
-  # Download detection models for WanAnimatePreprocess
-  if [ "${download_detection:-false}" == "true" ]; then
-    echo "Downloading detection models..."
-    download_model "https://huggingface.co/Wan-AI/Wan2.2-Animate-14B/resolve/main/process_checkpoint/det/yolov10m.onnx"     "$DETECTION_DIR/yolov10m.onnx"
-    download_model "https://huggingface.co/Kijai/vitpose_comfy/resolve/main/onnx/vitpose_h_wholebody_data.bin"              "$DETECTION_DIR/vitpose_h_wholebody_data.bin"
-    download_model "https://huggingface.co/Kijai/vitpose_comfy/resolve/main/onnx/vitpose_h_wholebody_model.onnx"            "$DETECTION_DIR/vitpose_h_wholebody_model.onnx"
-  fi
-
-  # Keep checking until no aria2c processes are not running
-  echo "⏳ Waiting for model downloads to complete..."
-  while pgrep -x "aria2c" > /dev/null; do
-      echo "🔽 Model Downloads still in progress..."
-      sleep 5  # Check every 5 seconds
-  done
-  echo "✅ All requested model downloads completed."
-}
-
 # tg: Telegram notify (best-effort)
 tg() {
   if [ -n "${TELEGRAM_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
@@ -1401,88 +1246,47 @@ helpers_progress_until_done() {
 }
 
 aria2_enqueue_and_wait_from_manifest() {
-  _helpers_need curl; _helpers_need jq; _helpers_need awk
+  local man_url="${MODEL_MANIFEST_URL:-}"
+  [[ -z "$man_url" ]] && { echo "MODEL_MANIFEST_URL is not set." >&2; return 1; }
 
-  if [[ -z "${MODEL_MANIFEST_URL:-}" ]]; then
-    echo "MODEL_MANIFEST_URL is not set." >&2
-    return 1
-  fi
+  # start from a clean slate (doesn't delete files)
+  aria2_clear_results >/dev/null 2>&1 || true
 
-  local MAN; MAN="$(mktemp)"
-  if ! curl -fsSL "${MODEL_MANIFEST_URL}" -o "$MAN"; then
-    echo "Failed to fetch manifest" >&2
-    rm -f "$MAN"
-    return 1
-  fi
-
-  # Build var map (vars + paths), then uppercase ENV overrides
-  local VARS_JSON
-  VARS_JSON="$(
-    jq -n --slurpfile m "$MAN" '
-      ($m[0].vars // {}) as $v
-      | ($m[0].paths // {}) as $p
-      | ($v + $p)
-    '
-  )"
-  while IFS='=' read -r k v; do
-    [[ "$k" =~ ^[A-Z0-9_]+$ ]] || continue
-    VARS_JSON="$(jq --arg k "$k" --arg v "$v" '. + {($k):$v}' <<<"$VARS_JSON")"
-  done < <(env)
-
-  # Which sections are on?
-  local SECTIONS_ALL ENABLED sec
-  SECTIONS_ALL="$(jq -r '.sections | keys[]' "$MAN")"
-  ENABLED=()
-  while read -r sec; do
-    if [[ "${!sec:-}" == "true" || "${!sec:-}" == "1" ]]; then ENABLED+=("$sec"); fi
-    local dl="download_${sec}"
-    if [[ "${!dl:-}" == "true" || "${!dl:-}" == "1" ]]; then ENABLED+=("$sec"); fi
-  done <<<"$SECTIONS_ALL"
-  mapfile -t ENABLED < <(printf '%s\n' "${ENABLED[@]}" | awk '!seen[$0]++')
-
+  # Ensure daemon
   helpers_have_aria2_rpc || helpers_start_aria2_daemon
 
-  if ((${#ENABLED[@]}==0)); then
-    echo "No sections enabled. Available:"; echo "$SECTIONS_ALL" | sed 's/^/  - /'
-    rm -f "$MAN"
-    return 0
-  fi
+  # Graceful INT/TERM handling
+  local trapped=0
+  _cleanup_trap_manifest() {
+    (( trapped )) && return 0
+    trapped=1
+    echo; echo "⚠️  Interrupted — stopping queue and cleaning results…"
+    aria2_stop_all >/dev/null 2>&1 || true
+    aria2_clear_results >/dev/null 2>&1 || true
+    # Don’t kill the daemon here; other tasks may still use it
+    return 130
+  }
+  trap _cleanup_trap_manifest INT TERM
 
-  # Enqueue (no pre-HEAD).
-  for sec in "${ENABLED[@]}"; do
-    echo ">>> Enqueue section: $sec"
-    jq -r --arg sec "$sec" '
-      (.sections[$sec] // [])[]
-      | [.url, (.path // ((.dir // "") + (if .out then "/" + .out else "" end)))]
-      | @tsv
-    ' "$MAN" | while IFS=$'\t' read -r url raw_path; do
-      [[ -z "$url" || -z "$raw_path" ]] && continue
-      local path dir out
-      path="$(helpers_resolve_placeholders "$raw_path" "$VARS_JSON")" || continue
-      dir="$(dirname -- "$path")"; out="$(basename -- "$path")"
-      mkdir -p -- "$dir"
+  # Enqueue selections
+  local any=0
+  echo "▶ Starting aria2 RPC daemon…"
+  any="$(helpers_download_from_manifest || echo 0)"
 
-      if helpers_ensure_target_ready "$path"; then
-        echo "📥 Queue: $out"
-        helpers_rpc_add_uri "$url" "$dir" "$out" "" >/dev/null || true
-      fi
-    done
-  done
-  rm -f "$MAN"
-
-  # Start loop only if aria2 says there’s something pending
-  local pending; pending="$(helpers_rpc_count_pending)"
-  if (( pending == 0 )); then
+  if [[ "$any" == "0" ]]; then
     echo "Nothing enqueued. Exiting without starting progress loop."
+    trap - INT TERM
     return 0
   fi
 
-  local interval="${ARIA2_PROGRESS_INTERVAL:-10}"
-  local width="${ARIA2_PROGRESS_BAR_WIDTH:-40}"
-  local logfile="${COMFY_LOGS:-/workspace/logs}/aria2_progress.log"
-  mkdir -p -- "$(dirname -- "$logfile")"
+  # Foreground progress loop — exits itself when queue drains
+  helpers_progress_snapshot_loop "${ARIA2_PROGRESS_INTERVAL:-5}" "${ARIA2_PROGRESS_BAR_WIDTH:-40}" \
+    "${COMFY_LOGS:-/workspace/logs}/aria2_progress.log"
 
-  helpers_progress_snapshot_loop "$interval" "$width" "$logfile"
+  # Clear stopped results _after_ a successful run (fresh list next time)
+  aria2_clear_results >/dev/null 2>&1 || true
+
+  trap - INT TERM
   return 0
 }
 
@@ -1535,11 +1339,162 @@ _helpers_gate() {
   done
 }
 
-# Main entry: schedule CivitAI downloads by IDs into target dirs.
-# You may pass an explicit mapping; otherwise it uses checkpoints/loras envs.
+
+# Build a civitai download URL from a ModelVersion ID.
+# You can later extend this to add query params (format/type) if needed.
+_civitai_url_for_id() {
+  local id="$1"
+  printf "https://civitai.com/api/download/models/%s" "$id"
+}
+
+# Turn CIVITAI_TOKEN into an aria2 header array (or nothing)
+_civitai_headers_json() {
+  if [[ -n "${CIVITAI_TOKEN:-}" ]]; then
+    # aria2.addUri "header": ["Authorization: Bearer <token>"]
+    printf '[ "Authorization: Bearer %s" ]' "Bearer ${CIVITAI_TOKEN}"
+  else
+    printf '[]'
+  fi
+}
+
+# Post-process a target directory: extract any *.zip to a tmp, copy only *.safetensors to target, clean up.
+_civitai_postprocess_dir() {
+  local target="$1"
+  local z
+  shopt -s nullglob
+  for z in "$target"/*.zip "$target"/*.ZIP; do
+    [[ -e "$z" ]] || continue
+    local tmpd; tmpd="$(mktemp -d)"
+    echo "🗜️  Extracting: $(basename "$z")"
+    unzip -o -q "$z" -d "$tmpd" || { echo "  ! unzip failed for $z"; rm -rf "$tmpd"; continue; }
+    # copy only *.safetensors (case-insensitive) into target
+    find "$tmpd" -type f -iregex '.*\.safetensors$' -print -exec mv -f {} "$target"/ \;
+    rm -rf "$tmpd"
+    # keep the zip so you can audit; comment next line to keep
+    # rm -f "$z"
+  done
+  shopt -u nullglob
+}
+
+# Split mixed "ID, ID2 ID3" into one-per-line
+_helpers_split_ids() {
+  local s="$*"
+  tr ',\t' '\n' <<<"$s" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | awk 'NF>0'
+}
+
+# Enqueue a single CivitAI ID into target dir via aria2 RPC.
+_civitai_enqueue_one() {
+  local id="$1" dir="$2"
+  mkdir -p "$dir"
+  local url; url="$(_civitai_url_for_id "$id")"
+  local headers; headers="$(_civitai_headers_json)"
+
+  # Let aria2 pick the filename via Content-Disposition; we only set dir & continue
+  helpers_rpc_add_uri_with_headers "$url" "$dir" "" "$headers"
+}
+
+# helpers_rpc_add_uri_with_headers URL DIR OUT headers_json_array
+#   OUT may be empty to let server decide filename
+helpers_rpc_add_uri_with_headers() {
+  local url="$1" dir="$2" out="$3" headers_json="$4"
+  local params
+  if [[ -n "$out" ]]; then
+    params=$(jq -nc --arg dir "$dir" --arg out "$out" --argjson hdrs "$headers_json" \
+      '{dir:$dir, out:$out, continue:true, split:16, "max-connection-per-server":16, "min-split-size":1048576, header:$hdrs}')
+  else
+    params=$(jq -nc --arg dir "$dir" --argjson hdrs "$headers_json" \
+      '{dir:$dir, continue:true, split:16, "max-connection-per-server":16, "min-split-size":1048576, header:$hdrs}')
+  fi
+
+  # Raw RPC
+  local payload; payload=$(jq -nc --arg url "$url" --argjson opts "$params" --arg tok "${ARIA2_SECRET:-}" '
+    {jsonrpc:"2.0", id:"add", method:"aria2.addUri",
+     params:[ ( $tok|length>0 ? "token:"+$tok : empty ), [ $url ], $opts ] }')
+
+  [[ -n "${ARIA2_HOST:-}" ]] || export ARIA2_HOST=127.0.0.1
+  [[ -n "${ARIA2_PORT:-}" ]] || export ARIA2_PORT=6800
+  curl -s "http://${ARIA2_HOST}:${ARIA2_PORT}/jsonrpc" -H 'Content-Type: application/json' --data "$payload" |
+    jq -r '.result // empty'
+}
+
+# Public API: like your old download_civitai_ids, but native aria2 + progress + post-processing
 # Usage:
-#   download_civitai_ids
-#   download_civitai_ids "/path/A:ID1 ID2" "/path/B:ID3,ID4"
+#   aria2_enqueue_and_wait_from_civitai
+#   aria2_enqueue_and_wait_from_civitai "/dirA:ID1 ID2" "/dirB:ID3,ID4"
+aria2_enqueue_and_wait_from_civitai() {
+  command -v jq >/dev/null || { echo "jq required"; return 1; }
+  command -v unzip >/dev/null || { echo "unzip required"; return 1; }
+
+  # start fresh list
+  aria2_clear_results >/dev/null 2>&1 || true
+  helpers_have_aria2_rpc || helpers_start_aria2_daemon
+
+  # Build mapping
+  declare -A map=()
+  if (( $# > 0 )); then
+    local pair dir ids
+    for pair in "$@"; do
+      dir="${pair%%:*}"; ids="${pair#*:}"
+      map["$dir"]="$ids"
+    done
+  else
+    map["${COMFY_HOME:-/workspace/ComfyUI}/models/checkpoints"]="${CHECKPOINT_IDS_TO_DOWNLOAD:-}"
+    map["${COMFY_HOME:-/workspace/ComfyUI}/models/loras"]="${LORAS_IDS_TO_DOWNLOAD:-}"
+  fi
+
+  # Ctrl-C trap
+  local trapped=0
+  _cleanup_trap_civitai() {
+    (( trapped )) && return 0
+    trapped=1
+    echo; echo "⚠️  Interrupted — stopping queue and cleaning results…"
+    aria2_stop_all >/dev/null 2>&1 || true
+    aria2_clear_results >/dev/null 2>&1 || true
+    return 130
+  }
+  trap _cleanup_trap_civitai INT TERM
+
+  # Enqueue
+  local started=0
+  for TARGET_DIR in "${!map[@]}"; do
+    local ids_raw="${map[$TARGET_DIR]}"
+    [[ -n "${ids_raw// }" ]] || { echo "⏭️  No IDs set for $TARGET_DIR"; continue; }
+    echo "📦 Target: $TARGET_DIR"
+    while IFS= read -r MODEL_ID; do
+      [[ -z "$MODEL_ID" ]] && continue
+      local gid
+      gid="$(_civitai_enqueue_one "$MODEL_ID" "$TARGET_DIR")"
+      if [[ -n "$gid" ]]; then
+        echo "🚀 Enqueued ID=$MODEL_ID  → GID=$gid"
+        ((started++))
+      else
+        echo "❌ Failed to enqueue ID=$MODEL_ID"
+      fi
+      sleep 0.15
+    done < <(_helpers_split_ids "$ids_raw")
+  done
+
+  if (( started == 0 )); then
+    echo "Nothing enqueued. Exiting."
+    trap - INT TERM
+    return 0
+  fi
+
+  # Progress (foreground, will exit when queue drains)
+  helpers_progress_snapshot_loop "${ARIA2_PROGRESS_INTERVAL:-5}" "${ARIA2_PROGRESS_BAR_WIDTH:-40}" \
+    "${COMFY_LOGS:-/workspace/logs}/aria2_progress.log"
+
+  # Post-process any zips (only copy *.safetensors)
+  for TARGET_DIR in "${!map[@]}"; do
+    _civitai_postprocess_dir "$TARGET_DIR"
+  done
+
+  # Final tidy: clear results so next session list is fresh
+  aria2_clear_results >/dev/null 2>&1 || true
+  trap - INT TERM
+  echo "✅ CivitAI batch complete."
+}
+
 download_civitai_ids() {
   command -v download_with_aria.py >/dev/null || {
     echo "❌ /usr/local/bin/download_with_aria.py not found/executable" >&2

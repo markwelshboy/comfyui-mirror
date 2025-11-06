@@ -26,7 +26,7 @@ apt-get update
 apt-get install -y --no-install-recommends \
   python3.12 python3.12-venv python3.12-dev python3-pip \
   build-essential ninja-build pkg-config cmake gcc g++ \
-  git git-lfs curl ca-certificates \
+  git git-lfs curl ca-certificates unzip \
   ffmpeg libgl1 libglib2.0-0 \
   aria2 jq gawk nano coreutils \
   tmux net-tools ncurses-base bash-completion
@@ -264,37 +264,42 @@ echo "✅ All Huggingface models from manifest downloaded."
 #===============================================================================================
 
 #----------- Download CivitAI downloader script ----------
-echo "Downloading CivitAI download script to /usr/local/bin"
-git clone "https://github.com/Hearmeman24/CivitAI_Downloader.git" || { echo "Git clone failed"; exit 1; }
-mv CivitAI_Downloader/download_with_aria.py "/usr/local/bin/" || { echo "Move failed"; exit 1; }
-chmod +x "/usr/local/bin/download_with_aria.py" || { echo "Chmod failed"; exit 1; }
-rm -rf CivitAI_Downloader  # Clean up the cloned repo
+#echo "Downloading CivitAI download script to /usr/local/bin"
+#git clone "https://github.com/Hearmeman24/CivitAI_Downloader.git" || { echo "Git clone failed"; exit 1; }
+#mv CivitAI_Downloader/download_with_aria.py "/usr/local/bin/" || { echo "Move failed"; exit 1; }
+#chmod +x "/usr/local/bin/download_with_aria.py" || { echo "Chmod failed"; exit 1; }
+#rm -rf CivitAI_Downloader  # Clean up the cloned repo
 
-mkdir -p "${CIVITAI_LOG_DIR}"
-echo "Downloading models from CivitAI..."
+#mkdir -p "${CIVITAI_LOG_DIR}"
+#echo "Downloading models from CivitAI..."
 
 # Using env-defined lists (checkpoints + loras):
-download_civitai_ids
+#download_civitai_ids
 
 # Optional: wait until aria2 RPC daemon is idle
-echo "⏳ Waiting for background aria2 downloads to finish..."
-while pgrep -x "aria2c" >/dev/null; do
-  echo "🔽 Downloads still running..."
-  sleep 5
-done
+#echo "⏳ Waiting for background aria2 downloads to finish..."
+#while pgrep -x "aria2c" >/dev/null; do
+#  echo "🔽 Downloads still running..."
+#  sleep 5
+#done
+
+echo "Downloading CivitAI assets using environment-defined lists..."
+
+aria2_enqueue_and_wait_from_civitai
+
 echo "✅ All CivitAI models downloaded successfully!"
 
 #===============================================================================================
 #  6.2.1) Rename any .zip loras to .safetensors
 #===============================================================================================
-echo "Renaming loras downloaded as zip files to safetensors files...."
-cd $LORAS_DIR
-for file in *.zip; do
-  echo "Renaming $file to ${file%.zip}.safetensors"
-  mv "$file" "${file%.zip}.safetensors"
-done
+#echo "Renaming loras downloaded as zip files to safetensors files...."
+#cd $LORAS_DIR
+#for file in *.zip; do
+#  echo "Renaming $file to ${file%.zip}.safetensors"
+#  mv "$file" "${file%.zip}.safetensors"
+#done
 # Return to workspace
-cd /workspace
+#cd /workspace
 
 #===============================================================================================
 #  6.3) Relocate upscaling models from comfyui-mirror git dir to proper upscale dir
