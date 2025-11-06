@@ -597,18 +597,36 @@ helpers_human_bytes() { # bytes -> human
   printf "%d %s" "$b" "${u[$d]}"
 }
 
-# jq/env placeholder substitution: ${FOO} → value
+# Replace the existing helpers_resolve_placeholders with this:
 helpers_resolve_placeholders() {
-  local s="$1" json="$2"
-  jq -r --arg s "$s" --argjson envmap "$json" '
-    def subvars($m):
-      def repl:
-        capture("\\$\\{(?<k>[A-Z0-9_]+)\\}") as $c
-        | ($m[$c.k] // env[$c.k] // $c.k) as $v
-        | .string |= (.string | sub("\\$\\{" + $c.k + "\\}"; ($v|tostring)));
-      reduce range(0;20) as $i ({"string":$s}; repl) | .string;
-    subvars($envmap)
-  ' <<< "{}"
+  # Replace ${VARNAME} with value from provided JSON map (first) or env (fallback)
+  # Args: 1=template string (may contain ${FOO}), 2=json map string
+  local tmpl="$1" json="${2:-{}}"
+  local out="$tmpl"
+
+  # Fast bail if no ${...}
+  [[ "$out" != *'${'* ]] && { printf '%s' "$out"; return 0; }
+
+  # Expand all ${NAME} occurrences
+  local before="$out" var key val
+  # Limit to avoid infinite loops if someone embeds weird patterns
+  for _ in {1..50}; do
+    if [[ "$out" =~ (\$\{[A-Z0-9_]+\}) ]]; then
+      var="${BASH_REMATCH[1]}"
+      key="${var:2:${#var}-3}"
+      # lookup in JSON then env
+      val="$(jq -r --arg k "$key" '.[ $k ] // env[$k] // empty' <<<"$json")"
+      # If still empty, replace with nothing (or keep raw; choose one)
+      out="${out//$var/$val}"
+    else
+      break
+    fi
+    # If nothing changed, stop
+    [[ "$out" == "$before" ]] && break
+    before="$out"
+  done
+
+  printf '%s' "$out"
 }
 
 # ---- RPC core ----
@@ -702,8 +720,21 @@ helpers_progress_snapshot_once() {
   local active; active="$(helpers_rpc_post '{"jsonrpc":"2.0","id":"a","method":"aria2.tellActive","params":["'"$tok"'"]}')" || active='{}'
   local names=() sizes=() dones=() speeds=() dirs=()
 
-  mapfile -t names < <(jq -r '(.result // [])[] | (.files[0].path // .bittorrent.info.name // .infoHash // "unknown") | split("/") | last' <<<"$active")
-  mapfile -t dirs  < <(jq -r '(.result // [])[] | (.files[0].path // "unknown") | split("/") | .[0:-1] | join("/")' <<<"$active")
+  #mapfile -t names < <(jq -r '(.result // [])[] | (.files[0].path // .bittorrent.info.name // .infoHash // "unknown") | split("/") | last' <<<"$active")
+  #mapfile -t dirs  < <(jq -r '(.result // [])[] | (.files[0].path // "unknown") | split("/") | .[0:-1] | join("/")' <<<"$active")
+  #mapfile -t sizes < <(jq -r '(.result // [])[] | (.totalLength // 0)' <<<"$active")
+  #mapfile -t dones < <(jq -r '(.result // [])[] | (.completedLength // 0)' <<<"$active")
+  #mapfile -t speeds < <(jq -r '(.result // [])[] | (.downloadSpeed // 0)' <<<"$active")
+
+  # Replace the 4 mapfile lines in helpers_progress_snapshot_once with:
+  mapfile -t names < <(jq -r '
+    (.result // [])[]
+    | ( .files[0].path
+        // .bittorrent.info.name
+        // .infoHash
+        // .gid
+        // "unknown" )' <<<"$active" | awk -F/ '{print $NF}')
+  mapfile -t dirs  < <(jq -r '(.result // [])[] | (.files[0].path // "") | split("/") | .[0:-1] | join("/")' <<<"$active")
   mapfile -t sizes < <(jq -r '(.result // [])[] | (.totalLength // 0)' <<<"$active")
   mapfile -t dones < <(jq -r '(.result // [])[] | (.completedLength // 0)' <<<"$active")
   mapfile -t speeds < <(jq -r '(.result // [])[] | (.downloadSpeed // 0)' <<<"$active")
@@ -793,6 +824,7 @@ helpers_progress_snapshot_loop() {
 }
 
 # ---- Manifest Enqueue ----
+# Replace helpers_download_from_manifest with this:
 helpers_download_from_manifest() {
   command -v curl >/dev/null && command -v jq >/dev/null || { echo "Need curl + jq"; return 1; }
   [[ -z "${MODEL_MANIFEST_URL:-}" ]] && { echo "MODEL_MANIFEST_URL is not set." >&2; return 1; }
@@ -800,6 +832,7 @@ helpers_download_from_manifest() {
   local MAN; MAN="$(mktemp)"
   curl -fsSL "$MODEL_MANIFEST_URL" -o "$MAN" || { echo "Failed to fetch manifest: $MODEL_MANIFEST_URL" >&2; return 1; }
 
+  # Build vars map (manifest vars/paths merged with UPPERCASE env)
   local VARS_JSON
   VARS_JSON="$(
     jq -n --slurpfile m "$MAN" '
@@ -813,6 +846,7 @@ helpers_download_from_manifest() {
     VARS_JSON="$(jq --arg k "$k" --arg v "$v" '. + {($k):$v}' <<<"$VARS_JSON")"
   done < <(env)
 
+  # Determine enabled sections
   local SECTIONS_ALL ENABLED sec
   SECTIONS_ALL="$(jq -r '.sections | keys[]' "$MAN")"
   ENABLED=()
@@ -821,6 +855,7 @@ helpers_download_from_manifest() {
     local dl_var="download_${sec}"
     if [[ "${!dl_var:-}" == "true" || "${!dl_var:-}" == "1" ]]; then ENABLED+=("$sec"); fi
   done <<<"$SECTIONS_ALL"
+
   if ((${#ENABLED[@]}==0)); then
     echo "No sections enabled. Available:"; echo "$SECTIONS_ALL" | sed 's/^/  - /'; return 0
   fi
@@ -829,10 +864,15 @@ helpers_download_from_manifest() {
   helpers_have_aria2_rpc || helpers_start_aria2_daemon
   helpers_reset_enqueued
 
-  local url raw_path path dir out gid any=0
+  local any=0 url raw_path path dir out gid
+  local default_dir="${DEFAULT_DOWNLOAD_DIR:-$COMFY}"
+
   for sec in "${ENABLED[@]}"; do
     echo ">>> Enqueue section: $sec"
-    jq -r --arg sec "$sec" --arg default_dir "${DEFAULT_DOWNLOAD_DIR:-$COMFY}" '
+
+    # Collect pairs first to avoid subshell write-loss
+    local -a pairs=()
+    mapfile -t pairs < <(jq -r --arg sec "$sec" --arg default_dir "$default_dir" '
       def as_obj:
         if (type=="object") then {url:(.url // ""), path:(.path // ((.dir // "") + (if .out then "/" + .out else "" end)))}
         elif (type=="array") then {url:(.[0] // ""), path:(.[1] // "")}
@@ -848,21 +888,35 @@ helpers_download_from_manifest() {
           end ) as $p
       | select(($u|type)=="string" and ($p|type)=="string" and ($u|length)>0 and ($p|length)>0)
       | [$u, $p] | @tsv
-    ' "$MAN" | while IFS=$'\t' read -r url raw_path; do
+    ' "$MAN")
+
+    for line in "${pairs[@]}"; do
+      IFS=$'\t' read -r url raw_path <<<"$line"
       [[ -z "$url" || -z "$raw_path" ]] && { echo "⚠️  Skipping invalid item"; continue; }
+
       path="$(helpers_resolve_placeholders "$raw_path" "$VARS_JSON")"
-      dir="$(dirname -- "$path")"; out="$(basename -- "$path")"
+      dir="$(dirname -- "$path")"
+      out="$(basename -- "$path")"
       mkdir -p -- "$dir"
+
+      # If file exists with non-zero size, skip
       if [[ -s "$path" ]]; then
-        sz="$(helpers_human_bytes "$(stat -c%s -- "$path" 2>/dev/null || wc -c <"$path")")"
-        echo "✅ $(basename -- "$path") exists (${sz}), skipping."; continue
+        local sz; sz="$(helpers_human_bytes "$(stat -c%s -- "$path" 2>/dev/null || wc -c <"$path")")"
+        echo "✅ $(basename -- "$path") exists (${sz}), skipping."
+        continue
       fi
+
       echo "📥 Queue: $out"
       gid="$(helpers_rpc_add_uri "$url" "$dir" "$out" "")"
-      [[ -n "$gid" ]] && any=1
-      helpers_record_gid "$gid"
+      if [[ -n "$gid" ]]; then
+        any=1
+        helpers_record_gid "$gid"
+      else
+        echo "❌ addUri failed for $out"
+      fi
     done
   done
+
   echo "$any"
 }
 
