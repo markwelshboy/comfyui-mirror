@@ -1520,19 +1520,24 @@ aria2_enqueue_and_wait_from_civitai() {
 
   echo "📦 Target (LoRAs): ${COMFY_HOME:-/workspace/ComfyUI}/models/loras"
   enq="$(helpers_civitai_process_list "${LORAS_IDS_TO_DOWNLOAD:-}" "${COMFY_HOME:-/workspace/ComfyUI}/models/loras" "LoRA id(s)")"
-  (( enq_total += enq  ))
+  # keep only digits; default to 0 if empty
+  enq="${enq//[^0-9]/}"; [[ -z "$enq" ]] && enq=0
+  (( enq_total += enq ))
 
   echo "📦 Target (Checkpoints): ${COMFY_HOME:-/workspace/ComfyUI}/models/checkpoints"
   enq="$(helpers_civitai_process_list "${CHECKPOINT_IDS_TO_DOWNLOAD:-}" "${COMFY_HOME:-/workspace/ComfyUI}/models/checkpoints" "Checkpoint id(s)")"
-  (( enq_total += enq  ))
+  enq="${enq//[^0-9]/}"; [[ -z "$enq" ]] && enq=0
+  (( enq_total += enq ))
 
   if (( enq_total == 0 )); then
     echo "Nothing to enqueue from CivitAI tokens."
     return 0
   fi
 
-  # Ensure aria2 daemon and show unified progress
+  # Make sure aria2 RPC is up (reuses your daemon)
   helpers_have_aria2_rpc || helpers_start_aria2_daemon
+
+  # Use your existing, Ctrl-C–aware progress loop
   helpers_progress_snapshot_loop "${ARIA2_PROGRESS_INTERVAL:-5}" "${ARIA2_PROGRESS_BAR_WIDTH:-40}" \
     "${COMFY_LOGS:-/workspace/logs}/aria2_progress.log"
 }
@@ -1899,17 +1904,18 @@ helpers_civitai_tokenize_ids() {
 
 helpers_civitai_process_list() {
   local list="$1" target_dir="$2" kind="$3"
-  [[ -z "$list" || -z "$target_dir" ]] && { echo 0; return 0; }
+  [[ -z "$list" || -z "$target_dir" ]] && { printf '0\n'; return 0; }
 
+  # Tokenize -> array
   local tokens=()
-  while IFS= read -r t; do tokens+=("$t"); done < <(helpers_civitai_tokenize_ids "$list")
+  while IFS= read -r t; do [[ -n "$t" ]] && tokens+=("$t"); done < <(helpers_civitai_tokenize_ids "$list")
 
   if ((${#tokens[@]}==0)); then
-    echo "⏭️ No ${kind:-items} parsed from list."
-    echo 0
+    echo "⏭️ No ${kind:-items} parsed from list." >&2
+    printf '0\n'
     return 0
   else
-    echo "→ Parsed ${#tokens[@]} ${kind:-items}: ${tokens[*]}"
+    echo "→ Parsed ${#tokens[@]} ${kind:-items}: ${tokens[*]}" >&2
   fi
 
   local enq=0 id gid
@@ -1920,11 +1926,11 @@ helpers_civitai_process_list() {
         ((enq++))
       fi
     else
-      echo "⏭️ Skipping unsupported token '$id' (expect numeric version id)"
+      echo "⏭️ Skipping unsupported token '$id' (expect numeric version id)" >&2
     fi
   done
 
-  echo "$enq"
+  printf '%d\n' "$enq"
 }
 
 # Enqueue one CivitAI version id as a SafeTensor model into DIR.
@@ -1979,9 +1985,10 @@ helpers_civitai_enqueue_version() {
     header_json="$(jq -n --arg H "Authorization: Bearer ${CIVITAI_TOKEN}" '[ $H ]')"
   fi
 
-  echo "📥 CivitAI v${ver_id}"
-  echo "   URL : $dl_url"
-  echo "   OUT : $dir/$fname"
+  # inside helpers_civitai_enqueue_version, wherever you print info:
+  echo "📥 CivitAI v${ver_id}" >&2
+  echo "   URL : $dl_url" >&2
+  echo "   OUT : $dir/$fname" >&2
 
   # Enqueue
   local gid
