@@ -737,6 +737,7 @@ helpers_download_from_manifest() {
     echo ">>> Enqueue section: $sec"
 
     jq -r --arg sec "$sec" --arg default_dir "${DEFAULT_DOWNLOAD_DIR:-$COMFY}" '
+      # Normalize each entry to an object {url, path}
       def as_obj:
         if (type=="object") then
           {url:(.url // ""), path:(.path // ((.dir // "") + (if .out then "/" + .out else "" end)))}
@@ -747,7 +748,9 @@ helpers_download_from_manifest() {
         else
           {url:"", path:""}
         end;
-      (.sections[$sec] // [])[] | as_obj
+
+      (.sections[$sec] // [])[]
+      | as_obj
       | .url as $u
       | ( if (.path|length) > 0 then .path
           else ( if ($default_dir|length) > 0
@@ -765,13 +768,14 @@ helpers_download_from_manifest() {
           out="$(basename -- "$path")"
           mkdir -p -- "$dir"
 
-          if helpers_ensure_target_ready "$path" "$url"; then
+          if helpers_ensure_target_ready "$path"; then
             echo "📥 Queue: $(basename -- "$path")"
             gid="$(helpers_rpc_add_uri "$url" "$dir" "$out" "")"
             helpers_record_gid "$gid"
           fi
-    done
+      done
   done
+
   echo "✅ Enqueued selected sections."
 }
 
