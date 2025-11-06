@@ -1471,51 +1471,52 @@ _civitai_process_token_for_type() {
 # Accepts only VERSION IDs (pure numbers). If you later want MODELID logic,
 # we can extend this to call /api/v1/models/{id} and filter versions.
 aria2_enqueue_and_wait_from_civitai() {
-  # Make sure the aria2 RPC is up
-  helpers_have_aria2_rpc || helpers_start_aria2_daemon
+  local lora_dir="${COMFY_HOME:-/workspace/ComfyUI}/models/loras"
+  local ckpt_dir="${COMFY_HOME:-/workspace/ComfyUI}/models/checkpoints"
 
-  local comfy="${COMFY_HOME:-/workspace/ComfyUI}"
-  local loras_dir="${LORAS_DIR:-$comfy/models/loras}"
-  local ckpt_dir="$comfy/models/checkpoints"
-
-  echo "📦 Target (LoRAs): $loras_dir"
+  echo "📦 Target (LoRAs): $lora_dir"
   echo "📦 Target (Checkpoints): $ckpt_dir"
 
-  local ids_loras="${LORAS_IDS_TO_DOWNLOAD:-}"
-  local ids_ckpt="${CHECKPOINT_IDS_TO_DOWNLOAD:-}"
+  aria2_clear_results >/dev/null 2>&1 || true
+  helpers_have_aria2_rpc || helpers_start_aria2_daemon
 
-  # split helper
-  _split_ids() { tr ', ' '\n' | sed -E '/^[[:space:]]*$/d'; }
+  # Graceful INT/TERM handling
+  local trapped=0
+  _cleanup_trap_civitai() {
+    (( trapped )) && return 0
+    trapped=1
+    echo; echo "⚠️  Interrupted — stopping queue and cleaning results…"
+    aria2_stop_all >/dev/null 2>&1 || true
+    aria2_clear_results >/dev/null 2>&1 || true
+    return 130
+  }
+  trap _cleanup_trap_civitai INT TERM
 
-  local any=0
+  local any=0 added=0
 
-  # Enqueue LoRAs (version IDs)
-  if [[ -n "${ids_loras// }" ]]; then
-    while read -r id; do
-      [[ -z "$id" || ! "$id" =~ ^[0-9]+$ ]] && { echo "⏭️ Skip token '$id' (not numeric)"; continue; }
-      if helpers_civitai_enqueue_version "$id" "$loras_dir"; then any=1; fi
-    done < <(printf '%s' "$ids_loras" | _split_ids)
+  # LoRAs
+  if [[ -n "${LORAS_IDS_TO_DOWNLOAD:-}" ]]; then
+    added="$(helpers_civitai_process_list "${LORAS_IDS_TO_DOWNLOAD}" "$lora_dir" "LoRA id(s)")"
+    [[ "$added" == "1" ]] && any=1
   fi
 
-  # Enqueue Checkpoints (version IDs)
-  if [[ -n "${ids_ckpt// }" ]]; then
-    while read -r id; do
-      [[ -z "$id" || ! "$id" =~ ^[0-9]+$ ]] && { echo "⏭️ Skip token '$id' (not numeric)"; continue; }
-      if helpers_civitai_enqueue_version "$id" "$ckpt_dir"; then any=1; fi
-    done < <(printf '%s' "$ids_ckpt" | _split_ids)
+  # Checkpoints
+  if [[ -n "${CHECKPOINT_IDS_TO_DOWNLOAD:-}" ]]; then
+    added="$(helpers_civitai_process_list "${CHECKPOINT_IDS_TO_DOWNLOAD}" "$ckpt_dir" "Checkpoint id(s)")"
+    [[ "$added" == "1" ]] && any=1
   fi
 
-  if (( any == 0 )); then
+  if [[ "$any" != "1" ]]; then
     echo "Nothing to enqueue from CivitAI tokens."
+    trap - INT TERM
     return 0
   fi
 
-  # Let your existing foreground progress loop drive and exit when idle
   helpers_progress_snapshot_loop "${ARIA2_PROGRESS_INTERVAL:-5}" "${ARIA2_PROGRESS_BAR_WIDTH:-40}" \
     "${COMFY_LOGS:-/workspace/logs}/aria2_progress.log"
 
-  # Clean results so next run starts fresh
   aria2_clear_results >/dev/null 2>&1 || true
+  trap - INT TERM
   return 0
 }
 
@@ -1882,40 +1883,87 @@ helpers_civitai_pick_safetensor_from_version() {
     }
 }
 
+# Split a comma/space/newline list into clean tokens, skipping blanks and placeholders.
+# Accepts:  "12345, 67890"  or  $'12345\n67890'  etc.
+helpers_civitai_tokenize_ids() {
+  local raw="$1"
+  printf '%s\n' "$raw" \
+  | tr ', ' '\n' \
+  | tr -s '\n' \
+  | awk 'NF' \
+  | sed -E 's/^[[:space:]]+|[[:space:]]+$//g' \
+  | grep -v -E '^(replace_with_ids|none|null)$' \
+  || true
+}
+
+helpers_civitai_process_list() {
+  local list="$1" target_dir="$2" kind="$3"   # kind is just for messages
+  [[ -z "$list" || -z "$target_dir" ]] && return 0
+
+  local tokens=(); while IFS= read -r t; do tokens+=("$t"); done < <(helpers_civitai_tokenize_ids "$list")
+
+  # Show what we parsed (tiny summary)
+  if ((${#tokens[@]}==0)); then
+    echo "⏭️ No ${kind:-items} parsed from list."
+    return 0
+  else
+    echo "→ Parsed ${#tokens[@]} ${kind:-items}: ${tokens[*]}"
+  fi
+
+  local any=0 id
+  for id in "${tokens[@]}"; do
+    # For now: numeric = version ID. (MODELID:filter can be added later if needed.)
+    if [[ "$id" =~ ^[0-9]+$ ]]; then
+      helpers_civitai_enqueue_version "$id" "$target_dir" && any=1
+    else
+      echo "⏭️ Skipping unsupported token '$id' (expecting numeric version id)"
+    fi
+  done
+
+  echo "$any"
+}
+
 # Enqueue one CivitAI version id as a SafeTensor model into DIR.
 # Uses CIVITAI_TOKEN if set. Prints a one-line status and returns 0/1.
 helpers_civitai_enqueue_version() {
   local ver_id="$1" dir="$2"
   [[ -z "$ver_id" || -z "$dir" ]] && { echo "helpers_civitai_enqueue_version: missing args" >&2; return 2; }
 
-  local ver_json
+  local ver_json dl_url fname header_json gid
   if ! ver_json="$(helpers_civitai_get_version_json "$ver_id")"; then
     echo "❌ CivitAI version $ver_id not found/unauthorized"
     return 1
   fi
 
-  local dl_url fname
-  if ! {
-    read -r dl_url < <(printf '%s' "$ver_json" | helpers_civitai_pick_safetensor_from_version) && false
-  }; then
-    # picker failed to emit both lines; try again to fill fname (won’t block)
-    read -r fname  < <(printf '%s' "$ver_json" | jq -r '(.files // []) | (.[0].name // empty)') || true
+  # pick a .safetensors by filename OR format field
+  read -r dl_url fname < <(
+    printf '%s' "$ver_json" | jq -r '
+      def is_safetensor:
+        ((.metadata.format? // .format? // "") | ascii_downcase) == "safetensor"
+        or ((.name? // "") | test("\\.safetensors$"));
+
+      (.files // [])
+      | map(select((.type? // "") == "Model" and is_safetensor))
+      | if length>0 then
+          (.[0].downloadUrl | if test("\\?") then . else . + "?type=Model&format=SafeTensor" end),
+          (.[0].name // (.[0].downloadUrl | sub("^.*/";"")))
+        else empty end
+    '
+  ) || true
+
+  if [[ -z "$dl_url" || -z "$fname" ]]; then
     echo "❌ No .safetensors in version $ver_id"
     return 1
   fi
-  read -r fname  < <(printf '%s' "$ver_json" | helpers_civitai_pick_safetensor_from_version | sed -n '2p') || true
-
-  [[ -z "$dl_url" || -z "$fname" ]] && { echo "❌ No .safetensors in version $ver_id"; return 1; }
 
   mkdir -p -- "$dir"
-  echo "📥 CivitAI v$ver_id → $dir/$fname"
 
-  local header_json='[]'
+  header_json='[]'
   if [[ -n "${CIVITAI_TOKEN:-}" ]]; then
     header_json="$(jq -n --arg H "Authorization: Bearer ${CIVITAI_TOKEN}" '[ $H ]')"
   fi
 
-  local gid
+  echo "📥 CivitAI v${ver_id} → ${dir}/${fname}"
   gid="$(helpers_rpc_add_uri_with_auth "$dl_url" "$dir" "$fname" "$header_json")" || {
     echo "❌ Failed to enqueue v$ver_id"
     return 1
