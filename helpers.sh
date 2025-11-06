@@ -1936,80 +1936,105 @@ helpers_civitai_process_list() {
 # Enqueue one CivitAI version id as a SafeTensor model into DIR.
 # Uses CIVITAI_TOKEN if set. Prints a one-line status and returns 0/1.
 helpers_civitai_enqueue_version() {
+  # $1 = version_id (numeric), $2 = target_dir
   local ver_id="$1" dir="$2"
-  [[ -z "$ver_id" || -z "$dir" ]] && { echo ""; return 2; }
+  [[ -z "$ver_id" || -z "$dir" ]] && { echo "" ; return 1; }
 
-  local ver_json
-  if ! ver_json="$(helpers_civitai_get_version_json "$ver_id")"; then
+  # 1) Get version JSON (already have a helper; must print JSON to stdout or empty on error)
+  local j
+  if ! j="$(helpers_civitai_get_version_json "$ver_id")" || [[ -z "$j" ]]; then
     echo "❌ CivitAI version $ver_id not found/unauthorized" >&2
-    echo ""
-    return 1
+    echo ""; return 1
   fi
 
-  [[ -n "${CIVITAI_DEBUG:-}" ]] && {
-    echo "— CivitAI v${ver_id} files —" >&2
-    printf '%s' "$ver_json" | jq -r '.files | map({name,type,metadata,format,downloadUrl})' >&2
-  }
+  # 2) Choose the first file that is safetensors (by extension or metadata)
+  local name dl_url
+  name="$(printf '%s' "$j" | jq -r '
+    (.files // []) |
+    map(select(
+      ((.name // "") | ascii_downcase | endswith(".safetensors")) or
+      (((.metadata.format? // .format? // "") | tostring | ascii_downcase) == "safetensor")
+    )) | (.[0].name // empty)
+  ')"
+  dl_url="$(printf '%s' "$j" | jq -r '(.files // []) | (.[0].downloadUrl // empty)')"
 
-  # Produce one TSV line: <downloadUrl>\t<filename>
-  local tsv dl_url fname
-  tsv="$(
-    printf '%s' "$ver_json" | jq -r '
-      (.files // [])
-      | map(select(
-          ((.name // "") | ascii_downcase | endswith(".safetensors"))
-          or (((.metadata.format? // .format? // "") | tostring | ascii_downcase) == "safetensor")
-        ))
-      | if length>0 then
-          [ (.[0].downloadUrl
-              | if test("\\?") then . else . + "?type=Model&format=SafeTensor" end),
-            (.[0].name // (.[0].downloadUrl | sub("^.*/";"")))
-          ] | @tsv
-        else empty end
-    '
-  )"
-
-  IFS=$'\t' read -r dl_url fname <<<"$tsv"
-
-  if [[ -z "$dl_url" || -z "$fname" ]]; then
+  if [[ -z "$name" || -z "$dl_url" ]]; then
     echo "❌ No .safetensors in version $ver_id" >&2
-    echo ""
-    return 1
+    echo ""; return 1
   fi
 
-  mkdir -p -- "$dir"
+  mkdir -p "$dir"
 
-  # Header array only if token exists
-  local header_json='[]'
+  # 3) Build candidate URLs (some versions reject certain query combos)
+  local candidates=(
+    "${dl_url}?type=Model&format=SafeTensor"
+    "${dl_url}?format=SafeTensor"
+    "${dl_url}"
+  )
+
+  # 4) Headers: auth (if token), UA, referer
+  local ua hdr_auth hdr_referer
+  ua="${CIVITAI_UA:-Mozilla/5.0 (X11; Linux x86_64) aria2-helper}"
+  hdr_referer="Referer: https://civitai.com/"
   if [[ -n "${CIVITAI_TOKEN:-}" ]]; then
-    header_json="$(jq -n --arg H "Authorization: Bearer ${CIVITAI_TOKEN}" '[ $H ]')"
+    hdr_auth="Authorization: Bearer ${CIVITAI_TOKEN}"
   fi
 
-  # inside helpers_civitai_enqueue_version, wherever you print info:
-  echo "📥 CivitAI v${ver_id}" >&2
-  echo "   URL : $dl_url" >&2
-  echo "   OUT : $dir/$fname" >&2
+  # 5) Probe candidates with HEAD (follow redirects). Accept 2xx/3xx.
+  local good_url="" code=""
+  for u in "${candidates[@]}"; do
+    code="$(
+      curl -sSIL -o /dev/null -w '%{http_code}' -L \
+        -H "User-Agent: $ua" \
+        -H "$hdr_referer" \
+        ${hdr_auth:+-H "$hdr_auth"} \
+        --max-time 20 --retry 2 --retry-delay 1 \
+        "$u" || echo ""
+    )"
+    # accept 2xx/3xx
+    if [[ "$code" =~ ^2|3[0-9]{2}$ ]]; then
+      good_url="$u"
+      break
+    fi
+  done
 
-  # Enqueue
+  if [[ -z "$good_url" ]]; then
+    echo "❌ CivitAI v${ver_id} URL probe failed (last code: ${code:-none})" >&2
+    echo ""; return 1
+  fi
+
+  # 6) If name is empty, try to infer from Content-Disposition (rare)
+  if [[ -z "$name" ]]; then
+    name="$(
+      curl -sSIL -L \
+        -H "User-Agent: $ua" -H "$hdr_referer" ${hdr_auth:+-H "$hdr_auth"} \
+        "$good_url" | awk -F'filename=' '/Content-Disposition/ {print $2}' | tr -d '";'\'''
+    )"
+    [[ -z "$name" ]] && name="civitai_${ver_id}.safetensors"
+  fi
+
+  # 7) Enqueue to aria2 RPC using the same headers
+  local out_path="$dir/$name"
   local gid
-  gid="$(helpers_rpc_add_uri_with_auth "$dl_url" "$dir" "$fname" "$header_json" 2>/dev/null || true)"
+  gid="$(helpers_rpc_add_uri "$good_url" "$dir" "$name" "$(cat <<EOF
+$([[ -n "$hdr_auth" ]] && printf '%s\n' "$hdr_auth")
+User-Agent: $ua
+$hdr_referer
+EOF
+)")"
 
-  if [[ -z "$gid" ]]; then
-    echo "❌ Enqueue returned empty GID (check aria2 RPC or helper wiring)" >&2
-    # Fallback: try raw core one more time (prints gid or stays empty)
-    gid="$(helpers__rpc_add_uri_core "$dl_url" "$dir" "$fname" "$header_json" 2>/dev/null || true)"
+  if [[ -n "$gid" ]]; then
+    echo "📥 CivitAI v${ver_id}" >&2
+    echo "   URL : $good_url" >&2
+    echo "   OUT : $out_path" >&2
+    printf '%s\n' "$gid"
+    return 0
+  else
+    echo "❌ Failed to enqueue v${ver_id} to aria2" >&2
+    echo ""; return 1
   fi
-
-  if [[ -z "$gid" ]]; then
-    echo "❌ Failed to enqueue v$ver_id" >&2
-    echo ""
-    return 1
-  fi
-
-  echo "   GID : $gid"
-  echo "$gid"
-  return 0
 }
+
 
 helpers_rpc_add_uri() {
   local url="$1" dir="$2" out="$3" checksum="${4:-}"
