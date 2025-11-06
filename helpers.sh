@@ -581,22 +581,28 @@ push_bundle_if_requested() {
 # ---------- Internals ----------
 _helpers_need() { command -v "$1" >/dev/null || { echo "Missing $1" >&2; exit 1; }; }
 
-_helpers_tok_json() {
-  if [[ -n "$ARIA2_SECRET" ]]; then printf '"token:%s",' "$ARIA2_SECRET"; fi
+# Lightweight log fallback
+helpers_log() { printf "%s %s\n" "${2:-ℹ️}" "$1"; }
+
+# Human bytes (safe)
+helpers_human_bytes() {
+  local n=${1:-0}
+  if (( n < 1024 )); then printf "%d B" "$n"
+  elif (( n < 1048576 )); then printf "%d KB" $((n/1024))
+  elif (( n < 1073741824 )); then printf "%d MB" $((n/1048576))
+  else printf "%d GB" $((n/1073741824))
+  fi
 }
 
+# --- aria2 RPC presence/start -------------------------------------------------
 helpers_have_aria2_rpc() {
   curl -s "http://${ARIA2_HOST:-127.0.0.1}:${ARIA2_PORT:-6800}/jsonrpc" \
     -H 'Content-Type: application/json' \
     --data '{"jsonrpc":"2.0","id":"v","method":"aria2.getVersion","params":["token:'"${ARIA2_SECRET:-KissMeQuick}"'"]}' \
-    | jq -e '.result.version' >/dev/null 2>&1
+  | jq -e '.result.version' >/dev/null 2>&1
 }
 
 helpers_start_aria2_daemon() {
-  if helpers_have_aria2_rpc; then
-    helpers_log "aria2 RPC already running." "▶"
-    return 0
-  fi
   helpers_log "Starting aria2 RPC daemon…" "▶"
   aria2c --no-conf \
     --enable-rpc \
@@ -619,70 +625,53 @@ helpers_start_aria2_daemon() {
   helpers_have_aria2_rpc || { helpers_log "aria2 RPC failed to start" "❌"; return 1; }
 }
 
-# Resolve {VARNAME} placeholders against a JSON map
+# --- Placeholder resolution (for {VAR} in manifest paths) ---------------------
 helpers_resolve_placeholders() {
-  local string="$1" map_json="$2"
-  jq -nr --arg s "$string" --argjson map "$map_json" '
+  local s="$1" map_json="$2"
+  jq -nr --arg s "$s" --argjson map "$map_json" '
     def subvars($m):
       reduce ($m|to_entries[]) as $e ($s; gsub("\\{"+($e.key)+"\\}"; ($e.value|tostring)) );
     $s | subvars($map)
   '
 }
 
-# Optional: quiet, opt-in URL probe that won't spam logs
+# --- Optional quiet URL probe (OFF by default to avoid curl spam) -------------
 helpers_probe_url() {
-  # Usage: helpers_probe_url "<url>"
-  # Returns 0 if HEAD/GET looks good, else non-zero.
-  local url="$1"
-  [[ -z "$url" ]] && return 0
-  # Default OFF; set ARIA2_PROBE=1 to enable probing
+  # Enable only if ARIA2_PROBE=1
   [[ "${ARIA2_PROBE:-0}" != "1" ]] && return 0
-
-  local to="${ARIA2_PROBE_TIMEOUT:-10}"
-  local rt="${ARIA2_PROBE_RETRIES:-0}"
-
-  # HEAD is often enough; some endpoints don’t like HEAD, so fall back to GET if HEAD fails.
-  # stderr is suppressed unless DEBUG/CIVITAI_DEBUG/ARIA2_DEBUG is set.
+  local url="$1" to="${ARIA2_PROBE_TIMEOUT:-10}" rt="${ARIA2_PROBE_RETRIES:-0}"
+  # HEAD then GET; suppress stderr unless debugging
   if curl -sSIL -m "$to" --retry "$rt" --retry-all-errors -o /dev/null "$url" 2>"/tmp/.probe.$$"; then
     return 0
   fi
   if curl -sSL  -m "$to" --retry "$rt" --retry-all-errors -o /dev/null "$url" 2>>"/tmp/.probe.$$"; then
     return 0
   fi
-
-  if [[ -n "${DEBUG}${CIVITAI_DEBUG}${ARIA2_DEBUG}" ]]; then
-    echo "⚠️  Probe failed for: $url"
-    sed -n '1,8p' "/tmp/.probe.$$" || true
-  fi
+  [[ -n "${DEBUG}${ARIA2_DEBUG}" ]] && { echo "⚠️  Probe failed for: $url"; sed -n '1,8p' "/tmp/.probe.$$" || true; }
   rm -f "/tmp/.probe.$$"
   return 1
 }
 
-# Ensure the destination file is either skipped (exists/valid) or ready to enqueue (dir made).
+# --- Decide whether the target should be skipped/enqueued ---------------------
 helpers_ensure_target_ready() {
-  local target="$1"; local src_url="${2:-}"
+  local target="$1" src_url="${2:-}"
   [[ -z "$target" ]] && return 1
 
   local dir; dir="$(dirname -- "$target")"
   mkdir -p -- "$dir"
 
-  # If already present and non-zero size, skip with human size
   if [[ -s "$target" ]]; then
     local sz; sz="$(helpers_human_bytes "$(stat -c%s -- "$target" 2>/dev/null || wc -c <"$target")")"
     echo "✅ $(basename -- "$target") exists (${sz}), skipping."
     return 1
   fi
 
-  # Optional, quiet URL probe (OFF by default)
-  if ! helpers_probe_url "$src_url"; then
-    # Don’t block the queue; just proceed silently (aria2 will handle retries/auth)
-    : # no-op
-  fi
-
+  # Optional, quiet probe (OFF by default)
+  helpers_probe_url "$src_url" >/dev/null 2>&1 || :
   return 0
 }
 
-# ---------- MAIN: download selected sections from manifest ----------
+# --- Core: read manifest and enqueue selected sections ------------------------
 helpers_download_from_manifest() {
   _helpers_need curl; _helpers_need jq; _helpers_need awk
 
@@ -697,7 +686,7 @@ helpers_download_from_manifest() {
     return 1
   }
 
-  # Build placeholder map = vars + paths + current env (env can override)
+  # Build {VAR} map from manifest .vars/.paths, then let env uppercase override
   local VARS_JSON
   VARS_JSON="$(
     jq -n --slurpfile m "$MAN" '
@@ -706,25 +695,22 @@ helpers_download_from_manifest() {
       | ($v + $p)
     '
   )"
-  # Merge uppercase env into map (env wins)
   while IFS='=' read -r k v; do
     [[ "$k" =~ ^[A-Z0-9_]+$ ]] || continue
     VARS_JSON="$(jq --arg k "$k" --arg v "$v" '. + {($k):$v}' <<<"$VARS_JSON")"
   done < <(env)
 
-  # Which sections are enabled? either export <section>=true or download_<section>=true
+  # Enable sections if either <section>=true or download_<section>=true
   local SECTIONS_ALL ENABLED sec
   SECTIONS_ALL="$(jq -r '.sections | keys[]' "$MAN")"
   ENABLED=()
   while read -r sec; do
     if [[ "${!sec:-}" == "true" || "${!sec:-}" == "1" ]]; then ENABLED+=("$sec"); fi
-    local dl_var="download_${sec}"
-    if [[ "${!dl_var:-}" == "true" || "${!dl_var:-}" == "1" ]]; then ENABLED+=("$sec"); fi
+    local dl="download_${sec}"
+    if [[ "${!dl:-}" == "true" || "${!dl:-}" == "1" ]]; then ENABLED+=("$sec"); fi
   done <<<"$SECTIONS_ALL"
-
   if ((${#ENABLED[@]}==0)); then
-    echo "No sections enabled. Available:"
-    echo "$SECTIONS_ALL" | sed 's/^/  - /'
+    echo "No sections enabled. Available:"; echo "$SECTIONS_ALL" | sed 's/^/  - /'
     return 0
   fi
   mapfile -t ENABLED < <(printf '%s\n' "${ENABLED[@]}" | awk '!seen[$0]++')
@@ -735,29 +721,28 @@ helpers_download_from_manifest() {
   local url raw_path path dir out gid
   for sec in "${ENABLED[@]}"; do
     echo ">>> Enqueue section: $sec"
+    jq -r --arg sec "$sec" --arg default_dir "${DEFAULT_DOWNLOAD_DIR:-$COMFY}" '
+      # Normalize entries to {url, path}
+      def as_obj:
+        if (type=="object") then
+          {url:(.url // ""), path:(.path // ((.dir // "") + (if .out then "/" + .out else "" end)))}
+        elif (type=="array") then
+          {url:(.[0] // ""), path:(.[1] // "")}
+        elif (type=="string") then
+          {url:., path:""}
+        else {url:"", path:""} end;
 
-  jq -r --arg sec "$sec" --arg default_dir "${DEFAULT_DOWNLOAD_DIR:-$COMFY}" '
-    def as_obj:
-      if (type=="object") then
-        {url:(.url // ""), path:(.path // ((.dir // "") + (if .out then "/" + .out else "" end)))}
-      elif (type=="array") then
-        {url:(.[0] // ""), path:(.[1] // "")}
-      elif (type=="string") then
-        {url:., path:""}
-      else
-        {url:"", path:""}
-      end;
-    (.sections[$sec] // [])[] | as_obj
-    | .url as $u
-    | ( if (.path|length) > 0 then .path
-        else ( if ($default_dir|length) > 0
-              then ($default_dir + "/" + ($u|sub("^.*/";"")))
-              else (               ($u|sub("^.*/";"")) )
-              end )
-        end ) as $p
-    | select(($u|type)=="string" and ($p|type)=="string" and ($u|length)>0 and ($p|length)>0)
-    | [$u, $p] | @tsv
-  ' "$MAN" | while IFS=$'\t' read -r url raw_path; do
+      (.sections[$sec] // [])[] | as_obj
+      | .url as $u
+      | ( if (.path|length) > 0 then .path
+          else ( if ($default_dir|length) > 0
+                then ($default_dir + "/" + ($u|sub("^.*/";"")))
+                else (               ($u|sub("^.*/";"")) )
+                end )
+          end ) as $p
+      | select(($u|type)=="string" and ($p|type)=="string" and ($u|length)>0 and ($p|length)>0)
+      | [$u, $p] | @tsv
+    ' "$MAN" | while IFS=$'\t' read -r url raw_path; do
         [[ -z "$url" || -z "$raw_path" ]] && { echo "⚠️  Skipping invalid item"; continue; }
 
         path="$(helpers_resolve_placeholders "$raw_path" "$VARS_JSON")"
@@ -767,32 +752,160 @@ helpers_download_from_manifest() {
 
         if helpers_ensure_target_ready "$path" "$url"; then
           echo "📥 Queue: $(basename -- "$path")"
-          gid="$(helpers_rpc_add_uri "$url" "$dir" "$out" "")"
-          helpers_record_gid "$gid"
+          gid="$(helpers_rpc_add_uri "$url" "$dir" "$out" "")" && helpers_record_gid "$gid"
         fi
-    done
+      done
   done
+
   echo "✅ Enqueued selected sections."
 }
 
-helpers_human_bytes() {
-  # usage: helpers_human_bytes <bytes>
-  local n=${1:-0}
-  if (( n < 1024 )); then printf "%d B" "$n"
-  elif (( n < 1048576 )); then printf "%d KB" $((n/1024))
-  elif (( n < 1073741824 )); then printf "%d MB" $((n/1048576))
-  else printf "%d GB" $((n/1073741824))
+helpers_rpc_add_uri() {
+  local url="$1" dir="$2" out="$3" checksum="${4:-}"
+
+  # Concurrency knobs (global defaults)
+  local split_n="${SPLIT:-16}"
+  local mconn_n="${MCONN:-16}"
+  local chunk_sz="${CHUNK:-1M}"
+
+  # If host is HF, optionally downshift (gentler on their CDN)
+  local host; host="$(_helpers_url_host "$url")"
+  if [[ "$host" =~ (^|\.)(huggingface\.co)$ ]]; then
+    split_n="${HF_SPLIT:-${split_n}}"
+    mconn_n="${HF_MCONN:-${mconn_n}}"
+    chunk_sz="${HF_CHUNK:-${chunk_sz}}"
   fi
+
+  # bytes → integer for aria2 RPC
+  _helpers_parse_size_bytes() {
+    local s="${1:-1M}"
+    case "$s" in
+      *K|*k) gawk -v n="${s%[Kk]}" 'BEGIN{printf "%d", n*1024}' ;;
+      *M|*m) gawk -v n="${s%[Mm]}" 'BEGIN{printf "%d", n*1024*1024}' ;;
+      *G|*g) gawk -v n="${s%[Gg]}" 'BEGIN{printf "%d", n*1024*1024*1024}' ;;
+      *)     printf '%s' "$s" ;;
+    esac
+  }
+  local chunk_b; chunk_b="$(_helpers_parse_size_bytes "$chunk_sz")"
+
+  # Decide whether to attach Authorization for this specific URL
+  local send_auth; send_auth="$(_helpers_hf_needs_auth "$url")"
+  if [[ "$send_auth" == "1" && -z "${HF_TOKEN:-}" ]]; then
+    echo "⚠️  HF auth required by probe, but HF_TOKEN is not set. Proceeding without Authorization; may fail." >&2
+    send_auth=0
+  fi
+
+  # Build per-download options
+  local opt req resp gid err
+  opt="$(
+    jq -n \
+      --arg dir "$dir" \
+      --arg out "$out" \
+      --arg hf "${HF_TOKEN:-}" \
+      --arg chk "$checksum" \
+      --arg host "$host" \
+      --argjson split "$split_n" \
+      --argjson mconn "$mconn_n" \
+      --argjson chunk "$chunk_b" \
+      --argjson send_auth "$send_auth" '
+        {
+          dir: $dir,
+          out: $out,
+          continue: true,
+          split: $split,
+          "max-connection-per-server": $mconn,
+          "min-split-size": $chunk
+        }
+        | if $send_auth==1 then .header = [ "Authorization: Bearer \($hf)" ] else . end
+        | if ($chk|length)>0 then .checksum=("sha-256="+$chk) else . end
+      '
+  )"
+
+  req="$(
+    jq -n \
+      --arg url "$url" \
+      --argjson opt "$opt" \
+      --arg tok "${ARIA2_SECRET:-}" '
+        {
+          jsonrpc:"2.0",
+          id:"add",
+          method:"aria2.addUri",
+          params: (
+            ( if ($tok|length)>0 then ["token:"+$tok] else [] end )
+            + [[ $url ]]
+            + [ $opt ]
+          )
+        }'
+  )"
+
+  resp="$(
+    printf '%s' "$req" \
+    | curl -s "http://${ARIA2_HOST:-127.0.0.1}:${ARIA2_PORT:-6800}/jsonrpc" \
+            -H 'Content-Type: application/json' \
+            --data-binary @-
+  )"
+
+  # Optional debug
+  if [[ "${DEBUG_ARIA2:-0}" == "1" ]]; then
+    echo "---- addUri request ----" >&2;  echo "$req"  | jq . >&2
+    echo "---- addUri response ----" >&2; echo "$resp" | jq . >&2 || echo "$resp" >&2
+  fi
+
+  gid="$(jq -r 'select(.result) | .result' <<<"$resp" 2>/dev/null || true)"
+  err="$(jq -r 'select(.error)  | .error.message' <<<"$resp" 2>/dev/null || true)"
+
+  if [[ -n "$gid" && "$gid" != "null" ]]; then
+    echo "$gid"
+    return 0
+  fi
+
+  echo "❌ aria2.addUri failed for: $out" >&2
+  echo "    URL: $url" >&2
+  if [[ -n "$err" && "$err" != "null" ]]; then
+    echo "    Error: $err" >&2
+  else
+    echo "    Raw response: $resp" >&2
+  fi
+  return 1
 }
 
-# log helper (since your new pod said "helpers_log: command not found")
-helpers_log() { printf "%s %s\n" "${2:-ℹ️}" "$1"; }
+helpers_reset_enqueued() {
+  : > "$ARIA2_GID_FILE"
+}
 
-# Human bytes (you already have something similar; safe default)
-human_bytes() {
-  local b=${1:-0} s=0 S=(B KB MB GB TB)
-  while ((b>=1024 && s<${#S[@]}-1)); do b=$((b/1024)); s=$((s+1)); done
-  printf "%d %s" "$b" "${S[$s]}"
+helpers_record_gid() {
+  local gid="$1"
+  [[ -n "$gid" && "$gid" != "null" ]] && echo "$gid" >> "$ARIA2_GID_FILE"
+}
+
+# ----- Clear COMPLETED + FAILED results from aria2 memory -----
+aria2_clear_results() {
+  echo "🧹 Clearing stopped (completed/failed) results…"
+  # Remove per-GID records (keeps finished files on disk)
+  _aria2_rpc aria2.tellStopped '0,1000,["gid","status"]' | _aria2_gids_from | while read -r gid; do
+    echo "  • removeDownloadResult $gid"
+    _aria2_rpc aria2.removeDownloadResult "\"$gid\"" >/dev/null || true
+  done
+  # Purge any leftover result cache
+  echo "  • purgeDownloadResult"
+  _aria2_rpc aria2.purgeDownloadResult >/dev/null || true
+}
+
+# ----- Stop/kill all ACTIVE + WAITING -----
+aria2_stop_all() {
+  echo "⏹️  Stopping all active + waiting downloads…"
+  # Active
+  _aria2_rpc aria2.tellActive '["gid","status"]' | _aria2_gids_from | while read -r gid; do
+    echo "  • forceRemove ACTIVE $gid"
+    _aria2_rpc aria2.forceRemove "\"$gid\"" >/dev/null || true
+  done
+  # Waiting (queue)
+  _aria2_rpc aria2.tellWaiting '0,1000,["gid","status"]' | _aria2_gids_from | while read -r gid; do
+    echo "  • remove WAITING $gid"
+    _aria2_rpc aria2.remove "\"$gid\"" >/dev/null || true
+  done
+  # A tiny grace
+  sleep 1
 }
 
 # ---------- Progress snapshots (append-friendly; no clear by default) ----------
@@ -1044,283 +1157,14 @@ helpers_progress_snapshot_loop() {
   done
 }
 
-# ---------- RPC helpers ----------
-
-_aria2_endpoint() { printf "http://%s:%s/jsonrpc" "${ARIA2_HOST:-127.0.0.1}" "${ARIA2_PORT:-6800}"; }
-_aria2_tok()      { [[ -n "${ARIA2_SECRET:-}" ]] && printf '"token:%s",' "$ARIA2_SECRET"; }
-
-# Call: _aria2_rpc <method> [params_json_without_token_prefix]
-# Example: _aria2_rpc aria2.getGlobalStat
-#          _aria2_rpc aria2.tellWaiting '0,1000,["gid","status"]'
-_aria2_rpc() {
-  local m="$1"; shift || true
-  local params="$*"
-  local tok; tok="$(_aria2_tok)"
-  [[ -n "$params" ]] && params=",$params"
-  curl -sS --fail "$(_aria2_endpoint)" -H 'Content-Type: application/json' \
-    --data "{\"jsonrpc\":\"2.0\",\"id\":\"x\",\"method\":\"$m\",\"params\":[${tok%?}${params#,*}]}" \
-    || echo 'null'
-}
-
-# Utility: return array (one per line) of GIDs for a tell* result
-_aria2_gids_from() {
-  jq -r 'try (.result // .) | if type=="array" then . else [] end | .[].gid // empty catch empty'
-}
-
-# ----- Stop/kill all ACTIVE + WAITING -----
-aria2_stop_all() {
-  echo "⏹️  Stopping all active + waiting downloads…"
-  # Active
-  _aria2_rpc aria2.tellActive '["gid","status"]' | _aria2_gids_from | while read -r gid; do
-    echo "  • forceRemove ACTIVE $gid"
-    _aria2_rpc aria2.forceRemove "\"$gid\"" >/dev/null || true
-  done
-  # Waiting (queue)
-  _aria2_rpc aria2.tellWaiting '0,1000,["gid","status"]' | _aria2_gids_from | while read -r gid; do
-    echo "  • remove WAITING $gid"
-    _aria2_rpc aria2.remove "\"$gid\"" >/dev/null || true
-  done
-  # A tiny grace
-  sleep 1
-}
-
-# ----- Clear COMPLETED + FAILED results from aria2 memory -----
-aria2_clear_results() {
-  echo "🧹 Clearing stopped (completed/failed) results…"
-  # Remove per-GID records (keeps finished files on disk)
-  _aria2_rpc aria2.tellStopped '0,1000,["gid","status"]' | _aria2_gids_from | while read -r gid; do
-    echo "  • removeDownloadResult $gid"
-    _aria2_rpc aria2.removeDownloadResult "\"$gid\"" >/dev/null || true
-  done
-  # Purge any leftover result cache
-  echo "  • purgeDownloadResult"
-  _aria2_rpc aria2.purgeDownloadResult >/dev/null || true
-}
-
-# ----- Full nuke convenience: stop -> clear -> optional partial cleanup -> daemon shutdown -----
-aria2_nuke_all() {
-  local partial_root="${1:-${COMFY_HOME:-/workspace/ComfyUI}/models}"
-
-  aria2_stop_all
-  aria2_clear_results
-
-  # Optional: cleanup *.aria2 partial stubs under models
-  if [[ -d "$partial_root" ]]; then
-    echo "🧽 Removing *.aria2 partial files under: $partial_root"
-    find "$partial_root" -type f -name '*.aria2' -print -delete 2>/dev/null || true
-  fi
-
-  # Try graceful shutdown of the RPC daemon (won’t delete logs/files)
-  echo "🛑 Shutting down aria2 daemon…"
-  _aria2_rpc aria2.shutdown >/dev/null || true
-
-  # Fallback: hard kill lingering aria2c RPC daemons
-  sleep 1
-  pkill -f 'aria2c .*--enable-rpc' 2>/dev/null || true
-  echo "✅ All queues cleared and daemon stopped."
-}
-
-# ----- Tiny diagnostics (optional) -----
-aria2_show_counts() {
-  local s; s="$(_aria2_rpc aria2.getGlobalStat)"
-  printf "Active:%s Waiting:%s Stopped:%s\n" \
-    "$(jq -r '(.result//.).numActive  // "0"'  <<<"$s")" \
-    "$(jq -r '(.result//.).numWaiting // "0"'  <<<"$s")" \
-    "$(jq -r '(.result//.).numStopped // "0"' <<<"$s")"
-}
-
-aria2_inspect_gid() {
-  local gid="$1"
-  [[ -z "$gid" ]] && { echo "Usage: aria2_inspect_gid <gid>"; return 1; }
-  local endpoint="http://${ARIA2_HOST:-127.0.0.1}:${ARIA2_PORT:-6800}/jsonrpc"
-  local tok=""; [[ -n "${ARIA2_SECRET:-}" ]] && tok="token:${ARIA2_SECRET}"
-  curl -s "$endpoint" -H 'Content-Type: application/json' \
-    --data "{\"jsonrpc\":\"2.0\",\"id\":\"st\",\"method\":\"aria2.tellStatus\",\"params\":[\"$tok\",\"$gid\",[\"status\",\"errorMessage\",\"totalLength\",\"completedLength\",\"files\",\"followedBy\",\"bittorrent\"]]}"
-  echo
-}
-
-aria2_last_errors() {
-  local endpoint="http://${ARIA2_HOST:-127.0.0.1}:${ARIA2_PORT:-6800}/jsonrpc"
-  local tok=""; [[ -n "${ARIA2_SECRET:-}" ]] && tok="token:${ARIA2_SECRET}"
-  curl -s "$endpoint" -H 'Content-Type: application/json' \
-    --data "{\"jsonrpc\":\"2.0\",\"id\":\"s\",\"method\":\"aria2.tellStopped\",\"params\":[\"$tok\",0,50,[\"status\",\"errorMessage\",\"files\"]]}" \
-  | jq -r '.result[]
-     | select(.status=="error")
-     | {name:(.files[0].path|split("/")|last), err:(.errorMessage//"Unknown")}
-     | "✖ \(.name): \(.err)"'
-}
-
-helpers_watch_gids() {
-  _helpers_need jq; _helpers_need curl
-  local gids=("$@")
-  local -A done=()
-  while :; do
-    local all=1
-    for g in "${gids[@]}"; do
-      [[ ${done[$g]} ]] && continue
-      s="$(curl -s "http://${ARIA2_HOST}:${ARIA2_PORT}/jsonrpc" -H 'Content-Type: application/json' \
-        --data "{\"jsonrpc\":\"2.0\",\"id\":\"st\",\"method\":\"aria2.tellStatus\",\"params\":[ $(_helpers_tok_json) \"$g\", [\"status\",\"completedLength\",\"totalLength\",\"files\"] ] }")"
-      st="$(jq -r '.result.status' <<<"$s")"
-      name="$(jq -r '.result.files[0].path // .result.files[0].uris[0].uri' <<<"$s")"
-      cl="$(jq -r '.result.completedLength' <<<"$s")"; tl="$(jq -r '.result.totalLength' <<<"$s")"
-      printf "%-50.50s  %-9s  %s/%s\n" "$(basename "$name")" "$st" "$cl" "$tl"
-      if [[ "$st" == "complete" || "$st" == "error" ]]; then done[$g]=1; fi
-    done
-    for g in "${gids[@]}"; do [[ ${done[$g]} ]] || { all=0; break; }; done
-    (( all )) && break
-    sleep "${ARIA2_PROGRESS_INTERVAL:-10}"
-  done
-}
-
-helpers_rpc_shutdown() {
-  curl -s "http://${ARIA2_HOST}:${ARIA2_PORT}/jsonrpc" \
-    -H 'Content-Type: application/json' \
-    --data "{\"jsonrpc\":\"2.0\",\"id\":\"sd\",\"method\":\"aria2.shutdown\",\"params\":[\"token:${ARIA2_SECRET}\"]}" \
-    | jq -r '.result // .error.message // "ok"' 2>/dev/null
-}
-
-# Return just the host of a URL
-_helpers_url_host() { awk -F/ '{print $3}' <<<"$1"; }
-
-# HEAD/redirect probe → prints HTTP status code (or 000 on failure)
-_helpers_http_status() {
-  local url="$1"
-  curl -sS -o /dev/null \
-       -I -L \
-       --max-redirs "${HF_PROBE_REDIRECTS:-5}" \
-       --connect-timeout "${HF_PROBE_TIMEOUT:-5}" \
-       --retry "${HF_PROBE_RETRY:-0}" \
-       --write-out '%{http_code}' \
-       "$url" || printf '000'
-}
-
-# Decide if this URL needs HF auth (returns 0/1 printed to stdout)
-# Modes:
-#   HF_AUTH_MODE=auto (default): probe; send auth only on 401/403
-#   HF_AUTH_MODE=always: always attach Authorization for huggingface.co
-#   HF_AUTH_MODE=never:  never attach Authorization
-_helpers_hf_needs_auth() {
-  local url="$1"
-  local host; host="$(_helpers_url_host "$url")"
-  [[ "$host" =~ (^|\.)(huggingface\.co)$ ]] || { echo 0; return; }
-
-  case "${HF_AUTH_MODE:-auto}" in
-    always) echo 1; return ;;
-    never)  echo 0; return ;;
-    auto|*) :
-      local code; code="$(_helpers_http_status "$url")"
-      # 401/403 → private/gated, needs token
-      if [[ "$code" == "401" || "$code" == "403" ]]; then
-        echo 1
-      else
-        echo 0
-      fi
-      ;;
-  esac
-}
-
-helpers_reset_enqueued() {
-  : > "$ARIA2_GID_FILE"
-}
-
-helpers_record_gid() {
-  local gid="$1"
-  [[ -n "$gid" && "$gid" != "null" ]] && echo "$gid" >> "$ARIA2_GID_FILE"
-}
-
-# Wait until ALL provided GIDs are complete/error/removed.
-# Returns 0 if all completed OK, 1 if any ended in error/removed.
-helpers_wait_for_gids() {
-  _helpers_need curl; _helpers_need jq
-  local interval="${1:-${ARIA2_PROGRESS_INTERVAL:-10}}"; shift || true
-  local gids=("$@")
-  [[ ${#gids[@]} -eq 0 ]] && { echo "No GIDs to wait on." >&2; return 0; }
-
-  declare -A done ok
-  while :; do
-    # Build system.multicall for all not-done GIDs
-    local payload='{"jsonrpc":"2.0","id":"mc","method":"system.multicall","params":[['
-    local first=1
-    for g in "${gids[@]}"; do
-      [[ ${done[$g]} ]] && continue
-      [[ $first -eq 0 ]] && payload+=','
-      first=0
-      if [[ -n "${ARIA2_SECRET:-}" ]]; then
-        payload+='{"methodName":"aria2.tellStatus","params":["token:'"${ARIA2_SECRET}"'","'"$g"'",["status","errorMessage","totalLength","completedLength","files"]]}'
-      else
-        payload+='{"methodName":"aria2.tellStatus","params":["'"$g"'",["status","errorMessage","totalLength","completedLength","files"]]}'
-      fi
-    done
-    payload+=']]}'
-
-    # If nothing pending, break
-    if [[ $first -eq 1 ]]; then
-      break
-    fi
-
-    local resp
-    resp="$(curl -s "http://${ARIA2_HOST:-127.0.0.1}:${ARIA2_PORT:-6800}/jsonrpc" \
-            -H 'Content-Type: application/json' --data-binary "$payload")"
-
-    local i=0
-    for g in "${gids[@]}"; do
-      [[ ${done[$g]} ]] && { i=$((i+1)); continue; }
-      local node status errmsg
-      node="$(jq -r --argjson idx "$i" '.result[$idx]' <<<"$resp")"
-      if [[ "$(jq -r 'has("error")' <<<"$node")" == "true" ]]; then
-        done[$g]=1; ok[$g]=0
-        i=$((i+1))
-        continue
-      fi
-      status="$(jq -r '.result.status // "unknown"' <<<"$node")"
-      errmsg="$(jq -r '.result.errorMessage // ""' <<<"$node")"
-
-      case "$status" in
-        complete) done[$g]=1; ok[$g]=1 ;;
-        error|removed) done[$g]=1; ok[$g]=0; [[ -n "$errmsg" ]] && echo "✖ $g error: $errmsg" >&2 ;;
-        *) ;;
-      esac
-      i=$((i+1))
-    done
-
-    # All done?
-    local all=1; for g in "${gids[@]}"; do [[ ${done[$g]} ]] || { all=0; break; }; done
-    (( all )) && break
-
-    sleep "$interval"
-  done
-
-  local any_bad=0; for g in "${gids[@]}"; do [[ "${ok[$g]}" == "1" ]] || any_bad=1; done
-  return $any_bad
-}
-
-# Convenience: wait on everything recorded in $ARIA2_GID_FILE
-helpers_wait_for_enqueued() {
-  local interval="${1:-${ARIA2_PROGRESS_INTERVAL:-10}}"
-  [[ -f "$ARIA2_GID_FILE" ]] || { echo "No GID file: $ARIA2_GID_FILE" >&2; return 0; }
-  mapfile -t gids < <(awk 'NF' "$ARIA2_GID_FILE" | awk '!seen[$0]++')
-  helpers_wait_for_gids "$interval" "${gids[@]}"
-}
-
-# Run progress UI until specific GIDs finish, then exit
-helpers_progress_until_done() {
-  local interval="${1:-${ARIA2_PROGRESS_INTERVAL:-10}}"; shift || true
-  local gids=("$@")
-  [[ ${#gids[@]} -eq 0 ]] && { echo "No GIDs to watch." >&2; return 0; }
-  helpers_progress_snapshot_loop "$interval" "${ARIA2_PROGRESS_BAR_WIDTH:-40}" "${COMFY_LOGS:-/workspace/logs}/aria2_progress.log" &
-  local snap_pid=$!
-  helpers_wait_for_gids "$interval" "${gids[@]}"
-  local rc=$?
-  kill "$snap_pid" >/dev/null 2>&1 || true
-  wait "$snap_pid" 2>/dev/null || true
-  return $rc
-}
-
+#===============================================================================
+# --- Public entrypoint: clear → ensure daemon → enqueue → progress → clear ----
+#===============================================================================
 aria2_enqueue_and_wait_from_manifest() {
   local man_url="${MODEL_MANIFEST_URL:-}"
   [[ -z "$man_url" ]] && { echo "MODEL_MANIFEST_URL is not set." >&2; return 1; }
 
-  # start from a clean slate (doesn't delete files)
+  # Start clean (does not delete files)
   aria2_clear_results >/dev/null 2>&1 || true
 
   # Ensure daemon
@@ -1332,14 +1176,13 @@ aria2_enqueue_and_wait_from_manifest() {
     (( trapped )) && return 0
     trapped=1
     echo; echo "⚠️  Interrupted — stopping queue and cleaning results…"
-    aria2_stop_all >/dev/null 2>&1 || true
+    aria2_stop_all   >/dev/null 2>&1 || true
     aria2_clear_results >/dev/null 2>&1 || true
-    # Don’t kill the daemon here; other tasks may still use it
     return 130
   }
   trap _cleanup_trap_manifest INT TERM
 
-  # Enqueue selections
+  # Enqueue
   local any=0
   echo "▶ Starting aria2 RPC daemon…"
   any="$(helpers_download_from_manifest || echo 0)"
@@ -1350,146 +1193,15 @@ aria2_enqueue_and_wait_from_manifest() {
     return 0
   fi
 
-  # Foreground progress loop — exits itself when queue drains
+  # Foreground progress loop — exits on idle
   helpers_progress_snapshot_loop "${ARIA2_PROGRESS_INTERVAL:-5}" "${ARIA2_PROGRESS_BAR_WIDTH:-40}" \
     "${COMFY_LOGS:-/workspace/logs}/aria2_progress.log"
 
-  # Clear stopped results _after_ a successful run (fresh list next time)
+  # Fresh slate for next run
   aria2_clear_results >/dev/null 2>&1 || true
 
   trap - INT TERM
   return 0
-}
-
-helpers_rpc_count_pending() {
-  _helpers_need curl; _helpers_need jq
-  local endpoint="http://${ARIA2_HOST:-127.0.0.1}:${ARIA2_PORT:-6800}/jsonrpc"
-  local tok=""; [[ -n "${ARIA2_SECRET:-}" ]] && tok="token:${ARIA2_SECRET}"
-
-  # tellActive
-  local payload_a='{"jsonrpc":"2.0","id":"a","method":"aria2.tellActive","params":['
-  [[ -n "$tok" ]] && payload_a+="\"$tok\","
-  payload_a+='["gid"]]}'
-  local ra; ra="$(curl -sS --fail "$endpoint" -H 'Content-Type: application/json' --data-binary "$payload_a" 2>/dev/null || echo 'null')"
-  local A_len; A_len="$(jq 'try ((.result // .) | length) catch 0' <<<"$ra")"
-
-  # tellWaiting
-  local payload_w='{"jsonrpc":"2.0","id":"w","method":"aria2.tellWaiting","params":['
-  [[ -n "$tok" ]] && payload_w+="\"$tok\","
-  payload_w+='0,200,["gid"]]}'
-  local rw; rw="$(curl -sS --fail "$endpoint" -H 'Content-Type: application/json' --data-binary "$payload_w" 2>/dev/null || echo 'null')"
-  local W_len; W_len="$(jq 'try ((.result // .) | length) catch 0' <<<"$rw")"
-
-  echo $(( A_len + W_len ))
-}
-
-helpers_rpc_add_uri() {
-  local url="$1" dir="$2" out="$3" checksum="${4:-}"
-
-  # Concurrency knobs (global defaults)
-  local split_n="${SPLIT:-16}"
-  local mconn_n="${MCONN:-16}"
-  local chunk_sz="${CHUNK:-1M}"
-
-  # If host is HF, optionally downshift (gentler on their CDN)
-  local host; host="$(_helpers_url_host "$url")"
-  if [[ "$host" =~ (^|\.)(huggingface\.co)$ ]]; then
-    split_n="${HF_SPLIT:-${split_n}}"
-    mconn_n="${HF_MCONN:-${mconn_n}}"
-    chunk_sz="${HF_CHUNK:-${chunk_sz}}"
-  fi
-
-  # bytes → integer for aria2 RPC
-  _helpers_parse_size_bytes() {
-    local s="${1:-1M}"
-    case "$s" in
-      *K|*k) gawk -v n="${s%[Kk]}" 'BEGIN{printf "%d", n*1024}' ;;
-      *M|*m) gawk -v n="${s%[Mm]}" 'BEGIN{printf "%d", n*1024*1024}' ;;
-      *G|*g) gawk -v n="${s%[Gg]}" 'BEGIN{printf "%d", n*1024*1024*1024}' ;;
-      *)     printf '%s' "$s" ;;
-    esac
-  }
-  local chunk_b; chunk_b="$(_helpers_parse_size_bytes "$chunk_sz")"
-
-  # Decide whether to attach Authorization for this specific URL
-  local send_auth; send_auth="$(_helpers_hf_needs_auth "$url")"
-  if [[ "$send_auth" == "1" && -z "${HF_TOKEN:-}" ]]; then
-    echo "⚠️  HF auth required by probe, but HF_TOKEN is not set. Proceeding without Authorization; may fail." >&2
-    send_auth=0
-  fi
-
-  # Build per-download options
-  local opt req resp gid err
-  opt="$(
-    jq -n \
-      --arg dir "$dir" \
-      --arg out "$out" \
-      --arg hf "${HF_TOKEN:-}" \
-      --arg chk "$checksum" \
-      --arg host "$host" \
-      --argjson split "$split_n" \
-      --argjson mconn "$mconn_n" \
-      --argjson chunk "$chunk_b" \
-      --argjson send_auth "$send_auth" '
-        {
-          dir: $dir,
-          out: $out,
-          continue: true,
-          split: $split,
-          "max-connection-per-server": $mconn,
-          "min-split-size": $chunk
-        }
-        | if $send_auth==1 then .header = [ "Authorization: Bearer \($hf)" ] else . end
-        | if ($chk|length)>0 then .checksum=("sha-256="+$chk) else . end
-      '
-  )"
-
-  req="$(
-    jq -n \
-      --arg url "$url" \
-      --argjson opt "$opt" \
-      --arg tok "${ARIA2_SECRET:-}" '
-        {
-          jsonrpc:"2.0",
-          id:"add",
-          method:"aria2.addUri",
-          params: (
-            ( if ($tok|length)>0 then ["token:"+$tok] else [] end )
-            + [[ $url ]]
-            + [ $opt ]
-          )
-        }'
-  )"
-
-  resp="$(
-    printf '%s' "$req" \
-    | curl -s "http://${ARIA2_HOST:-127.0.0.1}:${ARIA2_PORT:-6800}/jsonrpc" \
-            -H 'Content-Type: application/json' \
-            --data-binary @-
-  )"
-
-  # Optional debug
-  if [[ "${DEBUG_ARIA2:-0}" == "1" ]]; then
-    echo "---- addUri request ----" >&2;  echo "$req"  | jq . >&2
-    echo "---- addUri response ----" >&2; echo "$resp" | jq . >&2 || echo "$resp" >&2
-  fi
-
-  gid="$(jq -r 'select(.result) | .result' <<<"$resp" 2>/dev/null || true)"
-  err="$(jq -r 'select(.error)  | .error.message' <<<"$resp" 2>/dev/null || true)"
-
-  if [[ -n "$gid" && "$gid" != "null" ]]; then
-    echo "$gid"
-    return 0
-  fi
-
-  echo "❌ aria2.addUri failed for: $out" >&2
-  echo "    URL: $url" >&2
-  if [[ -n "$err" && "$err" != "null" ]]; then
-    echo "    Error: $err" >&2
-  else
-    echo "    Raw response: $resp" >&2
-  fi
-  return 1
 }
 
 #=======================================================================================
