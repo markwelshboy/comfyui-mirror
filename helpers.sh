@@ -1312,11 +1312,191 @@ helpers_rpc_count_pending() {
   echo $(( A_len + W_len ))
 }
 
-# ---------- CivitAI ID downloader (via /usr/local/bin/download_with_aria.py) ----------
+#=======================================================================================
+#
+# ---------- CivitAI ID downloader helpers ----------
+#
+#=======================================================================================
+
 # Env it uses (override in .env):
-: "${CHECKPOINT_IDS_TO_DOWNLOAD:=}"     # e.g. "12345, 67890"
+: "${CHECKPOINT_IDS_TO_DOWNLOAD:=}"     # e.g. "12345, 67890, 23422:i2v"
 : "${LORAS_IDS_TO_DOWNLOAD:=}"          # e.g. "abc, def ghi"
 : "${CIVITAI_LOG_DIR:=${COMFY_LOGS:-/workspace/logs}/civitai}"
+
+# ===============================
+# CivitAI: shared helpers (updated)
+# ===============================
+_civitai_api_base() { printf "https://civitai.com/api/v1"; }
+_civitai_hdr_auth()  { [[ -n "${CIVITAI_TOKEN:-}" ]] && printf '%s' "-H" "Authorization: Bearer ${CIVITAI_TOKEN}"; }
+
+_civitai_get() {
+  local path="$1"; shift
+  local url="$(_civitai_api_base)%s"; url="$(printf "$url" "$path")"
+  curl -sS --fail --retry 3 --retry-delay 1 --max-time 30 "$(_civitai_hdr_auth)" "$url"
+}
+
+_civitai_get_version_json() { _civitai_get "/model-versions/$1"; }
+_civitai_get_model_json()   { _civitai_get "/models/$1"; }
+
+# Prefer .safetensors > .ckpt > .zip. Output TSV: "<url>\t<suggested_name>"
+_civitai_pick_files_from_version_json() {
+  jq -r '
+    .files
+    | ( map(select((.type // "") | ascii_downcase == "model")) ) as $files
+    | def base: (.name // .metadata.filename // .downloadUrl | split("/") | last);
+    ( $files | map(select(.downloadUrl|test("\\.safetensors$"; "i"))) ) as $safes
+    | ( $files | map(select(.downloadUrl|test("\\.ckpt$";        "i"))) ) as $ckpts
+    | ( $files | map(select(.downloadUrl|test("\\.zip$";         "i"))) ) as $zips
+    | if ($safes|length)>0 then $safes
+      elif ($ckpts|length)>0 then $ckpts
+      elif ($zips|length)>0 then $zips
+      else [] end
+    | .[] | [.downloadUrl, base] | @tsv
+  '
+}
+
+# NEW: pick version IDs from a MODEL JSON by desired model TYPE and optional name regex
+#  $1 = TYPE to match exactly (e.g., "LORA" or "Checkpoint")
+#  $2 = optional name regex (case-insensitive)
+_civitai_pick_version_ids_from_model_json() {
+  local want_type="$1" rx="${2:-}"
+  jq -r --arg t "$want_type" --arg rx "$rx" '
+    select(((.type // "") == $t))
+    | .modelVersions[]
+    | ( if ($rx|length)>0 then (.name|test($rx; "i")) else true end )
+    | .id
+  '
+}
+
+_civitai_enqueue_url() {
+  local url="$1" dest_dir="$2" out_name="$3"
+  helpers_rpc_add_uri "$url" "$dest_dir" "$out_name" ""
+}
+
+# Post-process: extract any .zip in a given dir/_incoming → only *.safetensors into that dir
+_civitai_post_extract_to_dir() {
+  local target_dir="$1"
+  local incoming="${target_dir}/_incoming"
+  [[ -d "$incoming" ]] || return 0
+  shopt -s nullglob
+  local z
+  for z in "$incoming"/*.zip; do
+    helpers_log "🧩 Extracting safetensors: $(basename "$z") → $(basename "$target_dir")/"
+    unzip -o -j "$z" '*.safetensors' -d "$target_dir" >/dev/null 2>&1 || true
+  done
+  shopt -u nullglob
+}
+
+# Core: process a single token (VERSIONID or MODELID[:filter]) for a specific DEST + TYPE
+#  $1=token, $2=dest_dir, $3=model_type ("LORA" or "Checkpoint")
+# Returns: number enqueued
+_civitai_process_token_for_type() {
+  local token="$1" dest_dir="$2" model_type="$3"
+  local incoming="${dest_dir}/_incoming"
+  mkdir -p "$dest_dir" "$incoming"
+
+  local id="${token%%:*}"
+  local filter=""
+  [[ "$token" == *:* ]] && filter="${token#*:}"
+
+  # Try as VERSION first
+  local vjson
+  if vjson="$(_civitai_get_version_json "$id" 2>/dev/null)"; then
+    local n=0
+    while IFS=$'\t' read -r url fname; do
+      [[ -z "$url" ]] && continue
+      if [[ "$fname" =~ \.zip$ ]]; then
+        helpers_log "📥 ($model_type zip) ${fname}"
+        _civitai_enqueue_url "$url" "$incoming" "$fname" >/dev/null && ((n++))
+      else
+        helpers_log "📥 ($model_type) ${fname}"
+        _civitai_enqueue_url "$url" "$dest_dir" "$fname" >/dev/null && ((n++))
+      fi
+    done < <(printf '%s' "$vjson" | _civitai_pick_files_from_version_json)
+    printf '%d' "$n"; return 0
+  fi
+
+  # Not a VERSION → treat as MODEL
+  local mjson
+  if mjson="$(_civitai_get_model_json "$id" 2>/dev/null)"; then
+    local enq=0
+    while IFS= read -r ver_id; do
+      [[ -z "$ver_id" ]] && continue
+      local vj
+      if vj="$(_civitai_get_version_json "$ver_id" 2>/dev/null)"; then
+        while IFS=$'\t' read -r url fname; do
+          [[ -z "$url" ]] && continue
+          if [[ "$fname" =~ \.zip$ ]]; then
+            helpers_log "📥 ($model_type zip) ${fname}"
+            _civitai_enqueue_url "$url" "$incoming" "$fname" >/devnull && ((enq++))
+          else
+            helpers_log "📥 ($model_type) ${fname}"
+            _civitai_enqueue_url "$url" "$dest_dir" "$fname" >/dev/null && ((enq++))
+          fi
+        done < <(printf '%s' "$vj" | _civitai_pick_files_from_version_json)
+      fi
+    done < <(printf '%s' "$mjson" | _civitai_pick_version_ids_from_model_json "$model_type" "$filter" | awk '!seen[$0]++')
+    printf '%d' "$enq"; return 0
+  fi
+
+  helpers_log "⚠️  Could not resolve '${token}' as version or model for type ${model_type}."
+  printf '0'
+}
+
+# Public entry: process LORAS_IDS_TO_DOWNLOAD (→ loras) and CHECKPOINT_IDS_TO_DOWNLOAD (→ checkpoints)
+aria2_enqueue_and_wait_from_civitai() {
+  local comfy="${COMFY_HOME:-/workspace/ComfyUI}"
+  local loras_dir="${comfy}/models/loras"
+  local ckpt_dir="${comfy}/models/checkpoints"
+
+  local lora_tokens="${LORAS_IDS_TO_DOWNLOAD:-}"
+  local ckpt_tokens="${CHECKPOINT_IDS_TO_DOWNLOAD:-}"
+
+  # Nothing to do?
+  if [[ -z "${lora_tokens// }" && -z "${ckpt_tokens// }" ]]; then
+    echo "⏭️  No CivitAI tokens set (LORAS_IDS_TO_DOWNLOAD, CHECKPOINT_IDS_TO_DOWNLOAD are empty)."
+    return 0
+  fi
+
+  helpers_have_aria2_rpc || helpers_start_aria2_daemon
+
+  local total_enq=0 tok count
+
+  # LoRAs
+  if [[ -n "${lora_tokens// }" ]]; then
+    echo "📦 Target (LoRAs): $loras_dir"
+    while IFS= read -r tok; do
+      [[ -z "$tok" ]] && continue
+      count="$(_civitai_process_token_for_type "$tok" "$loras_dir" "LORA")"
+      (( total_enq += count ))
+    done < <(printf '%s\n' "$lora_tokens" | tr ', ' '\n\n' | sed '/^$/d' | awk '!seen[$0]++')
+  fi
+
+  # Checkpoints
+  if [[ -n "${ckpt_tokens// }" ]]; then
+    echo "📦 Target (Checkpoints): $ckpt_dir"
+    while IFS= read -r tok; do
+      [[ -z "$tok" ]] && continue
+      count="$(_civitai_process_token_for_type "$tok" "$ckpt_dir" "Checkpoint")"
+      (( total_enq += count ))
+    done < <(printf '%s\n' "$ckpt_tokens" | tr ', ' '\n\n' | sed '/^$/d' | awk '!seen[$0]++')
+  fi
+
+  if (( total_enq == 0 )); then
+    echo "Nothing to enqueue from CivitAI tokens."
+    return 0
+  fi
+
+  # Use your nice progress UI
+  helpers_progress_snapshot_loop "${ARIA2_PROGRESS_INTERVAL:-5}" "${ARIA2_PROGRESS_BAR_WIDTH:-40}" "${COMFY_LOGS:-/workspace/logs}/aria2_civitai_progress.log"
+
+  # Post-extract any archives pulled for either set
+  _civitai_post_extract_to_dir "$loras_dir"
+  _civitai_post_extract_to_dir "$ckpt_dir"
+
+  echo "✅ CivitAI batch done."
+}
+
 
 # Split a comma/space/newline-separated list, dedupe, echo one-per-line
 _helpers_split_ids() {
@@ -1339,8 +1519,6 @@ _helpers_gate() {
   done
 }
 
-_civitai_api_base() { printf "https://civitai.com/api/v1"; }
-
 # Generic GET wrapper with optional token; prints body, returns curl RC
 _civitai_api_get() {
   local path="$1"; shift
@@ -1360,12 +1538,6 @@ _civitai_try_model_version() {
     return 0
   fi
   return 1
-}
-
-# Returns JSON for a model (with its versions), or RC 1
-_civitai_get_model() {
-  local id="$1"
-  _civitai_api_get "/models/${id}"
 }
 
 # Select version IDs from a model JSON using filters:
@@ -1488,36 +1660,6 @@ helpers_rpc_add_uri_with_headers() {
     jq -r '.result // empty'
 }
 
-# Public entry: enqueue via LORAS_IDS_TO_DOWNLOAD, then wait (reuses aria2 progress)
-# Honors your aria2 settings + progress loop.
-aria2_enqueue_and_wait_from_civitai() {
-  local ids="${LORAS_IDS_TO_DOWNLOAD:-}"
-  local loras_dir="${COMFY_HOME:-/workspace/ComfyUI}/models/loras"
-  [[ -n "${ids// }" ]] || { echo "⏭️  LORAS_IDS_TO_DOWNLOAD is empty"; return 0; }
-
-  helpers_have_aria2_rpc || helpers_start_aria2_daemon
-
-  local total_enq=0 tok count
-  echo "📦 Target dir: $loras_dir"
-  while IFS= read -r tok; do
-    [[ -z "$tok" ]] && continue
-    count="$(_civitai_process_token "$tok" "$loras_dir")"
-    (( total_enq += count ))
-  done < <(printf '%s\n' "$ids" | tr ', ' '\n\n' | sed '/^$/d' | awk '!seen[$0]++')
-
-  if (( total_enq == 0 )); then
-    echo "Nothing to enqueue from CivitAI tokens."
-    return 0
-  fi
-
-  # Wait with your nice progress UI
-  helpers_progress_snapshot_loop "${ARIA2_PROGRESS_INTERVAL:-10}" "${ARIA2_PROGRESS_BAR_WIDTH:-40}" "${COMFY_LOGS:-/workspace/logs}/aria2_civitai_progress.log"
-
-  # Post: extract safetensors from any zips
-  civitai_post_extract_loras "$loras_dir"
-  echo "✅ CivitAI batch done."
-}
-
 # ===============================
 # CivitAI: single-var smart fetch
 # ===============================
@@ -1542,108 +1684,6 @@ _civitai_get() {
   curl -sS --fail --retry 3 --retry-delay 1 --max-time 30 "$(_civitai_hdr_auth)" "$url"
 }
 
-# Returns JSON for version or fails
-_civitai_get_version_json() { _civitai_get "/model-versions/$1"; }
-# Returns JSON for model (with versions) or fails
-_civitai_get_model_json()   { _civitai_get "/models/$1"; }
-
-# Pick file candidates from a VERSION JSON; print TSV: "<url>\t<suggested_name>"
-# Preference: .safetensors > .ckpt; fallback: .zip (we’ll extract later)
-_civitai_pick_files_from_version_json() {
-  jq -r '
-    .files
-    | ( map(select((.type // "") | ascii_downcase == "model")) ) as $files
-    | def base: (.name // .metadata.filename // .downloadUrl | split("/") | last);
-    # prefer safetensors, then ckpt, then zip
-    ( $files | map(select(.downloadUrl|test("\\.safetensors$"; "i"))) ) as $safes
-    | ( $files | map(select(.downloadUrl|test("\\.ckpt$";        "i"))) ) as $ckpts
-    | ( $files | map(select(.downloadUrl|test("\\.zip$";         "i"))) ) as $zips
-    | if ($safes|length)>0 then $safes
-      elif ($ckpts|length)>0 then $ckpts
-      elif ($zips|length)>0 then $zips
-      else [] end
-    | .[] | [.downloadUrl, base] | @tsv
-  '
-}
-
-# For MODEL JSON, pick VERSION IDs (type LORA) with optional name regex filter (case-insensitive)
-_civitai_pick_version_ids_from_model_json() {
-  local rx="${1:-}"  # optional regex against version .name
-  jq -r --arg rx "$rx" '
-    select((.type // "") == "LORA")
-    | .modelVersions[]
-    | ( if ($rx|length)>0 then (.name|test($rx; "i")) else true end )
-    | .id
-  '
-}
-
-# Enqueue a single URL into aria2; returns GID
-_civitai_enqueue_url() {
-  local url="$1" dest_dir="$2" out_name="$3"
-  helpers_rpc_add_uri "$url" "$dest_dir" "$out_name" ""
-}
-
-# Main: parse one token (could be VERSIONID, or MODELID[:filter]) and enqueue items
-# Returns count of enqueued items
-_civitai_process_token() {
-  local token="$1"; shift
-  local loras_dir="${1:-${COMFY_HOME:-/workspace/ComfyUI}/models/loras}"
-  local incoming="${loras_dir}/_incoming"
-  mkdir -p "$loras_dir" "$incoming"
-
-  # Split token on first colon: "<id>[:filter]"
-  local id="${token%%:*}"
-  local filter=""
-  [[ "$token" == *:* ]] && filter="${token#*:}"
-
-  # Try VERSION first
-  local vjson
-  if vjson="$(_civitai_get_version_json "$id" 2>/dev/null)"; then
-    # Use files from this version
-    local n=0
-    while IFS=$'\t' read -r url fname; do
-      [[ -z "$url" ]] && continue
-      # If archive, land in _incoming; else directly in loras_dir
-      if [[ "$fname" =~ \.zip$ ]]; then
-        helpers_log "📥 (zip) ${fname}"
-        _civitai_enqueue_url "$url" "$incoming" "$fname" >/dev/null && ((n++))
-      else
-        helpers_log "📥 ${fname}"
-        _civitai_enqueue_url "$url" "$loras_dir" "$fname" >/dev/null && ((n++))
-      fi
-    done < <(printf '%s' "$vjson" | _civitai_pick_files_from_version_json)
-    printf '%d' "$n"; return 0
-  fi
-
-  # Not a VERSION → try MODEL
-  local mjson
-  if mjson="$(_civitai_get_model_json "$id" 2>/dev/null)"; then
-    local enq=0
-    # Filter version IDs (type LORA, and optional name regex from "filter")
-    while IFS= read -r ver_id; do
-      [[ -z "$ver_id" ]] && continue
-      local vj
-      if vj="$(_civitai_get_version_json "$ver_id" 2>/dev/null)"; then
-        while IFS=$'\t' read -r url fname; do
-          [[ -z "$url" ]] && continue
-          if [[ "$fname" =~ \.zip$ ]]; then
-            helpers_log "📥 (zip) ${fname}"
-            _civitai_enqueue_url "$url" "$incoming" "$fname" >/dev/null && ((enq++))
-          else
-            helpers_log "📥 ${fname}"
-            _civitai_enqueue_url "$url" "$loras_dir" "$fname" >/dev/null && ((enq++))
-          fi
-        done < <(printf '%s' "$vj" | _civitai_pick_files_from_version_json)
-      fi
-    done < <(printf '%s' "$mjson" | _civitai_pick_version_ids_from_model_json "$filter" | awk '!seen[$0]++')
-    printf '%d' "$enq"; return 0
-  fi
-
-  # Neither model-version nor model
-  helpers_log "⚠️  Could not resolve '${token}' as version or model."
-  printf '0'
-}
-
 # Post-process: extract any .zip sitting in _incoming to loras/, only *.safetensors
 civitai_post_extract_loras() {
   local loras_dir="${1:-${COMFY_HOME:-/workspace/ComfyUI}/models/loras}"
@@ -1660,79 +1700,6 @@ civitai_post_extract_loras() {
 }
 
 #--------------------------------------------------------------------------------------------------------------------------------------
-
-download_civitai_ids() {
-  command -v download_with_aria.py >/dev/null || {
-    echo "❌ /usr/local/bin/download_with_aria.py not found/executable" >&2
-    return 1
-  }
-
-  declare -A map=()
-
-  if (( $# > 0 )); then
-    # Accept arguments like: "/target/dir1:IDa,IDb" "/target/dir2:IDc IDd"
-    local pair dir ids
-    for pair in "$@"; do
-      dir="${pair%%:*}"; ids="${pair#*:}"
-      map["$dir"]="$ids"
-    done
-  else
-    # Default mapping from env
-    map["$COMFY_HOME/models/checkpoints"]="$CHECKPOINT_IDS_TO_DOWNLOAD"
-    map["$COMFY_HOME/models/loras"]="$LORAS_IDS_TO_DOWNLOAD"
-  fi
-
-  local total=0 running=0 started=0 pids=()
-
-  for TARGET_DIR in "${!map[@]}"; do
-    mkdir -p "$TARGET_DIR"
-    ids_raw="${map[$TARGET_DIR]}"
-
-    # Skip empty or placeholder
-    if [[ -z "${ids_raw// }" ]]; then
-      echo "⏭️  No IDs set for $TARGET_DIR"
-      continue
-    fi
-
-    echo "📦 Target: $TARGET_DIR"
-    while IFS= read -r MODEL_ID; do
-      [[ -z "$MODEL_ID" ]] && continue
-
-      # Gate concurrency
-      _helpers_gate running "$ARIA2_MAX_CONC"
-
-      # Per-ID log
-      safe_id="${MODEL_ID//[^A-Za-z0-9._-]/_}"
-      logfile="${CIVITAI_LOG_DIR}/$(basename "$TARGET_DIR")_${safe_id}.log"
-
-      (
-        cd "$TARGET_DIR"
-        echo "🚀 [$MODEL_ID] → $TARGET_DIR"
-        # If your downloader supports API tokens, export here (example):
-        # export CIVITAI_TOKEN=...
-        download_with_aria.py -m "$MODEL_ID" >"$logfile" 2>&1
-        rc=$?
-        if (( rc == 0 )); then
-          echo "✅ [$MODEL_ID] done"
-        else
-          echo "❌ [$MODEL_ID] failed (rc=$rc) — see $logfile"
-        fi
-      ) &
-
-      pids+=($!)
-      ((running++))
-      ((started++))
-      ((total++))
-      # small jitter to avoid thundering herd
-      sleep 0.2
-    done < <(_helpers_split_ids "$ids_raw")
-  done
-
-  echo "📋 Scheduled ${started} download(s). Waiting…"
-  # Drain remaining jobs
-  for pid in "${pids[@]}"; do wait "$pid" || true; done
-  echo "✅ CivitAI batch complete. Logs: ${CIVITAI_LOG_DIR}"
-}
 
 # Size parser stays simple & jq-friendly
 _helpers_parse_size_bytes() {
