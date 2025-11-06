@@ -840,7 +840,7 @@ helpers_progress_snapshot_loop() {
 # ---- Manifest Enqueue ----
 # Replace helpers_download_from_manifest with this:
 helpers_download_from_manifest() {
-  command -v curl >/dev/null && command -v jq >/div/null || { echo "Need curl + jq"; return 1; }
+  command -v curl >/dev/null && command -v jq >/dev/null || { echo "Need curl + jq"; return 1; }
   [[ -z "${MODEL_MANIFEST_URL:-}" ]] && { echo "MODEL_MANIFEST_URL is not set." >&2; return 1; }
 
   local MAN; MAN="$(mktemp)"
