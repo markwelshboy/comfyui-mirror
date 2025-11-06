@@ -656,32 +656,6 @@ helpers_probe_url() {
   return 1
 }
 
-# Ensure the destination file is either skipped (exists/valid) or ready to enqueue (dir made).
-# Usage: helpers_ensure_target_ready "<abs_path>" ["<source_url_for_optional_probe>"]
-# Returns 0 = enqueue, 1 = skip (already exists & sane)
-helpers_ensure_target_ready() {
-  local target="$1"; local src_url="${2:-}"
-  [[ -z "$target" ]] && return 1
-
-  local dir; dir="$(dirname -- "$target")"
-  mkdir -p -- "$dir"
-
-  # If already present and non-zero size, skip with human size
-  if [[ -s "$target" ]]; then
-    local sz; sz="$(helpers_human_bytes "$(stat -c%s -- "$target" 2>/dev/null || wc -c <"$target")")"
-    echo "✅ $(basename -- "$target") exists (${sz}), skipping."
-    return 1
-  fi
-
-  # Optional, quiet URL probe (OFF by default)
-  if ! helpers_probe_url "$src_url"; then
-    # Don’t block the queue; just proceed silently (aria2 will handle retries/auth)
-    : # no-op
-  end
-
-  return 0
-}
-
 # ---------- MAIN: download selected sections from manifest ----------
 helpers_download_from_manifest() {
   _helpers_need curl; _helpers_need jq; _helpers_need awk
