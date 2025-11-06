@@ -627,30 +627,59 @@ helpers_resolve_placeholders() {
   '
 }
 
-# Quick size/partial cleanup; returns 0 if should download, 1 if skip
-helpers_ensure_target_ready() {
-  # Args: <full_path>
-  local path="$1"
-  # If an .aria2 control file exists, remove both partial + control
-  if [[ -f "${path}.aria2" ]]; then
-    echo "🗑️  Removing stale control: ${path}.aria2"
-    rm -f -- "${path}.aria2" "${path}"
+# Optional: quiet, opt-in URL probe that won't spam logs
+helpers_probe_url() {
+  # Usage: helpers_probe_url "<url>"
+  # Returns 0 if HEAD/GET looks good, else non-zero.
+  local url="$1"
+  [[ -z "$url" ]] && return 0
+  # Default OFF; set ARIA2_PROBE=1 to enable probing
+  [[ "${ARIA2_PROBE:-0}" != "1" ]] && return 0
+
+  local to="${ARIA2_PROBE_TIMEOUT:-10}"
+  local rt="${ARIA2_PROBE_RETRIES:-0}"
+
+  # HEAD is often enough; some endpoints don’t like HEAD, so fall back to GET if HEAD fails.
+  # stderr is suppressed unless DEBUG/CIVITAI_DEBUG/ARIA2_DEBUG is set.
+  if curl -sSIL -m "$to" --retry "$rt" --retry-all-errors -o /dev/null "$url" 2>"/tmp/.probe.$$"; then
+    return 0
+  fi
+  if curl -sSL  -m "$to" --retry "$rt" --retry-all-errors -o /dev/null "$url" 2>>"/tmp/.probe.$$"; then
+    return 0
   fi
 
-  if [[ -f "$path" ]]; then
-    # Cross-distro stat (BSD/GNU)
-    local size_bytes
-    size_bytes="$(stat -f%z "$path" 2>/dev/null || stat -c%s "$path" 2>/dev/null || echo 0)"
-    # Consider anything <10MB suspicious (your previous rule); adjust if you like
-    if (( size_bytes < 10485760 )); then
-      echo "🗑️  Deleting too-small file ($(helpers_human_bytes "$size_bytes") < 10 MB): $path"
-      rm -f -- "$path"
-      return 0
-    fi
-    echo "✅ $(basename -- "$path") exists ($(helpers_human_bytes "$size_bytes")), skipping."
-    return 1   # tell caller: don't enqueue
+  if [[ -n "${DEBUG}${CIVITAI_DEBUG}${ARIA2_DEBUG}" ]]; then
+    echo "⚠️  Probe failed for: $url"
+    sed -n '1,8p' "/tmp/.probe.$$" || true
   fi
-  return 0     # ok to enqueue
+  rm -f "/tmp/.probe.$$"
+  return 1
+}
+
+# Ensure the destination file is either skipped (exists/valid) or ready to enqueue (dir made).
+# Usage: helpers_ensure_target_ready "<abs_path>" ["<source_url_for_optional_probe>"]
+# Returns 0 = enqueue, 1 = skip (already exists & sane)
+helpers_ensure_target_ready() {
+  local target="$1"; local src_url="${2:-}"
+  [[ -z "$target" ]] && return 1
+
+  local dir; dir="$(dirname -- "$target")"
+  mkdir -p -- "$dir"
+
+  # If already present and non-zero size, skip with human size
+  if [[ -s "$target" ]]; then
+    local sz; sz="$(helpers_human_bytes "$(stat -c%s -- "$target" 2>/dev/null || wc -c <"$target")")"
+    echo "✅ $(basename -- "$target") exists (${sz}), skipping."
+    return 1
+  fi
+
+  # Optional, quiet URL probe (OFF by default)
+  if ! helpers_probe_url "$src_url"; then
+    # Don’t block the queue; just proceed silently (aria2 will handle retries/auth)
+    : # no-op
+  end
+
+  return 0
 }
 
 # ---------- MAIN: download selected sections from manifest ----------
@@ -708,7 +737,6 @@ helpers_download_from_manifest() {
     echo ">>> Enqueue section: $sec"
 
     jq -r --arg sec "$sec" --arg default_dir "${DEFAULT_DOWNLOAD_DIR:-$COMFY}" '
-      # Normalize each entry to an object {url, path}
       def as_obj:
         if (type=="object") then
           {url:(.url // ""), path:(.path // ((.dir // "") + (if .out then "/" + .out else "" end)))}
@@ -719,9 +747,7 @@ helpers_download_from_manifest() {
         else
           {url:"", path:""}
         end;
-
-      (.sections[$sec] // [])[]
-      | as_obj
+      (.sections[$sec] // [])[] | as_obj
       | .url as $u
       | ( if (.path|length) > 0 then .path
           else ( if ($default_dir|length) > 0
@@ -739,14 +765,13 @@ helpers_download_from_manifest() {
           out="$(basename -- "$path")"
           mkdir -p -- "$dir"
 
-          if helpers_ensure_target_ready "$path"; then
+          if helpers_ensure_target_ready "$path" "$url"; then
             echo "📥 Queue: $(basename -- "$path")"
             gid="$(helpers_rpc_add_uri "$url" "$dir" "$out" "")"
             helpers_record_gid "$gid"
           fi
-      done
+    done
   done
-
   echo "✅ Enqueued selected sections."
 }
 
