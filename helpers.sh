@@ -953,15 +953,40 @@ helpers_progress_snapshot_loop() {
         echo
         echo "Completed (this session)"
         echo "--------------------------------------------------------------------------------"
+
+        # Compute max filename width safely (avoid null/empty)
+        local comp_max_name=0
         local j=0
         while (( j < comp_count )); do
+          # guard: ensure name exists
+          local _nm="${comp_name[j]}"
+          local _len=${#_nm}
+          (( _len > comp_max_name )) && comp_max_name=$_len
+          (( j++ ))
+        done
+        # minimum width to keep the column from collapsing
+        (( comp_max_name < 8 )) && comp_max_name=8
+
+        # Print rows
+        j=0
+        while (( j < comp_count )); do
+          # path relative to comfy root → "models/…"
           local rel="${comp_path[j]}"
-          [[ -n "$comfy_root" && "$rel" == "$comfy_root"* ]] && rel="${rel#$comfy_root/}"
+          if [[ -n "$comfy_root" && "$rel" == "$comfy_root"* ]]; then
+            rel="${rel#$comfy_root/}"
+          fi
+
+          # human size (bytes → e.g., "26 GB")
+          local hsize
+          hsize="$(helpers_human_bytes "${comp_len[j]}")"
+
+          # aligned print
           printf "✔ %-*s  %s  (%s)\n" \
             "$comp_max_name" "${comp_name[j]}" \
             "$rel" \
-            "$(helpers_human_bytes "${comp_len[j]}")"
-          ((j++))
+            "$hsize"
+
+          (( j++ ))
         done
       fi
 
@@ -1361,6 +1386,202 @@ helpers_rpc_count_pending() {
 #   helpers_rpc_add_uri, helpers_have_aria2_rpc, helpers_start_aria2_daemon,
 #   helpers_progress_snapshot_loop, aria2_clear_results, aria2_stop_all
 
+# Keep ASCII-ish, tool-friendly names that Comfy pickers like.
+# Rules:
+# - strip straight/curly quotes
+# - collapse whitespace -> _
+# - ()[]{} -> __
+# - remove anything not [A-Za-z0-9._-] -> _
+# - collapse multiple _ -> single _
+# - trim leading/trailing _
+# - preserve/normalize extension case
+helpers_sanitize_basename() {
+  local in="$1"
+  [[ -z "$in" ]] && { printf "model.safetensors"; return; }
+
+  local base ext name
+  base="$(basename -- "$in")"
+  ext="${base##*.}"
+  name="${base%.*}"
+  # normalize extension to lower
+  ext="${ext,,}"
+
+  # sed-based cleanup
+  name="$(printf '%s' "$name" \
+    | sed -E "s/['‘’]//g; s/[[:space:]]+/_/g; s/[(){}\[\]]+/__/g; s/[^A-Za-z0-9._-]+/_/g; s/_+/_/g; s/^_+|_+$//g")"
+
+  [[ -z "$name" ]] && name="model"
+  printf "%s.%s" "$name" "$ext"
+}
+
+# Ensure uniqueness in a directory (append _1, _2, … if needed)
+helpers_unique_dest() {
+  local dir="$1" base="$2"
+  local path="$dir/$base"
+  local stem="${base%.*}" ext=".${base##*.}"
+  local i=1
+  while [[ -e "$path" ]]; do
+    path="$dir/${stem}_$i$ext"
+    ((i++))
+  done
+  printf "%s" "$path"
+}
+
+helpers_civitai_extract_and_move_zip() {
+  local zip_path="$1" target_dir="$2"
+  [[ -f "$zip_path" ]] || { echo "⚠️  ZIP not found: $zip_path"; return 1; }
+  mkdir -p "$target_dir"
+
+  local tmpdir; tmpdir="$(mktemp -d -p "${target_dir%/*}" civit_zip_XXXXXX)"
+  local moved=0
+
+  # Try unzip quietly; fall back to BusyBox if needed
+  if command -v unzip >/dev/null 2>&1; then
+    unzip -q -o "$zip_path" -d "$tmpdir" || true
+  else
+    busybox unzip -oq "$zip_path" -d "$tmpdir" || true
+  fi
+
+  shopt -s nullglob
+  local f
+  for f in "$tmpdir"/**/*.safetensors "$tmpdir"/*.safetensors; do
+    [[ -e "$f" ]] || continue
+    local bn clean dest
+    bn="$(basename -- "$f")"
+    clean="$(helpers_sanitize_basename "$bn")"
+    dest="$(helpers_unique_dest "$target_dir" "$clean")"
+    mkdir -p "$(dirname "$dest")"
+    mv -f -- "$f" "$dest"
+    echo "📦 Extracted: $(basename -- "$dest")"
+    ((moved++))
+  done
+  shopt -u nullglob
+
+  # Cleanup temp + leave original ZIP (or delete—your call)
+  rm -rf -- "$tmpdir"
+
+  if (( moved == 0 )); then
+    echo "⚠️  No .safetensors found in ZIP: $(basename -- "$zip_path")"
+    # Option A: keep ZIP in place (already in loras dir)
+    # Option B (recommended): park it in an _incoming folder so it’s out of the picker’s way
+    local park_dir="${target_dir%/}/_incoming"
+    mkdir -p "$park_dir"
+    mv -f -- "$zip_path" "$park_dir/" || true
+    echo "➡️  Moved ZIP to: $park_dir/$(basename -- "$zip_path")"
+  else
+    # If at least one .safetensors extracted, remove the ZIP
+    rm -f -- "$zip_path"
+  fi
+}
+
+# Case-insensitive match for *.safetensors
+_helpers_zip_has_safetensors() {
+  local zip="$1"
+  if command -v unzip >/dev/null 2>&1; then
+    unzip -Z1 -- "$zip" 2>/dev/null | awk 'tolower($0) ~ /\.safetensors$/ {found=1} END{exit !(found)}'
+  elif command -v bsdtar >/dev/null 2>&1; then
+    bsdtar -tf -- "$zip" 2>/dev/null | awk 'tolower($0) ~ /\.safetensors$/ {found=1} END{exit !(found)}'
+  else
+    echo "⚠️  Need unzip or bsdtar to inspect $zip" >&2
+    return 2
+  fi
+}
+
+# Extract only *.safetensors (case-insensitive) from ZIP into $dest_dir
+_helpers_extract_safetensors_from_zip() {
+  local zip="$1" dest_dir="$2"
+  mkdir -p -- "$dest_dir"
+  if command -v unzip >/dev/null 2>&1; then
+    # unzip is case-sensitive; extract with a broad list then prune
+    # Strategy: extract all, then move only *.safetensors (ci via awk), then clean temp
+    local tmpdir; tmpdir="$(mktemp -d)"
+    unzip -oq -- "$zip" -d "$tmpdir" || return 1
+    find "$tmpdir" -type f | awk 'BEGIN{IGNORECASE=1} /\.safetensors$/ {print}' | while read -r f; do
+      mv -f -- "$f" "$dest_dir/"
+    done
+    rm -rf -- "$tmpdir"
+    return 0
+  elif command -v bsdtar >/dev/null 2>&1; then
+    local tmpdir; tmpdir="$(mktemp -d)"
+    bsdtar -xf -- "$zip" -C "$tmpdir" || return 1
+    find "$tmpdir" -type f | awk 'BEGIN{IGNORECASE=1} /\.safetensors$/ {print}' | while read -r f; do
+      mv -f -- "$f" "$dest_dir/"
+    done
+    rm -rf -- "$tmpdir"
+    return 0
+  else
+    echo "⚠️  Need unzip or bsdtar to extract $zip" >&2
+    return 2
+  fi
+}
+
+# Moves ZIPs into _incoming/, extracts safetensors to the parent dir,
+# quarantines ZIPs with no safetensors or suspiciously tiny ones.
+helpers_civitai_postprocess_dir() {
+  local dest_dir="$1"  # e.g., /workspace/ComfyUI/models/loras
+  local incoming="$dest_dir/_incoming"
+  local junk="$incoming/_junk"
+  mkdir -p -- "$incoming" "$junk"
+
+  # scan recent .zip (last 2 hours) OR just all .zip if you prefer:
+  find "$dest_dir" -maxdepth 1 -type f -name '*.zip' -printf '%T@ %p\n' \
+    | sort -nr \
+    | awk '{ $1=""; sub(/^ /,""); print }' \
+    | while read -r zip; do
+        # skip if already in _incoming/_junk (safety)
+        case "$zip" in
+          "$incoming"/*|"$junk"/*) continue ;;
+        esac
+
+        # move into _incoming
+        local moved="$incoming/$(basename "$zip")"
+        mv -f -- "$zip" "$moved" || continue
+
+        # quick size sanity (<= 64 KB → likely metadata-only)
+        local bytes; bytes="$(stat -c %s "$moved" 2>/dev/null || stat -f %z "$moved")"
+        if [[ -n "$bytes" && "$bytes" -le 65536 ]]; then
+          echo "⚠️  $(basename "$moved") is tiny ($bytes B) — no extraction; quarantining."
+          mv -f -- "$moved" "$junk/"
+          continue
+        fi
+
+        if _helpers_zip_has_safetensors "$moved"; then
+          if _helpers_extract_safetensors_from_zip "$moved" "$dest_dir"; then
+            echo "✅ Extracted safetensors from $(basename "$moved"); removing ZIP."
+            rm -f -- "$moved"
+          else
+            echo "⚠️  Extraction failed for $(basename "$moved"); quarantining."
+            mv -f -- "$moved" "$junk/"
+          fi
+        else
+          echo "⚠️  No .safetensors found in $(basename "$moved"); quarantining."
+          mv -f -- "$moved" "$junk/"
+        fi
+      done
+}
+
+# Print aligned "Completed (this session)" block from a list of "name<TAB>relpath<TAB>size"
+helpers_print_completed_block() {
+  local lines=("$@")
+  [[ ${#lines[@]} -eq 0 ]] && return 0
+
+  local maxlen=0
+  local name relpath size
+  # find longest name
+  for row in "${lines[@]}"; do
+    IFS=$'\t' read -r name relpath size <<<"$row"
+    (( ${#name} > maxlen )) && maxlen=${#name}
+  done
+
+  echo
+  echo "Completed (this session)"
+  echo "--------------------------------------------------------------------------------"
+  for row in "${lines[@]}"; do
+    IFS=$'\t' read -r name relpath size <<<"$row"
+    printf "✔ %-*s  %s  (%s)\n" "$maxlen" "$name" "$relpath" "$size"
+  done
+}
+
 # --- ID parsing: "1,2  3,,4" -> "1 2 3 4" (numbers only), drop placeholders
 helpers_civitai_tokenize_ids() {
   printf '%s' "$1" \
@@ -1501,7 +1722,7 @@ aria2_enqueue_and_wait_from_civitai() {
   fi
 
   # Use your existing nice progress UI
-  helpers_progress_snapshot_loop "${ARIA2_PROGRESS_INTERVAL:-5}" "${ARIA2_PROGRESS_BAR_WIDTH:-40}" \
+  helpers_progress_snapshot_loop "${ARIA2_PROGRESS_INTERVAL:-30}" "${ARIA2_PROGRESS_BAR_WIDTH:-40}" \
     "${COMFY_LOGS:-/workspace/logs}/aria2_progress.log"
 
   aria2_clear_results >/dev/null 2>&1 || true
