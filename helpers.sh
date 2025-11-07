@@ -599,42 +599,53 @@ helpers_human_bytes() { # bytes -> human
   printf "%d %s" "$b" "${u[$d]}"
 }
 
-# Replace {VAR} in either a plain string OR a JSON blob using environment variables.
+# Replace {VAR} in a plain string OR a JSON blob using environment variables.
 # Usage:
-#   helpers_resolve_placeholders "plain/path/{DIFFUSION_MODELS_DIR}/file"
-#   helpers_resolve_placeholders '{"url":"https://...","dst":"{VAE_DIR}/foo"}'
+#   helpers_resolve_placeholders "plain/{DIFFUSION_MODELS_DIR}/path"
+#   helpers_resolve_placeholders '{"dst":"{VAE_DIR}/foo","note":"{SHELL}"}'
 helpers_resolve_placeholders() {
   _helpers_need jq
-  local raw
+  local raw out
   raw=$1
 
-  jq -nr -r --arg RAW "$raw" '
-    # Replace all {KEY} tokens using values from the process environment
-    def subst_env($text):
-      reduce (env | to_entries[]) as $e ($text;
-        gsub("\\{" + ($e.key|tostring) + "\\}"; ($e.value|tostring))
-      );
+  # 1) Try jq using env (handles JSON structures and strings)
+  out="$(
+    jq -nr -r --arg RAW "$raw" '
+      def subst_env($text):
+        reduce (env | to_entries[]) as $e ($text;
+          gsub("\\{" + ($e.key|tostring) + "\\}"; ($e.value|tostring))
+        );
 
-    def walk_strings(f):
-      if type == "object" then
-        with_entries(.value |= ( . | walk_strings(f) ))
-      elif type == "array" then
-        map( walk_strings(f) )
-      elif type == "string" then
-        f
+      def walk_strings(f):
+        if type == "object" then
+          with_entries(.value |= ( . | walk_strings(f) ))
+        elif type == "array" then
+          map( walk_strings(f) )
+        elif type == "string" then
+          f
+        else
+          .
+        end;
+
+      ( $RAW | fromjson? ) as $J
+      |
+      if $J != null then
+        ($J | walk_strings( subst_env(.) )) | tojson
       else
-        .
-      end;
+        subst_env($RAW)
+      end
+    '
+  )"
 
-    # Try to parse RAW as JSON; if that fails, treat it as a plain string
-    ( $RAW | fromjson? ) as $J
-    |
-    if $J != null then
-      ($J | walk_strings( subst_env(.) )) | tojson
-    else
-      subst_env($RAW)
-    end
-  '
+  # 2) If jq printed nothing (unexpected), do a robust fallback with Perl.
+  #    This replaces {VARNAME} -> $ENV{VARNAME}, leaving unknown tokens intact.
+  if [ -z "$out" ]; then
+    out="$(printf '%s' "$raw" | perl -pe 's/\{([A-Z0-9_]+)\}/$ENV{$1} // $&/gie')"
+    # If still empty (very unlikely), echo the raw input as a last resort.
+    [ -z "$out" ] && out="$raw"
+  fi
+
+  printf '%s\n' "$out"
 }
 
 helpers_have_aria2_rpc() {
