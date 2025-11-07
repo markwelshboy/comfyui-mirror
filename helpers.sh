@@ -1024,120 +1024,75 @@ helpers_download_from_manifest() {
 aria2_enqueue_and_wait_from_manifest() {
   helpers_start_aria2_daemon || return 1
 
-  # Ctrl-C: stop queue (leave daemon alive)
-  local trapped=0
+  # Ctrl-C: stop queue (optionally leave daemon alive)
   _trap_manifest() {
-    ((trapped)) && return 0
-    trapped=1
-    echo; echo "⚠️  Interrupted — stopping queue…"
-    aria2_stop_all
-    return 130
+    echo "[trap] Caught signal — pausing all aria2 jobs..." >&2
+    helpers_rpc 'aria2.pauseAll' '[]' >/dev/null 2>&1 || true
+    if [[ "${ARIA2_SHUTDOWN_ON_INT:-0}" == "1" ]]; then
+      echo "[trap] Forcing aria2 shutdown..." >&2
+      helpers_rpc 'aria2.forceShutdown' '[]' >/dev/null 2>&1 || true
+    else
+      echo "[trap] Leaving aria2 daemon running (ARIA2_SHUTDOWN_ON_INT=0)." >&2
+    fi
+    # return to caller if sourced, otherwise exit
+    return 130 2>/dev/null || exit 130
   }
   trap _trap_manifest INT TERM
+
+  echo "================================================================================"
+  echo "==="
+  echo "=== Huggingface Model Downloader: Processing queuing @ $(date '+%Y-%m-%d %H:%M:%S') ==="
+  echo "==="
 
   local any; any="$(helpers_download_from_manifest || echo 0)"
   if [[ "$any" == "0" ]]; then
     trap - INT TERM
-    echo "Nothing enqueued. Exiting without starting progress loop."
+    echo "=== Nothing enqueued. Exiting without starting progress loop."
     return 0
   fi
 
-  # live progress loop
-  #while :; do
-  #  # tellActive + stats
-  #  local act tot_done tot_size tot_speed
-  #  act="$(helpers_rpc 'aria2.tellActive' '[]' | jq -cr '(.result // [])')"
-  #  tot_done="$(jq -rn --argjson A "$act" '$A|map((.completedLength|tonumber)? // 0)|add // 0')"
-  #  tot_size="$(jq -rn --argjson A "$act" '$A|map((.totalLength|tonumber)? // 0)|add // 0')"
-  #  tot_speed="$(jq -rn --argjson A "$act" '$A|map((.downloadSpeed|tonumber)? // 0)|add // 0')"
-  #
-  #  echo "================================================================================"
-  #  echo "==="
-  #  echo "=== Huggingface Model Downloader: aria2 progress @ $(date '+%F %T') ==="
-  #  echo "==="
-  #
-  #  # Active lines
-  #  local cnt; cnt="$(jq -rn --argjson A "$act" '$A|length')"
-  #  echo "=== Active downloads: $cnt"
-  #  echo "--------------------------------------------------------------------------------"
-  #  A="$act" jq -r '
-  #    # human bytes
-  #    def hb($n):
-  #      if ($n // 0) >= 1099511627776 then ((($n // 0) / 1099511627776)|floor|tostring) + " TB"
-  #      elif ($n // 0) >= 1073741824 then  ((($n // 0) / 1073741824 )|floor|tostring) + " GB"
-  #      elif ($n // 0) >= 1048576    then  ((($n // 0) / 1048576   )|floor|tostring) + " MB"
-  #      elif ($n // 0) >= 1024       then  ((($n // 0) / 1024      )|floor|tostring) + " KB"
-  #      else (($n // 0)|tostring) + " B" end;
-  #
-  #    # ascii progress bar of width W
-  #    def bar($pct; $W):
-  #      (($W * ($pct/100.0))|floor) as $f
-  #      | "[" + ( (range(0;$f) | "#") + (range($f;$W) | "-") ) + "]";
-  #
-  #    (env.A // "[]") | fromjson
-  #    | .[]? as $t
-  #    | ($t.completedLength|tonumber) as $done
-  #    | ($t.totalLength|tonumber)     as $tot
-  #    | ($t.downloadSpeed|tonumber)   as $spd
-  #    | ($t.files|type) as $ft
-  #    | (if $ft=="array" and ($t.files|length)>0 and ($t.files[0].path? // "")!="" then
-  #        ($t.files[0].path | capture("(?<dir>.*)/(?<name>[^/]+)$"))
-  #      else
-  #        {"dir":"", "name":($t.bittorrent.info.name? // $t.infoHash // "unknown")}
-  #      end) as $p
-  #    | ($tot | if .>0 then (100.0 * $done / .) else 0 end) as $pct
-  #    | ($pct | if .>100 then 100 elif .<0 then 0 else . end) as $pc
-  #    | (env.ARIA2_PROGRESS_BAR_WIDTH|tonumber? // 40) as $W
-  #    | (bar($pc; $W)) as $B
-  #    | "\($p.name)\n  \($B) \((($pc*10)|round/10.0))%  \((hb($done))) / \((if $tot>0 then hb($tot) else "?" end))  \((hb($spd)))/s\n"
-  #  '
-  #  echo "--------------------------------------------------------------------------------"
-  #  printf "Group total: speed %s/s, done %s / %s\n" \
-  #    "$(helpers_human_bytes "$tot_speed")" \
-  #    "$(helpers_human_bytes "$tot_done")" \
-  #    "$(helpers_human_bytes "$tot_size")"
-  #
-  #  # exit if nothing active + no waiting
-  #  local wait_cnt
-  #  wait_cnt="$(helpers_rpc 'aria2.tellWaiting' '[0,10000]' | jq -r '(.result // []) | length')" || wait_cnt=0
-  #  (( cnt==0 && wait_cnt==0 )) && { echo "✅ All downloads complete — exiting progress loop."; break; }
-  #
-  #  sleep "${ARIA2_PROGRESS_INTERVAL:-10}"
-  #done
-
-  # ===== progress loop =====
+   # interval
+  local _refresh="${ARIA2_PROGRESS_REFRESH:-15}"
   ARIA2_PROGRESS_BAR_WIDTH="${ARIA2_PROGRESS_BAR_WIDTH:-40}"
-  local tick=0
+  echo "=== Starting progress loop (refresh every ${_refresh}s)..."
+  
+  # ---- PROGRESS LOOP (robust) ----
+  # Don’t let -e / pipefail kill the loop
+  set +e
+  trap '' PIPE  # ignore SIGPIPE just in case
+ 
   while :; do
-    # pull active, waiting, stopped
-    act="$(helpers_rpc 'aria2.tellActive' '[]' | jq -c '.result // []')"
-    wai="$(helpers_rpc 'aria2.tellWaiting' '[0, 1000]' | jq -c '.result // []')"
-    sto="$(helpers_rpc 'aria2.tellStopped' '[-1000, 1000]' | jq -c '.result // []')"
+    # Fetch JSONs; always fall back to empty arrays so jq never errors
+    local _act_json _wai_json _sto_json
+    _act_json="$(helpers_rpc 'aria2.tellActive' '[]'           2>/dev/null || true)"
+    _wai_json="$(helpers_rpc 'aria2.tellWaiting' '[0,1000]'    2>/dev/null || true)"
+    _sto_json="$(helpers_rpc 'aria2.tellStopped' '[-1000,1000]' 2>/dev/null || true)"
 
-    active_count="$(jq -r 'length' <<<"$act")"
-    waiting_count="$(jq -r 'length' <<<"$wai")"
+    # Extract arrays safely
+    local act wai sto
+    act="$(jq -c '(.result // [])' <<<"$_act_json" 2>/dev/null || echo '[]')"
+    wai="$(jq -c '(.result // [])' <<<"$_wai_json" 2>/dev/null || echo '[]')"
+    sto="$(jq -c '(.result // [])' <<<"$_sto_json" 2>/dev/null || echo '[]')"
 
-    # header
+    local active_count waiting_count
+    active_count="$(jq -r 'length' <<<"$act" 2>/dev/null || echo 0)"
+    waiting_count="$(jq -r 'length' <<<"$wai" 2>/dev/null || echo 0)"
+
     echo "================================================================================"
-    echo "==="
-    echo "=== Huggingface Model Downloader: aria2 progress @ $(date '+%Y-%m-%d %H:%M:%S') ==="
-    echo "==="
-    echo "=== Active downloads: $active_count (waiting: $waiting_count)"
+    echo "=== Aria2 Downloader: Active downloads: $active_count (pending: $waiting_count)"
     echo "--------------------------------------------------------------------------------"
 
-    # rows (your existing pretty jq renderer)
+    # Pretty rows (env inject BEFORE jq)
     A="$act" jq -r '
       def hb($n):
         if ($n // 0) >= 1099511627776 then ((($n // 0) / 1099511627776)|floor|tostring) + " TB"
-        elif ($n // 0) >= 1073741824 then ((($n // 0) / 1073741824)|floor|tostring) + " GB"
-        elif ($n // 0) >= 1048576 then ((($n // 0) / 1048576)|floor|tostring) + " MB"
-        elif ($n // 0) >= 1024 then ((($n // 0) / 1024)|floor|tostring) + " KB"
+        elif ($n // 0) >= 1073741824 then  ((($n // 0) / 1073741824 )|floor|tostring) + " GB"
+        elif ($n // 0) >= 1048576    then  ((($n // 0) / 1048576   )|floor|tostring) + " MB"
+        elif ($n // 0) >= 1024       then  ((($n // 0) / 1024      )|floor|tostring) + " KB"
         else (($n // 0)|tostring) + " B" end;
-
       def bar($pct; $W):
         (($W * ($pct/100.0))|floor) as $f
         | "[" + ( (range(0;$f) | "#") + (range($f;$W) | "-") ) + "]";
-
       (env.A // "[]") | fromjson
       | .[]? as $t
       | ($t.completedLength|tonumber) as $done
@@ -1154,23 +1109,23 @@ aria2_enqueue_and_wait_from_manifest() {
       | (env.ARIA2_PROGRESS_BAR_WIDTH|tonumber? // 40) as $W
       | (bar($pc; $W)) as $B
       | "\($p.name)\n  \($B) \((($pc*10)|round/10.0))%  \((hb($done))) / \((if $tot>0 then hb($tot) else "?" end))  \((hb($spd)))/s\n"
-    '
+    ' 2>/dev/null || true
 
-    # exit condition: nothing active or waiting
+    # Exit when all done
     if [[ "$active_count" -eq 0 && "$waiting_count" -eq 0 ]]; then
       echo "--- Completed items (last 10) ---"
-      jq -r '
-        .result // []
-        | reverse | .[:10]
-        | .[] | (.files[0].path // .bittorrent.info.name // .infoHash // "unknown")
-      ' <<<"$(helpers_rpc 'aria2.tellStopped' '[-1000, 1000]')" 2>/dev/null
+      jq -r 'reverse | .[:10] | .[] |
+            (.files[0].path // .bittorrent.info.name // .infoHash // "unknown")' \
+        <<<"$sto" 2>/dev/null || true
       break
     fi
 
-    sleep "${ARIA2_PROGRESS_REFRESH:-15}"
-    ((tick++))
+    # Sleep; don’t let signals get swallowed by a pipeline
+    sleep "$_refresh"
   done
 
+  # restore error mode if you need it later
+  set -e
   trap - INT TERM
   return 0
 }
