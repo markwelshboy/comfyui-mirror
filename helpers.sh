@@ -759,31 +759,48 @@ helpers_queue_empty() {
 
 # ---- Foreground progress with trap ----
 helpers_progress_snapshot_loop() {
+  #local interval="${1:-10}" log="${3:-/workspace/logs/aria2_progress.log}"
+  #mkdir -p "$(dirname "$log")"
+  #while true; do
+  #  helpers_progress_snapshot_once | tee -a "$log"
+  #  # Exit when both active and waiting are empty
+  #  if helpers_queue_empty; then break; fi
+  #  sleep "$interval"
+  #done
   local interval="${1:-10}" log="${3:-/workspace/logs/aria2_progress.log}"
   mkdir -p "$(dirname "$log")"
+  local tick=0
   while true; do
+    echo "--- tick $tick ---"                    # <-- add this
     helpers_progress_snapshot_once | tee -a "$log"
-    # Exit when both active and waiting are empty
+    ((tick++))
     if helpers_queue_empty; then break; fi
-    sleep "$interval"
+    sleep "$interval" &
+    wait $!                                   # <-- allows ^C to hit the shell, not a pipe
   done
+
 }
 
 helpers_progress_snapshot_once() {
   : "${ARIA2_HOST:=127.0.0.1}"; : "${ARIA2_PORT:=6969}"; : "${ARIA2_SECRET:=KissMeQuick}"
   : "${ARIA2_PROGRESS_MAX:=999}"
 
+
   local body resp
   body="$(jq -cn --arg t "token:$ARIA2_SECRET" \
     '{jsonrpc:"2.0",id:"A",method:"aria2.tellActive",params:[$t]},
      {jsonrpc:"2.0",id:"W",method:"aria2.tellWaiting",params:[$t,0,1000]},
      {jsonrpc:"2.0",id:"S",method:"aria2.tellStopped",params:[$t,0,200]}' )"
-  resp="$(curl -fsS "http://$ARIA2_HOST:$ARIA2_PORT/jsonrpc" -H 'Content-Type: application/json' --data-binary "$body" 2>/dev/null)" || {
-    echo "=== aria2 progress @ $(date '+%Y-%m-%d %H:%M:%S') ==="
-    echo "Active downloads: 0"; echo "--------------------------------------------------------------------------------"
-    echo "Group total: speed 0 B/s, done 0 B / 0 B"
-    return 0
-  }
+    # inside helpers_progress_snapshot_once
+    resp="$(curl --max-time 4 -fsS "http://$ARIA2_HOST:$ARIA2_PORT/jsonrpc" \
+            -H 'Content-Type: application/json' \
+            --data-binary "$body" 2>/dev/null)" || {
+      echo "================================================================================"
+      echo "=== Huggingface Model Downloader: aria2 progress @ $(date '+%Y-%m-%d %H:%M:%S') ==="
+      echo "=== (RPC timeout or unreachable; showing zero activity)"
+      echo "--------------------------------------------------------------------------------"
+      return 0
+    }
 
   # Slurp stream into array, then pick by id
   local active waiting stopped
@@ -799,7 +816,7 @@ helpers_progress_snapshot_once() {
 
   local merged; merged="$(jq -c --argjson a "$active" --argjson w "$waiting" '$a+$w')" || merged='[]'
   local count; count="$(jq -r 'length' <<<"$merged")"
-
+  
   echo "================================================================================"
   echo "=== Huggingface Model Downloader: aria2 progress @ $(date '+%Y-%m-%d %H:%M:%S') ==="
   echo "==="; 
