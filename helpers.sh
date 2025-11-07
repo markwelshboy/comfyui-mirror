@@ -996,7 +996,7 @@ helpers_download_from_manifest() {
         resp="$(helpers_rpc 'aria2.addUri' "$(jq -n --arg d "$dir" --arg o "$out" --arg u "$url" '[["\($u)"], {"dir": $d, "out": $o}]')")"
         gid="$(jq -r '.result // empty' <<<"$resp")"
         if [[ -n "$gid" ]]; then
-          echo "📥 Queue: $out  (gid: $gid)"
+          echo "📥 Queue: $out  (gid: $gid)" >&2 
         else
           echo "[enqueue-debug] Sans Queue :( -> ERROR addUri: $resp" >&2
         fi
