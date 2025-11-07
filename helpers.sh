@@ -1025,7 +1025,7 @@ helpers_download_from_manifest() {
 
   done
 
-  echo "$any"
+  printf '%s\n' "$any"
 }
 
 #=======================================================================================
@@ -1053,7 +1053,7 @@ aria2_enqueue_and_wait_from_manifest() {
   echo "==="
 
   local any; any="$(helpers_download_from_manifest || echo 0)"
-  if [[ "$any" != "1" ]]; then
+  if [[ "$any" != "0" ]] || ! helpers_queue_empty; then
     echo "Nothing to enqueue from json manifest."
     trap - INT TERM
     return 0
