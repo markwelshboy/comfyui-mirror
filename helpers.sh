@@ -657,6 +657,23 @@ helpers_start_aria2_daemon() {
   return 1
 }
 
+# --- raw JSON-RPC POST helper (the function your code calls) ---
+helpers_rpc_post() {
+  : "${ARIA2_HOST:=127.0.0.1}" "${ARIA2_PORT:=6969}"
+  curl -sS "http://${ARIA2_HOST}:${ARIA2_PORT}/jsonrpc" \
+       -H 'Content-Type: application/json' \
+       --data-binary "${1:-{}}" || true
+}
+
+# --- quick ping (used by aria2_clear_results) ---
+helpers_rpc_ping() {
+  : "${ARIA2_HOST:=127.0.0.1}" "${ARIA2_PORT:=6969}" "${ARIA2_SECRET:=KissMeQuick}"
+  curl -fsS "http://${ARIA2_HOST}:${ARIA2_PORT}/jsonrpc" \
+       -H 'Content-Type: application/json' \
+       --data '{"jsonrpc":"2.0","id":"v","method":"aria2.getVersion","params":["token:'"$ARIA2_SECRET"'"]}' \
+       >/dev/null 2>&1
+}
+
 # addUri
 helpers_rpc_add_uri() {
   local url="$1" dir="$2" out="$3" checksum="$4"
@@ -949,7 +966,27 @@ aria2_enqueue_and_wait_from_manifest() {
     local cnt; cnt="$(jq -rn --argjson A "$act" '$A|length')"
     echo "=== Active downloads: $cnt"
     echo "--------------------------------------------------------------------------------"
-    jq -r '
+    A="$act" jq -r '
+      # helper: human bytes
+      def hb($n):
+        if ($n // 0) >= 1099511627776 then
+          ((($n // 0) / 1099511627776)|floor|tostring) + " TB"
+        elif ($n // 0) >= 1073741824 then
+          ((($n // 0) / 1073741824)|floor|tostring) + " GB"
+        elif ($n // 0) >= 1048576 then
+          ((($n // 0) / 1048576)|floor|tostring) + " MB"
+        elif ($n // 0) >= 1024 then
+          ((($n // 0) / 1024)|floor|tostring) + " KB"
+        else
+          (($n // 0)|tostring) + " B"
+        end ;
+
+      # helper: ascii progress bar of width w
+      def bar($pct; $w):
+        ( ($w * ($pct / 100.0)) | floor ) as $f
+        | "[" + ( (range(0;$f) | "#") + (range($f;$w) | " ") ) + "]" ;
+
+      # A is an env var containing JSON array from aria2.tellActive
       (env.A // "[]") | fromjson
       | .[]? as $t
       | ($t.completedLength|tonumber)   as $done
@@ -957,27 +994,15 @@ aria2_enqueue_and_wait_from_manifest() {
       | ($t.downloadSpeed|tonumber)     as $spd
       | ($t.files|type)                 as $ft
       | (if $ft=="array" and ($t.files|length)>0 and ($t.files[0].path? // "")!="" then
-           ($t.files[0].path | capture("(?<dir>.*)/(?<name>[^/]+)$"))
-         else
-           {"dir":"", "name":($t.bittorrent.info.name? // $t.infoHash // "unknown")}
+          ($t.files[0].path | capture("(?<dir>.*)/(?<name>[^/]+)$"))
+        else
+          {"dir":"", "name":($t.bittorrent.info.name? // $t.infoHash // "unknown")}
         end) as $p
-      | $done as $d | $tot as $T | $spd as $S | $p.dir as $D | $p.name as $N
-      | def hb($n):
-          if $n==0 then "0 B"
-          elif $n<1024 then "\($n) B"
-          elif $n<1048576 then "\((($n/1024))) KB"
-          elif $n<1073741824 then "\((($n/1048576))) MB"
-          else "\((($n/1073741824))) GB" end;
-        def bar($d;$T; $w):
-          if $T==0 then "[                                        ]"
-          else
-            ( ($d*100)/$T | floor ) as $pct
-            | ( ($pct*$w)/100 | floor ) as $fill
-            | "[" + ( (range(0;$fill) | "#") + (range($fill;$w) | " ") ) + "]"
-          end;
-        (if $T==0 then 0 else (($d*100)/$T|floor) end) as $pct
-      | "  \($pct)% " + bar($d;$T;40) + "  " + (hb($S) + "/s").rjust(8) + "  (" + hb($d) + " / " + hb($T) + ")  [ Destination -> \($D|gsub("^.*/ComfyUI/";"")|gsub("^.*/models/";"models/")) ] \($N)'
-    )" A="$act"
+      | ($tot | if .>0 then ((100.0 * $done) / .) else 0 end) as $pct
+      | ($pct | if .>100 then 100 elif .<0 then 0 else . end) as $pc
+      | (bar($pc; (env.ARIA2_PROGRESS_BAR_WIDTH|tonumber? // 40))) as $B
+      | "\($p.name)\n  [\($B)] \((($pc*10)|round/10.0))%  \((hb($done))) / \((if $tot>0 then hb($tot) else "?" end))  \((hb($spd)))/s\n"
+    '
 
     echo "--------------------------------------------------------------------------------"
     printf "Group total: speed %s/s, done %s / %s\n" \
