@@ -807,41 +807,23 @@ helpers_progress_snapshot_once() {
   # - The // [] ensures we never get null, and the final add // [] ensures valid []
   local active waiting stopped
 
-  echo "Here1"
-
+  # Slurp stream into arrays (always valid JSON arrays)
   active="$(
-    jq -c -sr '
-      map(select(.id=="A") | (.result // [])) | add // []
-    ' <<< "$resp" 2>/dev/null
-  )"
+    jq -c -sr 'map(select(.id=="A") | (.result // [])) | add // []' <<<"$resp" 2>/dev/null
+  )"; [[ -z "$active"  ]]  && active='[]'
+
   waiting="$(
-    jq -c -sr '
-      map(select(.id=="W") | (.result // [])) | add // []
-    ' <<< "$resp" 2>/dev/null
-  )"
+    jq -c -sr 'map(select(.id=="W") | (.result // [])) | add // []' <<<"$resp" 2>/dev/null
+  )"; [[ -z "$waiting" ]] && waiting='[]'
+
   stopped="$(
-    jq -c -sr '
-      map(select(.id=="S") | (.result // [])) | add // []
-    ' <<< "$resp" 2>/dev/null
-  )"
+    jq -c -sr 'map(select(.id=="S") | (.result // [])) | add // []' <<<"$resp" 2>/dev/null
+  )"; [[ -z "$stopped" ]] && stopped='[]'
 
-  # absolute safety: if any var is empty string, force it to []
-  [[ -z "$active"  ]]  && active='[]'
-  [[ -z "$waiting" ]]  && waiting='[]'
-  [[ -z "$stopped" ]]  && stopped='[]'
-
-  echo "Here2"
-
-  # Merge active+waiting safely
-  local merged
-  merged="$(jq -c --argjson a "$active" --argjson w "$waiting" '$a + $w')" || merged='[]'
-
-  echo "Here3"
-
-  # Count without crashing if something still went weird
-  local count
+  # Merge active + waiting (must use -n so jq doesn't read stdin)
+  merged="$(jq -c -n --argjson a "$active" --argjson w "$waiting" '$a + $w')" || merged='[]'
   count="$(jq -r 'length' <<<"$merged" 2>/dev/null || echo 0)"
-  
+
   echo "================================================================================"
   echo "=== Huggingface Model Downloader: aria2 progress @ $(date '+%Y-%m-%d %H:%M:%S') ==="
   echo "==="
