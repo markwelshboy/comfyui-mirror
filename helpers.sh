@@ -665,7 +665,8 @@ helpers_start_aria2_daemon() {
        >/dev/null 2>&1; then
     return 0
   fi
-
+  
+  set +m
   # quiet background, no shell job id printed
   nohup aria2c --no-conf \
     --enable-rpc --rpc-secret="$ARIA2_SECRET" \
@@ -677,7 +678,9 @@ helpers_start_aria2_daemon() {
     --summary-interval=0 --show-console-readout=false \
     --console-log-level=warn \
     --log="${COMFY_LOGS:-/workspace/logs}/aria2.log" --log-level=notice \
-    >/dev/null 2>&1 < /dev/null & disown
+    >/dev/null 2>&1 &
+    disown
+    set -m
 
   # wait until RPC responds
   for _ in {1..50}; do
@@ -934,7 +937,6 @@ helpers_build_vars_json() {
 }
 
 # ---- Manifest Enqueue ----
-# Replace helpers_download_from_manifest with this:
 helpers_download_from_manifest() {
   _helpers_need curl; _helpers_need jq; _helpers_need awk
 
@@ -990,15 +992,16 @@ helpers_download_from_manifest() {
           # Surface the error in full so we can see *why* (bad token, bad URL, etc.)
           echo "ERROR adding $url to the queue (addUri: $resp). Could be a bad token, bad URL etc. Please check the logs." >&2
         fi
-    done < <( jq -r --arg sec "$sec" '
+    done < <(
+      jq -r --arg sec "$sec" '
         def as_obj:
-        if type=="object" then {url:(.url//""), path:(.path // ((.dir // "") + (if .out then "/" + .out else "" end)))}
-        elif type=="array" then {url:(.[0]//""), path:(.[1]//"")}
-        elif type=="string" then {url:., path:""}
-        else {url:"", path:""} end;
+          if   type=="object" then {url:(.url//""), path:(.path // ((.dir // "") + (if .out then "/" + .out else "" end)))}
+          elif type=="array"  then {url:(.[0]//""), path:(.[1]//"")}
+          elif type=="string" then {url:., path:""}
+          else {url:"", path:""} end;
         (.sections[$sec] // [])[] | as_obj | select(.url|length>0)
         | [.url, (if (.path|length)>0 then .path else (.url|sub("^.*/";"")) end)] | @tsv
-      ' "$MAN" )
+      ' "$MAN"
   done
   echo "$any"
 }
@@ -1011,14 +1014,14 @@ aria2_enqueue_and_wait_from_manifest() {
   _trap_manifest() {
     echo "[trap] Caught signal — pausing all aria2 jobs..." >&2
     helpers_rpc 'aria2.pauseAll' '[]' >/dev/null 2>&1 || true
+
     if [[ "${ARIA2_SHUTDOWN_ON_INT:-0}" == "1" ]]; then
       echo "[trap] Forcing aria2 shutdown..." >&2
       helpers_rpc 'aria2.forceShutdown' '[]' >/dev/null 2>&1 || true
     else
       echo "[trap] Leaving aria2 daemon running (ARIA2_SHUTDOWN_ON_INT=0)." >&2
     fi
-    # return to caller if sourced, otherwise exit
-    return 130 2>/dev/null || exit 130
+    exit 130
   }
   trap _trap_manifest INT TERM
 
@@ -1034,30 +1037,28 @@ aria2_enqueue_and_wait_from_manifest() {
     return 0
   fi
 
-   # interval
-  local _refresh="${ARIA2_PROGRESS_REFRESH:-15}"
-  ARIA2_PROGRESS_BAR_WIDTH="${ARIA2_PROGRESS_BAR_WIDTH:-40}"
+  local _refresh="${ARIA2_PROGRESS_REFRESH:-5}"
+  : "${ARIA2_PROGRESS_BAR_WIDTH:=40}"
+
+  echo ""
   echo "=== Starting progress loop (refresh every ${_refresh}s)..."
+  echo "==="
 
-  # ---- PROGRESS LOOP (robust) ----
-  # Don’t let -e / pipefail kill the loop
+  # Don’t let transient errors kill the loop
   set +e
-  trap '' PIPE  # ignore SIGPIPE just in case
- 
-  while :; do
-    # Fetch JSONs; always fall back to empty arrays so jq never errors
-    local _act_json _wai_json _sto_json
-    _act_json="$(helpers_rpc 'aria2.tellActive' '[]'           2>/dev/null || true)"
-    _wai_json="$(helpers_rpc 'aria2.tellWaiting' '[0,1000]'    2>/dev/null || true)"
-    _sto_json="$(helpers_rpc 'aria2.tellStopped' '[-1000,1000]' 2>/dev/null || true)"
+  trap '' PIPE
 
-    # Extract arrays safely
-    local act wai sto
+  while :; do
+    # Pull aria2 state; never error out if RPC hiccups
+    local _act_json _wai_json _sto_json
+    _act_json="$(helpers_rpc 'aria2.tellActive'  '[]'            2>/dev/null || true)"
+    _wai_json="$(helpers_rpc 'aria2.tellWaiting' '[0,1000]'      2>/dev/null || true)"
+    _sto_json="$(helpers_rpc 'aria2.tellStopped' '[-1000,1000]'  2>/dev/null || true)"
+
+    local act wai sto active_count waiting_count
     act="$(jq -c '(.result // [])' <<<"$_act_json" 2>/dev/null || echo '[]')"
     wai="$(jq -c '(.result // [])' <<<"$_wai_json" 2>/dev/null || echo '[]')"
     sto="$(jq -c '(.result // [])' <<<"$_sto_json" 2>/dev/null || echo '[]')"
-
-    local active_count waiting_count
     active_count="$(jq -r 'length' <<<"$act" 2>/dev/null || echo 0)"
     waiting_count="$(jq -r 'length' <<<"$wai" 2>/dev/null || echo 0)"
 
@@ -1065,7 +1066,7 @@ aria2_enqueue_and_wait_from_manifest() {
     echo "=== Aria2 Downloader: Active downloads: $active_count (pending: $waiting_count)"
     echo "--------------------------------------------------------------------------------"
 
-    # Pretty rows (env inject BEFORE jq)
+    # Pretty rows
     A="$act" jq -r '
       def hb($n):
         if ($n // 0) >= 1099511627776 then ((($n // 0) / 1099511627776)|floor|tostring) + " TB"
@@ -1083,9 +1084,9 @@ aria2_enqueue_and_wait_from_manifest() {
       | ($t.downloadSpeed|tonumber)   as $spd
       | ($t.files|type) as $ft
       | (if $ft=="array" and ($t.files|length)>0 and ($t.files[0].path? // "")!="" then
-          ($t.files[0].path | capture("(?<dir>.*)/(?<name>[^/]+)$"))
-        else
-          {"dir":"", "name":($t.bittorrent.info.name? // $t.infoHash // "unknown")}
+           ($t.files[0].path | capture("(?<dir>.*)/(?<name>[^/]+)$"))
+         else
+           {"dir":"", "name":($t.bittorrent.info.name? // $t.infoHash // "unknown")}
         end) as $p
       | ($tot | if .>0 then (100.0 * $done / .) else 0 end) as $pct
       | ($pct | if .>100 then 100 elif .<0 then 0 else . end) as $pc
@@ -1094,20 +1095,20 @@ aria2_enqueue_and_wait_from_manifest() {
       | "\($p.name)\n  \($B) \((($pc*10)|round/10.0))%  \((hb($done))) / \((if $tot>0 then hb($tot) else "?" end))  \((hb($spd)))/s\n"
     ' 2>/dev/null || true
 
-    # Exit when all done
+    # Exit when done
     if [[ "$active_count" -eq 0 && "$waiting_count" -eq 0 ]]; then
       echo "--- Completed items (last 10) ---"
       jq -r 'reverse | .[:10] | .[] |
-            (.files[0].path // .bittorrent.info.name // .infoHash // "unknown")' \
+             (.files[0].path // .bittorrent.info.name // .infoHash // "unknown")' \
         <<<"$sto" 2>/dev/null || true
       break
     fi
 
-    # Sleep; don’t let signals get swallowed by a pipeline
-    sleep "$_refresh"
+    # Sleep in a background job and wait on it—SIGINT reliably interrupts this
+    { sleep "$_refresh" & wait $!; } || true
   done
 
-  # restore error mode if you need it later
+  # restore stricter mode
   set -e
   trap - INT TERM
   return 0
