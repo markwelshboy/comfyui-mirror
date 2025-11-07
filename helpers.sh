@@ -1022,11 +1022,9 @@ helpers_download_from_manifest() {
 
 # ---- Top-level: enqueue + progress ----
 aria2_enqueue_and_wait_from_manifest() {
-  helpers_start_aria2_daemon || return 1
-
-  # Ctrl-C: stop queue (optionally leave daemon alive)
+  # ----- TRAP (must be first!) -----
   _trap_manifest() {
-    echo "[trap] Caught signal — pausing all aria2 jobs..." >&2
+    echo "[trap] SIGINT/SIGTERM — pausing aria2..." >&2
     helpers_rpc 'aria2.pauseAll' '[]' >/dev/null 2>&1 || true
 
     if [[ "${ARIA2_SHUTDOWN_ON_INT:-0}" == "1" ]]; then
@@ -1038,6 +1036,8 @@ aria2_enqueue_and_wait_from_manifest() {
     exit 130
   }
   trap _trap_manifest INT TERM
+
+  helpers_start_aria2_daemon || return 1
 
   echo "================================================================================"
   echo "==="
@@ -1060,12 +1060,18 @@ aria2_enqueue_and_wait_from_manifest() {
   echo "=== Starting progress loop (refresh every ${_refresh}s)..."
   echo "==="
 
-  # Don’t let transient errors kill the loop
+  # ---- PROGRESS LOOP (robust) ----
+  # Neutralize strict modes inside the loop
   set +e
+  set +o pipefail
   trap '' PIPE
 
-  while :; do
-    # Pull aria2 state; never error out if RPC hiccups
+  : "${ARIA2_PROGRESS_BAR_WIDTH:=40}"
+  local _refresh="${ARIA2_PROGRESS_REFRESH:-15}"
+  local __tick=0
+
+  while true; do
+    # Pull aria2 state (never crash on transient RPC/jq issues)
     local _act_json _wai_json _sto_json
     _act_json="$(helpers_rpc 'aria2.tellActive'  '[]'            2>/dev/null || true)"
     _wai_json="$(helpers_rpc 'aria2.tellWaiting' '[0,1000]'      2>/dev/null || true)"
@@ -1079,10 +1085,10 @@ aria2_enqueue_and_wait_from_manifest() {
     waiting_count="$(jq -r 'length' <<<"$wai" 2>/dev/null || echo 0)"
 
     echo "================================================================================"
-    echo "=== Aria2 Downloader: Active downloads: $active_count (pending: $waiting_count)"
+    echo "=== Aria2 Downloader: Active downloads: $active_count (pending: $waiting_count) [tick $__tick]"
     echo "--------------------------------------------------------------------------------"
 
-    # Pretty rows
+    # Pretty rows (inject env BEFORE jq)
     A="$act" jq -r '
       def hb($n):
         if ($n // 0) >= 1099511627776 then ((($n // 0) / 1099511627776)|floor|tostring) + " TB"
@@ -1100,9 +1106,9 @@ aria2_enqueue_and_wait_from_manifest() {
       | ($t.downloadSpeed|tonumber)   as $spd
       | ($t.files|type) as $ft
       | (if $ft=="array" and ($t.files|length)>0 and ($t.files[0].path? // "")!="" then
-           ($t.files[0].path | capture("(?<dir>.*)/(?<name>[^/]+)$"))
-         else
-           {"dir":"", "name":($t.bittorrent.info.name? // $t.infoHash // "unknown")}
+          ($t.files[0].path | capture("(?<dir>.*)/(?<name>[^/]+)$"))
+        else
+          {"dir":"", "name":($t.bittorrent.info.name? // $t.infoHash // "unknown")}
         end) as $p
       | ($tot | if .>0 then (100.0 * $done / .) else 0 end) as $pct
       | ($pct | if .>100 then 100 elif .<0 then 0 else . end) as $pc
@@ -1113,21 +1119,24 @@ aria2_enqueue_and_wait_from_manifest() {
 
     # Exit when done
     if [[ "$active_count" -eq 0 && "$waiting_count" -eq 0 ]]; then
+      echo "[progress] nothing active/waiting — exiting." >&2
       echo "--- Completed items (last 10) ---"
       jq -r 'reverse | .[:10] | .[] |
-             (.files[0].path // .bittorrent.info.name // .infoHash // "unknown")' \
+            (.files[0].path // .bittorrent.info.name // .infoHash // "unknown")' \
         <<<"$sto" 2>/dev/null || true
       break
     fi
 
-    # Sleep in a background job and wait on it—SIGINT reliably interrupts this
+    # Sleep in a child and wait on it — SIGINT reliably interrupts this
+    # (if SIGINT arrives here, trap runs and exits; if not, we loop)
     { sleep "$_refresh" & wait $!; } || true
+    : $(( __tick+=1 ))
   done
 
-  # restore stricter mode if you want it later
+  # restore stricter modes if you want them after this function
   set -e
+  set -o pipefail
   trap - INT TERM
-  return 0
 }
 #=======================================================================================
 #
