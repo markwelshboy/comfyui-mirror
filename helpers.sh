@@ -807,6 +807,8 @@ helpers_progress_snapshot_once() {
   # - The // [] ensures we never get null, and the final add // [] ensures valid []
   local active waiting stopped
 
+  echo "Here1"
+
   active="$(
     jq -c -sr '
       map(select(.id=="A") | (.result // [])) | add // []
@@ -828,9 +830,13 @@ helpers_progress_snapshot_once() {
   [[ -z "$waiting" ]]  && waiting='[]'
   [[ -z "$stopped" ]]  && stopped='[]'
 
+  echo "Here2"
+
   # Merge active+waiting safely
   local merged
   merged="$(jq -c --argjson a "$active" --argjson w "$waiting" '$a + $w')" || merged='[]'
+
+  echo "Here3"
 
   # Count without crashing if something still went weird
   local count
