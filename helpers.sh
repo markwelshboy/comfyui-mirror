@@ -1020,7 +1020,7 @@ helpers_download_from_manifest() {
     # Iterate tsv in the *current* shell (no subshell)
     while IFS=$'\t' read -r url raw_path; do
       # unified enqueue -> records gid via helpers_rpc_add_uri
-      helpers_manifest_enqueue_one "$url" "$raw_path" && any=1
+      if helpers_manifest_enqueue_one "$url" "$raw_path"; then any=1; fi
     done <<<"$tsv"
 
   done
@@ -1080,6 +1080,7 @@ aria2_enqueue_and_wait_from_manifest() {
 : "${CHECKPOINT_IDS_TO_DOWNLOAD:=}"     # e.g. "12345, 67890, 23422:i2v"
 : "${LORAS_IDS_TO_DOWNLOAD:=}"          # e.g. "abc, def ghi"
 : "${CIVITAI_LOG_DIR:=${COMFY_LOGS:-/workspace/logs}/civitai}"
+: "${CIVITAI_DEBUG:=0}"
 
 #---------------------------------------------------------------------------------------
 
@@ -1326,13 +1327,13 @@ helpers_civitai_enqueue_version() {
   local vjson name url
 
   vjson="$(helpers_civitai_get_version_json "$ver_id")" || {
-    [[ -n "$CIVITAI_DEBUG" ]] && echo "❌ v${ver_id}: version JSON fetch failed" >&2
+    [[ "$CIVITAI_DEBUG" -eq 1 ]] && echo "❌ v${ver_id}: version JSON fetch failed" >&2
     return 1
   }
 
   name="$(printf '%s' "$vjson" | helpers_civitai_pick_name)"
   if [[ -z "$name" ]]; then
-    [[ -n "$CIVITAI_DEBUG" ]] && echo "❌ v${ver_id}: no filename in files[]" >&2
+    [[ "$CIVITAI_DEBUG" -eq 1 ]] && echo "❌ v${ver_id}: no filename in files[]" >&2
     return 1
   fi
 
@@ -1340,7 +1341,7 @@ helpers_civitai_enqueue_version() {
 
   # Optional 1-byte probe; disable with CIVITAI_PROBE=0
   if ! helpers_civitai_probe_url "$url"; then
-    [[ -n "$CIVITAI_DEBUG" ]] && echo "❌ v${ver_id}: URL probe failed" >&2
+    [[ "$CIVITAI_DEBUG" -eq 1 ]] && echo "❌ v${ver_id}: URL probe failed" >&2
     return 1
   fi
 
@@ -1349,14 +1350,12 @@ helpers_civitai_enqueue_version() {
   # IMPORTANT: 4th param is checksum in your helpers; pass empty string.
   # Do NOT pass headers here (token is already in the URL).
   if helpers_rpc_add_uri "$url" "$dest_dir" "$name" ""; then
-    [[ -n "$CIVITAI_DEBUG" ]] && {
+    [[ "$CIVITAI_DEBUG" -eq 1 ]] && {
       echo "📥 CivitAI v${ver_id}"
-      echo "   URL : $url"
-      echo "   OUT : ${dest_dir%/}/$name"
     }
     return 0
   else
-    [[ -n "$CIVITAI_DEBUG" ]] && echo "❌ v${ver_id}: addUri failed" >&2
+    [[ "$CIVITAI_DEBUG" -eq 1 ]] && echo "❌ v${ver_id}: addUri failed" >&2
     return 1
   fi
 }
@@ -1388,23 +1387,23 @@ aria2_enqueue_and_wait_from_civitai() {
   # LoRA version IDs
   ids="$(helpers_civitai_tokenize_ids "${LORAS_IDS_TO_DOWNLOAD:-}")"
   if [[ -n "${ids// }" ]]; then
-    [[ -n "$CIVITAI_DEBUG" ]] && echo "→ Parsed $(wc -w <<<"$ids") LoRA id(s): $ids"
+    [[ "$CIVITAI_DEBUG" -eq 1 ]] && echo "→ Parsed $(wc -w <<<"$ids") LoRA id(s): $ids"
     for vid in $ids; do
       if helpers_civitai_enqueue_version "$vid" "$lora_dir"; then any=1; fi
     done
   else
-    [[ -n "$CIVITAI_DEBUG" ]] && echo "⏭️ No LoRA id(s) parsed."
+    [[ "$CIVITAI_DEBUG" -eq 1 ]] && echo "⏭️ No LoRA id(s) parsed."
   fi
 
   # Checkpoint version IDs
   ids="$(helpers_civitai_tokenize_ids "${CHECKPOINT_IDS_TO_DOWNLOAD:-}")"
   if [[ -n "${ids// }" ]]; then
-    [[ -n "$CIVITAI_DEBUG" ]] && echo "→ Parsed $(wc -w <<<"$ids") Checkpoint id(s): $ids"
+    [[ "$CIVITAI_DEBUG" -eq 1 ]] && echo "→ Parsed $(wc -w <<<"$ids") Checkpoint id(s): $ids"
     for vid in $ids; do
       if helpers_civitai_enqueue_version "$vid" "$ckpt_dir"; then any=1; fi
     done
   else
-    [[ -n "$CIVITAI_DEBUG" ]] && echo "⏭️ No Checkpoint id(s) parsed."
+    [[ "$CIVITAI_DEBUG" -eq 1 ]] && echo "⏭️ No Checkpoint id(s) parsed."
   fi
 
   if [[ "$any" != "1" ]]; then
