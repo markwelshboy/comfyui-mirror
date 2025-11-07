@@ -785,22 +785,22 @@ helpers_progress_snapshot_once() {
   : "${ARIA2_HOST:=127.0.0.1}"; : "${ARIA2_PORT:=6969}"; : "${ARIA2_SECRET:=KissMeQuick}"
   : "${ARIA2_PROGRESS_MAX:=999}"
 
-
   local body resp
   body="$(jq -cn --arg t "token:$ARIA2_SECRET" \
     '{jsonrpc:"2.0",id:"A",method:"aria2.tellActive",params:[$t]},
      {jsonrpc:"2.0",id:"W",method:"aria2.tellWaiting",params:[$t,0,1000]},
      {jsonrpc:"2.0",id:"S",method:"aria2.tellStopped",params:[$t,0,200]}' )"
-    # inside helpers_progress_snapshot_once
-    resp="$(curl --max-time 4 -fsS "http://$ARIA2_HOST:$ARIA2_PORT/jsonrpc" \
+  # inside helpers_progress_snapshot_once
+  resp="$(curl --max-time 4 -fsS "http://$ARIA2_HOST:$ARIA2_PORT/jsonrpc" \
             -H 'Content-Type: application/json' \
             --data-binary "$body" 2>/dev/null)" || {
-      echo "================================================================================"
-      echo "=== Huggingface Model Downloader: aria2 progress @ $(date '+%Y-%m-%d %H:%M:%S') ==="
-      echo "=== (RPC timeout or unreachable; showing zero activity)"
-      echo "--------------------------------------------------------------------------------"
-      return 0
-    }
+    echo "================================================================================"
+    echo "=== Huggingface Model Downloader: aria2 progress @ $(date '+%Y-%m-%d %H:%M:%S') ==="
+    echo "=== (RPC timeout or unreachable; showing zero activity)"
+    echo "--------------------------------------------------------------------------------"
+    return 0
+  }
+  echo "Never Get Here"
 
   # Slurp stream into array, then pick by id
   local active waiting stopped
