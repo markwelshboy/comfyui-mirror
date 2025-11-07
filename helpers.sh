@@ -599,17 +599,16 @@ helpers_human_bytes() { # bytes -> human
   printf "%d %s" "$b" "${u[$d]}"
 }
 
-# Replace {VAR} in a plain string OR a JSON blob using environment variables.
-# Usage:
-#   helpers_resolve_placeholders "plain/{DIFFUSION_MODELS_DIR}/path"
-#   helpers_resolve_placeholders '{"dst":"{VAE_DIR}/foo","note":"{SHELL}"}'
+# Replace {VAR} tokens using *current environment*.
+# - If input looks like JSON (begins with "{" or "["), we walk it with jq and substitute in string leaves.
+# - Otherwise, we do fast pure-Bash substitution on the plain string (no jq/Perl).
 helpers_resolve_placeholders() {
   _helpers_need jq
-  local raw out
+  local raw
   raw=$1
 
-  # 1) Try jq using env (handles JSON structures and strings)
-  out="$(
+  # JSON-ish? Use jq + env (safe even if some envs are weird)
+  if [[ $raw =~ ^[[:space:]]*[\{\[] ]]; then
     jq -nr -r --arg RAW "$raw" '
       def subst_env($text):
         reduce (env | to_entries[]) as $e ($text;
@@ -632,20 +631,28 @@ helpers_resolve_placeholders() {
       if $J != null then
         ($J | walk_strings( subst_env(.) )) | tojson
       else
+        # If someone passes broken JSON, treat it as a plain string anyway
         subst_env($RAW)
       end
     '
-  )"
-
-  # 2) If jq printed nothing (unexpected), do a robust fallback with Perl.
-  #    This replaces {VARNAME} -> $ENV{VARNAME}, leaving unknown tokens intact.
-  if [ -z "$out" ]; then
-    out="$(printf '%s' "$raw" | perl -pe 's/\{([A-Z0-9_]+)\}/$ENV{$1} // $&/gie')"
-    # If still empty (very unlikely), echo the raw input as a last resort.
-    [ -z "$out" ] && out="$raw"
+    return
   fi
 
-  printf '%s\n' "$out"
+  # Plain string path: pure Bash replace {NAME} -> $NAME (leaves unknown tokens as-is)
+  local s="$raw"
+  local key val
+  # Loop while there is any {...} token with [A-Za-z0-9_]
+  while [[ $s =~ \{([A-Za-z0-9_]+)\} ]]; do
+    key="${BASH_REMATCH[1]}"
+    # indirect expansion: use empty if not set
+    val="${!key}"
+    # Replace *all* occurrences of this token
+    s="${s//\{$key\}/$val}"
+    # If val is empty because VAR is unset, the token disappears (desired);
+    # If you prefer to *keep* unknown tokens, uncomment next line:
+    # [[ -z ${!key+x} ]] && s="${s//\{$key\}/\{$key\}}"
+  done
+  printf '%s\n' "$s"
 }
 
 helpers_have_aria2_rpc() {
