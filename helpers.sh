@@ -945,7 +945,7 @@ helpers_download_from_manifest() {
   local MAN; MAN="$(mktemp)"
   curl -fsSL "$MODEL_MANIFEST_URL" -o "$MAN" || { echo "Failed to fetch manifest: $MODEL_MANIFEST_URL" >&2; return 1; }
 
-  # build vars map
+  # build vars map (even if not used later, keep parity)
   local VARS_JSON; VARS_JSON="$(helpers_build_vars_json "$MAN")" || return 1
 
   # find enabled sections
@@ -966,33 +966,13 @@ helpers_download_from_manifest() {
   helpers_start_aria2_daemon || return 1
 
   local any=0
+
   for sec in "${ENABLED[@]}"; do
     echo ">>> Enqueue section: $sec"
-    while IFS=$'\t' read -r url raw_path; do
-        # placeholder substitution
-        local path dir out
-        path="$(helpers_resolve_placeholders "$raw_path")"
-        dir="$(dirname -- "$sspath")"; out="$(basename -- "$path")"
-        mkdir -p -- "$dir"
-        # skip if exists & looks complete
-        if [[ -f "$path" && ! -f "$path.aria2" ]]; then
-          echo " - ⏭️ SKIPPING: $out (safetensors file exists)" >&2
-          : $(( any+=0 ))
-          continue
-        fi
-         resp="$(helpers_rpc 'aria2.addUri' "$(jq -n --arg d "$dir" --arg o "$out" --arg u "$url" \
-          '[["\($u)"], {"dir": $d, "out": $o}]')")"
-        # Always log what aria2 returned (first item is enough, but safe to keep)
-        # Parse gid (handles both `"result": "...gid..."` and error objects)
-        gid="$(jq -r '(.result // empty) // ""' <<<"$resp" 2>/dev/null)"
-        if [[ -n "$gid" ]]; then
-          echo " - 📥 Queue: $out" >&2
-          any=1
-        else
-          # Surface the error in full so we can see *why* (bad token, bad URL, etc.)
-          echo "ERROR adding $url to the queue (addUri: $resp). Could be a bad token, bad URL etc. Please check the logs." >&2
-        fi
-    done < <(
+
+    # Build the TSV *first* (no process substitution, no pipeline)
+    local tsv
+    tsv="$(
       jq -r --arg sec "$sec" '
         def as_obj:
           if   type=="object" then {url:(.url//""), path:(.path // ((.dir // "") + (if .out then "/" + .out else "" end)))}
@@ -1002,7 +982,41 @@ helpers_download_from_manifest() {
         (.sections[$sec] // [])[] | as_obj | select(.url|length>0)
         | [.url, (if (.path|length)>0 then .path else (.url|sub("^.*/";"")) end)] | @tsv
       ' "$MAN"
+    )"
+
+    # Iterate tsv in the *current* shell (no subshell)
+    while IFS=$'\t' read -r url raw_path; do
+      [[ -z "$url" ]] && continue
+
+      # placeholder substitution -> destination path
+      local path dir out
+      path="$(helpers_resolve_placeholders "$raw_path")"
+      dir="$(dirname -- "$path")"; out="$(basename -- "$path")"
+      mkdir -p -- "$dir"
+
+      # skip if exists & looks complete
+      if [[ -f "$path" && ! -f "$path.aria2" ]]; then
+        echo " - ⏭️ SKIPPING: $out (safetensors file exists)" >&2
+        : $(( any+=0 ))
+        continue
+      fi
+
+      # enqueue
+      local resp gid
+      resp="$(helpers_rpc 'aria2.addUri' "$(jq -n --arg d "$dir" --arg o "$out" --arg u "$url" \
+        '[["\($u)"], {"dir": $d, "out": $o}]')")"
+
+      gid="$(jq -r '(.result // empty) // ""' <<<"$resp" 2>/dev/null)"
+      if [[ -n "$gid" ]]; then
+        echo " - 📥 Queue: $out" >&2
+        any=1
+      else
+        echo "ERROR adding $url to the queue (addUri: $resp). Could be a bad token, bad URL etc. Please check the logs." >&2
+      fi
+    done <<<"$tsv"
+
   done
+
   echo "$any"
 }
 
