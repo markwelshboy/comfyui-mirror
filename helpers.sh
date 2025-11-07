@@ -1001,7 +1001,7 @@ helpers_download_from_manifest() {
   local any=0
 
   for sec in "${ENABLED[@]}"; do
-    echo ">>> Enqueue section: $sec"
+    echo ">>> Enqueue section: $sec" >&2
 
     # Build the TSV *first* (no process substitution, no pipeline)
     local tsv
@@ -1040,7 +1040,7 @@ aria2_enqueue_and_wait_from_manifest() {
   _cleanup_trap_manifest() {
     (( trapped )) && return 0
     trapped=1
-    echo; echo "⚠️  Interrupted — stopping queue and cleaning results…"
+    echo; echo "⚠️  Aria2 Downloader Interrupted — stopping queue and cleaning results…"
     aria2_stop_all >/dev/null 2>&1 || true
     aria2_clear_results >/dev/null 2>&1 || true
     return 130
@@ -1053,7 +1053,7 @@ aria2_enqueue_and_wait_from_manifest() {
   echo "==="
 
   local any; any="$(helpers_download_from_manifest || echo 0)"
-  if [[ "$any" != "0" ]] || ! helpers_queue_empty; then
+  if [[ "$any" == "0" ]] && ! helpers_queue_empty; then
     echo "Nothing to enqueue from json manifest."
     trap - INT TERM
     return 0
