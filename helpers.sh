@@ -599,22 +599,20 @@ helpers_human_bytes() { # bytes -> human
   printf "%d %s" "$b" "${u[$d]}"
 }
 
-# Replace {VAR} tokens using *current environment*.
-# - If input looks like JSON (begins with "{" or "["), we walk it with jq and substitute in string leaves.
-# - Otherwise, we do fast pure-Bash substitution on the plain string (no jq/Perl).
+# Replace {VAR} tokens using current environment.
+# - If the input parses as JSON, walk string leaves and substitute via jq+env.
+# - Otherwise, do fast pure-Bash substitution on the plain string.
 helpers_resolve_placeholders() {
   _helpers_need jq
-  local raw
-  raw=$1
+  local raw="$1"
 
-  # JSON-ish? Use jq + env (safe even if some envs are weird)
-  if [[ $raw =~ ^[[:space:]]*[\{\[] ]]; then
+  # If it's valid JSON, use jq path
+  if printf '%s' "$raw" | jq -e . >/dev/null 2>&1; then
     jq -nr -r --arg RAW "$raw" '
       def subst_env($text):
         reduce (env | to_entries[]) as $e ($text;
           gsub("\\{" + ($e.key|tostring) + "\\}"; ($e.value|tostring))
         );
-
       def walk_strings(f):
         if type == "object" then
           with_entries(.value |= ( . | walk_strings(f) ))
@@ -626,31 +624,22 @@ helpers_resolve_placeholders() {
           .
         end;
 
-      ( $RAW | fromjson? ) as $J
-      |
-      if $J != null then
-        ($J | walk_strings( subst_env(.) )) | tojson
-      else
-        # If someone passes broken JSON, treat it as a plain string anyway
-        subst_env($RAW)
-      end
+      ($RAW | fromjson)                          # safe: we just validated it parses
+      | walk_strings( subst_env(.) )
+      | tojson
     '
     return
   fi
 
-  # Plain string path: pure Bash replace {NAME} -> $NAME (leaves unknown tokens as-is)
-  local s="$raw"
-  local key val
-  # Loop while there is any {...} token with [A-Za-z0-9_]
-  while [[ $s =~ \{([A-Za-z0-9_]+)\} ]]; do
+  # Plain string: Bash token replace {NAME} -> $NAME (leaves unknown as-is)
+  local s="$raw" key val
+  # Replace all tokens that look like {VARNAME}
+  while [[ $s =~ \{([A-Za-z_][A-Za-z0-9_]*)\} ]]; do
     key="${BASH_REMATCH[1]}"
-    # indirect expansion: use empty if not set
-    val="${!key}"
-    # Replace *all* occurrences of this token
+    val="${!key}"                        # indirect expansion
+    # If not set, keep token as-is (comment next line & uncomment the one after if you want them to disappear)
+    [[ -z ${!key+x} ]] && val="{$key}"
     s="${s//\{$key\}/$val}"
-    # If val is empty because VAR is unset, the token disappears (desired);
-    # If you prefer to *keep* unknown tokens, uncomment next line:
-    # [[ -z ${!key+x} ]] && s="${s//\{$key\}/\{$key\}}"
   done
   printf '%s\n' "$s"
 }
