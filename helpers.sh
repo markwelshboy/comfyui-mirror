@@ -819,8 +819,9 @@ helpers_progress_snapshot_once() {
   
   echo "================================================================================"
   echo "=== Huggingface Model Downloader: aria2 progress @ $(date '+%Y-%m-%d %H:%M:%S') ==="
-  echo "==="; 
-  echo "=== Active downloads: $count"; echo "--------------------------------------------------------------------------------"
+  echo "==="
+  echo "=== Active downloads: $count"
+  echo "--------------------------------------------------------------------------------"
 
   if (( count == 0 )); then
     echo "Group total: speed 0 B/s, done 0 B / 0 B"
