@@ -966,15 +966,6 @@ helpers_download_from_manifest() {
   local any=0
   for sec in "${ENABLED[@]}"; do
     echo ">>> Enqueue section: $sec"
-    #jq -r --arg sec "$sec" '
-    #  def as_obj:
-    #    if type=="object" then {url:(.url//""), path:(.path // ((.dir // "") + (if .out then "/" + .out else "" end)))}
-    #    elif type=="array" then {url:(.[0]//""), path:(.[1]//"")}
-    #    elif type=="string" then {url:., path:""}
-    #    else {url:"", path:""} end;
-    #  (.sections[$sec] // [])[] | as_obj | select(.url|length>0)
-    #  | [.url, (if (.path|length)>0 then .path else (.url|sub("^.*/";"")) end)] | @tsv
-    #' "$MAN" | while IFS=$'\t' read -r url raw_path; do
     while IFS=$'\t' read -r url raw_path; do
         # placeholder substitution
         local path dir out
@@ -983,21 +974,13 @@ helpers_download_from_manifest() {
         mkdir -p -- "$dir"
         # skip if exists & looks complete
         if [[ -f "$path" && ! -f "$path.aria2" ]]; then
-          echo "[enqueue-debug] SKIP (path exists, no path.aria2): $path" >&2
+          echo " - ⏭️ SKIPPING: $out (safetensors file exists)" >&2
           : $(( any+=0 ))
           continue
         fi
-        #echo "[enqueue-debug] URL: $url" >&2
-        #echo "[enqueue-debug] RAW: $raw_path" >&2
-        #echo "[enqueue-debug] RESOLVED: $path" >&2    
-        #echo "[enqueue-debug] DIR: $dir" >&2    
-        #echo "📥 Queue (in): $out"
-        #helpers_rpc 'aria2.addUri' "$(jq -n --arg d "$dir" --arg o "$out" --arg u "$url" '[["\($u)"], {"dir": $d, "out": $o}]')" >/dev/null
-        #any=1
-        resp="$(helpers_rpc 'aria2.addUri' "$(jq -n --arg d "$dir" --arg o "$out" --arg u "$url" \
+         resp="$(helpers_rpc 'aria2.addUri' "$(jq -n --arg d "$dir" --arg o "$out" --arg u "$url" \
           '[["\($u)"], {"dir": $d, "out": $o}]')")"
         # Always log what aria2 returned (first item is enough, but safe to keep)
-        #echo "[enqueue-debug] addUri resp: ${resp:0:200}" >&2
         # Parse gid (handles both `"result": "...gid..."` and error objects)
         gid="$(jq -r '(.result // empty) // ""' <<<"$resp" 2>/dev/null)"
         if [[ -n "$gid" ]]; then
@@ -1055,7 +1038,7 @@ aria2_enqueue_and_wait_from_manifest() {
   local _refresh="${ARIA2_PROGRESS_REFRESH:-15}"
   ARIA2_PROGRESS_BAR_WIDTH="${ARIA2_PROGRESS_BAR_WIDTH:-40}"
   echo "=== Starting progress loop (refresh every ${_refresh}s)..."
-  
+
   # ---- PROGRESS LOOP (robust) ----
   # Don’t let -e / pipefail kill the loop
   set +e
