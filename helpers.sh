@@ -599,50 +599,11 @@ helpers_human_bytes() { # bytes -> human
   printf "%d %s" "$b" "${u[$d]}"
 }
 
-# Replace {VAR} tokens using current environment.
-# - If the input parses as JSON, walk string leaves and substitute via jq+env.
-# - Otherwise, do fast pure-Bash substitution on the plain string.
-helpers_resolve_placeholders() {
-  _helpers_need jq
-  local raw="$1"
-
-  # If it's valid JSON, use jq path
-  if printf '%s' "$raw" | jq -e . >/dev/null 2>&1; then
-    jq -nr -r --arg RAW "$raw" '
-      def subst_env($text):
-        reduce (env | to_entries[]) as $e ($text;
-          gsub("\\{" + ($e.key|tostring) + "\\}"; ($e.value|tostring))
-        );
-      def walk_strings(f):
-        if type == "object" then
-          with_entries(.value |= ( . | walk_strings(f) ))
-        elif type == "array" then
-          map( walk_strings(f) )
-        elif type == "string" then
-          f
-        else
-          .
-        end;
-
-      ($RAW | fromjson)                          # safe: we just validated it parses
-      | walk_strings( subst_env(.) )
-      | tojson
-    '
-    return
-  fi
-
-  # Plain string: Bash token replace {NAME} -> $NAME (leaves unknown as-is)
-  local s="$raw" key val
-  # Replace all tokens that look like {VARNAME}
-  while [[ $s =~ \{([A-Za-z_][A-Za-z0-9_]*)\} ]]; do
-    key="${BASH_REMATCH[1]}"
-    val="${!key}"                        # indirect expansion
-    # If not set, keep token as-is (comment next line & uncomment the one after if you want them to disappear)
-    [[ -z ${!key+x} ]] && val="{$key}"
-    s="${s//\{$key\}/$val}"
-  done
-  printf '%s\n' "$s"
-}
+#=======================================================================
+#===
+#=== Common utils for manifest-based and CIVITAI-based downloading
+#===
+#=======================================================================
 
 # start_aria2_daemon: launch aria2c daemon if not already running
 helpers_start_aria2_daemon() {
@@ -685,311 +646,6 @@ helpers_start_aria2_daemon() {
   echo "❌ aria2 RPC did not come up" >&2
   return 1
 }
-
-helpers_build_vars_json() {
-  _helpers_need jq
-  local man="$1"
-  # Start with vars+paths from the manifest
-  local base
-  base="$(jq -n --slurpfile m "$man" '
-    ($m[0].vars  // {}) as $v |
-    ($m[0].paths // {}) as $p |
-    ($v + $p)
-  ')" || return 1
-
-  # Merge UPPERCASE environment as *strings* (never --argjson)
-  while IFS='=' read -r k v; do
-    [[ "$k" =~ ^[A-Z0-9_]+$ ]] || continue
-    base="$(jq --arg k "$k" --arg v "$v" '. + {($k): $v}' <<<"$base")"
-  done < <(env)
-
-  printf '%s' "$base"
-}
-
-#=======================================================================================
-# ---- GID book-keeping ----
-#=======================================================================================
-
-helpers__read_gid_pairs() {
-  # prints "gid<TAB>name" for all still-present gids
-  local f="${ARIA2_GID_FILE:-/tmp/.aria2_enqueued_gids}"
-  [[ -s "$f" ]] || return 1
-  # strip blank / duplicate lines
-  awk -F'\t' 'NF>=1 && $1!="" {print $0}' "$f" | awk '!seen[$1]++'
-}
-
-helpers__prune_gids_and_count_active() {
-  local tmp; tmp="$(mktemp)"
-  local active=0
-  local line gid name status
-
-  while IFS=$'\t' read -r gid name; do
-    [[ -z "$gid" ]] && continue
-    # fetch status (never crash on hiccups)
-    local js; js="$(helpers_rpc 'aria2.tellStatus' "$(jq -nc --arg g "$gid" '[$g]')" 2>/dev/null || true)"
-    status="$(jq -r '.result.status // empty' <<<"$js" 2>/dev/null)"
-    case "$status" in
-      active|waiting|paused)
-        printf '%s\t%s\n' "$gid" "$name" >> "$tmp"
-        ((active++))
-        ;;
-      complete|error|removed|"")
-        # drop it
-        ;;
-    esac
-  done < <(helpers__read_gid_pairs || true)
-
-  # replace the file atomically
-  local f="${ARIA2_GID_FILE:-/tmp/.aria2_enqueued_gids}"
-  mv -f "$tmp" "$f" 2>/dev/null || cp -f "$tmp" "$f"
-  printf '%s' "$active"
-}
-
-#=======================================================================================
-# ---- Process json list for downloads to pull ----
-#=======================================================================================
-
-# ---- Manifest Enqueue ----
-helpers_download_from_manifest() {
-  _helpers_need curl; _helpers_need jq; _helpers_need awk
-
-  [[ -n "${MODEL_MANIFEST_URL:-}" ]] || { echo "MODEL_MANIFEST_URL is not set." >&2; return 1; }
-
-  local MAN; MAN="$(mktemp)"
-  curl -fsSL "$MODEL_MANIFEST_URL" -o "$MAN" || { echo "Failed to fetch manifest: $MODEL_MANIFEST_URL" >&2; return 1; }
-
-  # build vars map (even if not used later, keep parity)
-  local VARS_JSON; VARS_JSON="$(helpers_build_vars_json "$MAN")" || return 1
-
-  # find enabled sections
-  local SECTIONS_ALL ENABLED sec dl_var
-  SECTIONS_ALL="$(jq -r '.sections | keys[]' "$MAN")"
-  ENABLED=()
-  while read -r sec; do
-    dl_var="download_${sec}"
-    if [[ "${!sec:-}" == "true" || "${!sec:-}" == "1" || "${!dl_var:-}" == "true" || "${!dl_var:-}" == "1" ]]; then
-      ENABLED+=("$sec")
-    fi
-  done <<<"$SECTIONS_ALL"
-  if ((${#ENABLED[@]}==0)); then
-    echo "No sections enabled. Available:"; echo "$SECTIONS_ALL" | sed 's/^/  - /'; return 0
-  fi
-  mapfile -t ENABLED < <(printf '%s\n' "${ENABLED[@]}" | awk '!seen[$0]++')
-
-  helpers_start_aria2_daemon || return 1
-
-  local any=0
-
-  for sec in "${ENABLED[@]}"; do
-    echo ">>> Enqueue section: $sec"
-
-    # Build the TSV *first* (no process substitution, no pipeline)
-    local tsv
-    tsv="$(
-      jq -r --arg sec "$sec" '
-        def as_obj:
-          if   type=="object" then {url:(.url//""), path:(.path // ((.dir // "") + (if .out then "/" + .out else "" end)))}
-          elif type=="array"  then {url:(.[0]//""), path:(.[1]//"")}
-          elif type=="string" then {url:., path:""}
-          else {url:"", path:""} end;
-        (.sections[$sec] // [])[] | as_obj | select(.url|length>0)
-        | [.url, (if (.path|length)>0 then .path else (.url|sub("^.*/";"")) end)] | @tsv
-      ' "$MAN"
-    )"
-
-    # Iterate tsv in the *current* shell (no subshell)
-    while IFS=$'\t' read -r url raw_path; do
-      [[ -z "$url" ]] && continue
-
-      # placeholder substitution -> destination path
-      local path dir out
-      path="$(helpers_resolve_placeholders "$raw_path")"
-      dir="$(dirname -- "$path")"; out="$(basename -- "$path")"
-      mkdir -p -- "$dir"
-
-      # skip if exists & looks complete
-      if [[ -f "$path" && ! -f "$path.aria2" ]]; then
-        echo " - ⏭️ SKIPPING: $out (safetensors file exists)" >&2
-        : $(( any+=0 ))
-        continue
-      fi
-
-      # enqueue
-      local resp gid
-      resp="$(helpers_rpc 'aria2.addUri' "$(jq -n --arg d "$dir" --arg o "$out" --arg u "$url" \
-        '[["\($u)"], {"dir": $d, "out": $o}]')")"
-
-      gid="$(jq -r '(.result // empty) // ""' <<<"$resp" 2>/dev/null)"
-      if [[ -n "$gid" ]]; then
-        echo " - 📥 Queue: $out" >&2
-        any=1
-        # Record gid for download tracking
-        : "${ARIA2_GID_FILE:=/tmp/.aria2_enqueued_gids}"
-        printf '%s\t%s\n' "$gid" "$out" >> "$ARIA2_GID_FILE"
-      else
-        echo "ERROR adding $url to the queue (addUri: $resp). Could be a bad token, bad URL etc. Please check the logs." >&2
-      fi
-    done <<<"$tsv"
-
-  done
-
-  echo "$any"
-}
-
-#=======================================================================================
-# ---- Single-shot status update ----
-#=======================================================================================
-
-helpers_show_status_update_once() {
-  local rows='[]'
-  while IFS=$'\t' read -r gid name; do
-    [[ -z "$gid" ]] && continue
-    local js; js="$(helpers_rpc 'aria2.tellStatus' "$(jq -nc --arg g "$gid" '[$g]')" 2>/dev/null || true)"
-    local one; one="$(jq -c --arg name "$name" '
-      .result as $t
-      | {
-          gid: ($t.gid // ""),
-          name: ($t.files[0].path | split("/") | last // $name),
-          completed: (($t.completedLength // "0")|tonumber),
-          total: (($t.totalLength // "0")|tonumber),
-          speed: (($t.downloadSpeed // "0")|tonumber),
-          status: ($t.status // "unknown")
-        }
-    ' <<<"$js" 2>/dev/null || echo '{}')"
-    rows="$(jq -c --argjson r "$one" '. + [$r]' <<<"$rows")"
-  done < <(helpers__read_gid_pairs || true)
-
-  ARIA2_PROGRESS_BAR_WIDTH="${ARIA2_PROGRESS_BAR_WIDTH:-40}" \
-  A="$rows" jq -r '
-    def hb($n):
-      if $n>=1099511627776 then "\((($n/1099511627776)|floor)) TB"
-      elif $n>=1073741824 then "\((($n/1073741824)|floor)) GB"
-      elif $n>=1048576 then "\((($n/1048576)|floor)) MB"
-      elif $n>=1024 then "\((($n/1024)|floor)) KB"
-      else "\($n) B" end;
-    def bar($pct; $W):
-      (($W*($pct/100.0))|floor) as $f
-      | "[" + ( (range(0;$f) | "#") + (range($f;$W) | "-") ) + "]";
-    (env.A // "[]") | fromjson
-    | sort_by(.name)
-    | .[] as $t
-    | ($t.total as $tot | if $tot > 0 then (100.0 * ($t.completed/$tot)) else 0 end) as $pct
-    | (env.ARIA2_PROGRESS_BAR_WIDTH|tonumber? // 40) as $W
-    | (bar($pct; $W)) as $B
-    | "\($t.name)\n  \($B) \((($pct*10)|round/10.0))%  \((hb($t.completed))) / \((if $t.total>0 then hb($t.total) else "?" end))  \((hb($t.speed)))/s  [\($t.status)]\n"
-  '
-}
-
-#=======================================================================================
-# ---- GID tracker/loop ----
-#=======================================================================================
-
-aria2_wait_by_gidfile() {
-  : "${ARIA2_PROGRESS_REFRESH:=15}"
-  : "${ARIA2_GID_FILE:=/tmp/.aria2_enqueued_gids}"
-
-  # Trap just for this loop
-  _trap_gids() {
-    echo "[trap (ARIA2)] SIGINT — pausing all current download sessions..." >&2
-    # fast path: pauseAll works even if new jobs were queued elsewhere
-    helpers_rpc 'aria2.pauseAll' '[]' >/dev/null 2>&1 || true
-    exit 130
-  }
-  trap _trap_gids INT TERM
-
-  while :; do
-
-    echo "================================================================================"
-    echo "=== Reporting downloads @ $(date '+%Y-%m-%d %H:%M:%S')"
-    echo "--------------------------------------------------------------------------------"
-
-    # show once
-    helpers_show_status_update_once 2>/dev/null || true
-
-    # prune and check active count
-    local active; active="$(helpers__prune_gids_and_count_active 2>/dev/null || echo 0)"
-    [[ "${ARIA2_GID_DEBUG:-0}" -eq 1 ]] && echo "--- Active GIDs: $active ---"
-    if [[ "$active" -eq 0 ]]; then
-      [[ "${ARIA2_GID_DEBUG:-0}" -eq 1 ]] && echo "[gid-watcher] no active GIDs — done."
-      break
-    fi
-
-    # ^C reliably interrupts wait
-    { sleep "$ARIA2_PROGRESS_REFRESH" & wait $!; } || true
-  done
-
-  trap - INT TERM
-}
-
-#=======================================================================================
-# ---- Main ARIA2 Spawn ----
-#=======================================================================================
-
-aria2_enqueue_and_wait_from_manifest() {
-  helpers_start_aria2_daemon || return 1
-
-  # clear previous gid file
-  : "${ARIA2_GID_FILE:=/tmp/.aria2_enqueued_gids}"
-  : > "$ARIA2_GID_FILE"
-
-  echo "================================================================================"
-  echo "==="
-  echo "=== Huggingface Model Downloader: Processing queuing @ $(date '+%Y-%m-%d %H:%M:%S') ==="
-  echo "==="
-
-  local any; any="$(helpers_download_from_manifest || echo 0)"
-  if [[ "$any" == "0" ]]; then
-    echo "=== Nothing enqueued. Exiting without starting progress loop."
-    return 0
-  fi
-
-  local _refresh="${ARIA2_PROGRESS_REFRESH:-15}"
-
-  echo ""
-  echo "=== Starting progress loop (refresh every ${_refresh}s)..."
-  echo "==="
-
-  aria2_wait_by_gidfile
-
-}
-
-#=======================================================================================
-#
-# ---------- Section 6: CivitAI ID downloader helpers ----------
-#
-#=======================================================================================
-
-# Env it uses (override in .env):
-: "${CHECKPOINT_IDS_TO_DOWNLOAD:=}"     # e.g. "12345, 67890, 23422:i2v"
-: "${LORAS_IDS_TO_DOWNLOAD:=}"          # e.g. "abc, def ghi"
-: "${CIVITAI_LOG_DIR:=${COMFY_LOGS:-/workspace/logs}/civitai}"
-
-#---------------------------------------------------------------------------------------
-
-# =========================
-# CivitAI (clean slate RPC)
-# =========================
-# Env:
-#   CIVITAI_TOKEN                 (required for private/limited files; optional for public)
-#   LORAS_IDS_TO_DOWNLOAD         e.g. "2361379, 234567"
-#   CHECKPOINT_IDS_TO_DOWNLOAD    e.g. "1234567 7654321"
-#   COMFY_HOME                    default: /workspace/ComfyUI
-#   CIVITAI_DEBUG=1               verbose
-#   CIVITAI_PROBE=0|1             1-byte probe before enqueue (default: 1)
-#
-# Requires (already present in your stack):
-#   helpers_rpc_add_uri, helpers_have_aria2_rpc, helpers_start_aria2_daemon,
-#   helpers_progress_snapshot_loop, aria2_clear_results, aria2_stop_all
-
-# Keep ASCII-ish, tool-friendly names that Comfy pickers like.
-# Rules:
-# - strip straight/curly quotes
-# - collapse whitespace -> _
-# - ()[]{} -> __
-# - remove anything not [A-Za-z0-9._-] -> _
-# - collapse multiple _ -> single _
-# - trim leading/trailing _
-# - preserve/normalize extension case
 
 # --- raw JSON-RPC POST helper (the function your code calls) ---
 helpers_rpc_post() {
@@ -1112,6 +768,346 @@ helpers_progress_snapshot_loop() {
     sleep "$interval"
   done
 }
+
+helpers_progress_snapshot_once() {
+  : "${ARIA2_HOST:=127.0.0.1}"; : "${ARIA2_PORT:=6969}"; : "${ARIA2_SECRET:=KissMeQuick}"
+  : "${ARIA2_PROGRESS_MAX:=999}"
+
+  local body resp
+  body="$(jq -cn --arg t "token:$ARIA2_SECRET" \
+    '{jsonrpc:"2.0",id:"A",method:"aria2.tellActive",params:[$t]},
+     {jsonrpc:"2.0",id:"W",method:"aria2.tellWaiting",params:[$t,0,1000]},
+     {jsonrpc:"2.0",id:"S",method:"aria2.tellStopped",params:[$t,0,200]}' )"
+  resp="$(curl -fsS "http://$ARIA2_HOST:$ARIA2_PORT/jsonrpc" -H 'Content-Type: application/json' --data-binary "$body" 2>/dev/null)" || {
+    echo "=== aria2 progress @ $(date '+%Y-%m-%d %H:%M:%S') ==="
+    echo "Active downloads: 0"; echo "--------------------------------------------------------------------------------"
+    echo "Group total: speed 0 B/s, done 0 B / 0 B"
+    return 0
+  }
+
+  # Slurp stream into array, then pick by id
+  local active waiting stopped
+  active="$(jq -c -sr '[.[]
+     | select(.id=="A").result
+     | .[] ]' <<<"$resp")"
+  waiting="$(jq -c -sr '[.[]
+     | select(.id=="W").result
+     | .[] ]' <<<"$resp")"
+  stopped="$(jq -c -sr '[.[]
+     | select(.id=="S").result
+     | .[] ]' <<<"$resp")"
+
+  local merged; merged="$(jq -c --argjson a "$active" --argjson w "$waiting" '$a+$w')" || merged='[]'
+  local count; count="$(jq -r 'length' <<<"$merged")"
+
+  echo "================================================================================"
+  echo "=== Huggingface Model Downloader: aria2 progress @ $(date '+%Y-%m-%d %H:%M:%S') ==="
+  echo "==="; 
+  echo "=== Active downloads: $count"; echo "--------------------------------------------------------------------------------"
+
+  if (( count == 0 )); then
+    echo "Group total: speed 0 B/s, done 0 B / 0 B"
+    return 0
+  fi
+
+  mapfile -t names < <(jq -r '.[] | (.files[0].path // .bittorrent.info.name // .infoHash // .gid // "unknown") | split("/") | last' <<<"$merged")
+  mapfile -t dirs  < <(jq -r '.[] | (.files[0].path // "") | split("/") | .[0:-1] | join("/")' <<<"$merged")
+  mapfile -t sizes < <(jq -r '.[] | (.totalLength // 0)' <<<"$merged")
+  mapfile -t dones < <(jq -r '.[] | (.completedLength // 0)' <<<"$merged")
+  mapfile -t speeds< <(jq -r '.[] | (.downloadSpeed // 0)' <<<"$merged")
+
+  local i max="$ARIA2_PROGRESS_MAX"
+  for ((i=0; i<count && i<max; i++)); do
+    local tot="${sizes[i]:-0}" done="${dones[i]:-0}" spd="${speeds[i]:-0}" pct=0
+    (( tot > 0 )) && pct=$(( done*100/tot ))
+    local bars=$(( (pct*40)/100 )) bar line
+    printf -v bar '%*s' "$bars" ''; bar=${bar// /#}
+    printf -v line '%-40s' "$bar"
+
+    local dir="${dirs[i]:-.}"
+    [[ -n "${COMFY:-}" && "$dir" == "$COMFY"* ]] && dir="${dir#$COMFY/}"
+
+    printf " %3d%% [%s] %4s/s  (%s / %s)  [ Destination -> %s ] %s\n" \
+      "$pct" "$line" \
+      "$(helpers_human_bytes "$spd")" \
+      "$(helpers_human_bytes "$done")" \
+      "$(helpers_human_bytes "$tot")" \
+      "$dir" \
+      "${names[i]}"
+  done
+
+  local total_done total_size total_speed
+  total_done="$(jq -r '[.[]|(.completedLength//0)]|add' <<<"$merged")"
+  total_size="$(jq -r '[.[]|(.totalLength//0)]|add'    <<<"$merged")"
+  total_speed="$(jq -r '[.[]|(.downloadSpeed//0)]|add' <<<"$merged")"
+  echo "--------------------------------------------------------------------------------"
+  printf "Group total: speed %s/s, done %s / %s\n" \
+    "$(helpers_human_bytes "$total_speed")" \
+    "$(helpers_human_bytes "$total_done")" \
+    "$(helpers_human_bytes "$total_size")"
+}
+
+# Print aligned "Completed (this session)" block from a list of "name<TAB>relpath<TAB>size"
+helpers_print_completed_block() {
+  local lines=("$@")
+  [[ ${#lines[@]} -eq 0 ]] && return 0
+
+  local maxlen=0
+  local name relpath size
+  # find longest name
+  for row in "${lines[@]}"; do
+    IFS=$'\t' read -r name relpath size <<<"$row"
+    (( ${#name} > maxlen )) && maxlen=${#name}
+  done
+
+  echo
+  echo "Completed (this session)"
+  echo "--------------------------------------------------------------------------------"
+  for row in "${lines[@]}"; do
+    IFS=$'\t' read -r name relpath size <<<"$row"
+    printf "✔ %-*s  %s  (%s)\n" "$maxlen" "$name" "$relpath" "$size"
+  done
+}
+
+#-----------------------------------------------------------------------
+#--
+#-- Manifest parser helpers --
+#--
+
+# Replace {VAR} tokens using current environment.
+# - If the input parses as JSON, walk string leaves and substitute via jq+env.
+# - Otherwise, do fast pure-Bash substitution on the plain string.
+helpers_resolve_placeholders() {
+  _helpers_need jq
+  local raw="$1"
+
+  # If it's valid JSON, use jq path
+  if printf '%s' "$raw" | jq -e . >/dev/null 2>&1; then
+    jq -nr -r --arg RAW "$raw" '
+      def subst_env($text):
+        reduce (env | to_entries[]) as $e ($text;
+          gsub("\\{" + ($e.key|tostring) + "\\}"; ($e.value|tostring))
+        );
+      def walk_strings(f):
+        if type == "object" then
+          with_entries(.value |= ( . | walk_strings(f) ))
+        elif type == "array" then
+          map( walk_strings(f) )
+        elif type == "string" then
+          f
+        else
+          .
+        end;
+
+      ($RAW | fromjson)                          # safe: we just validated it parses
+      | walk_strings( subst_env(.) )
+      | tojson
+    '
+    return
+  fi
+
+  # Plain string: Bash token replace {NAME} -> $NAME (leaves unknown as-is)
+  local s="$raw" key val
+  # Replace all tokens that look like {VARNAME}
+  while [[ $s =~ \{([A-Za-z_][A-Za-z0-9_]*)\} ]]; do
+    key="${BASH_REMATCH[1]}"
+    val="${!key}"                        # indirect expansion
+    # If not set, keep token as-is (comment next line & uncomment the one after if you want them to disappear)
+    [[ -z ${!key+x} ]] && val="{$key}"
+    s="${s//\{$key\}/$val}"
+  done
+  printf '%s\n' "$s"
+}
+
+# Build a JSON object of vars+paths from manifest + UPPERCASE env vars
+helpers_build_vars_json() {
+  _helpers_need jq
+  local man="$1"
+  # Start with vars+paths from the manifest
+  local base
+  base="$(jq -n --slurpfile m "$man" '
+    ($m[0].vars  // {}) as $v |
+    ($m[0].paths // {}) as $p |
+    ($v + $p)
+  ')" || return 1
+
+  # Merge UPPERCASE environment as *strings* (never --argjson)
+  while IFS='=' read -r k v; do
+    [[ "$k" =~ ^[A-Z0-9_]+$ ]] || continue
+    base="$(jq --arg k "$k" --arg v "$v" '. + {($k): $v}' <<<"$base")"
+  done < <(env)
+
+  printf '%s' "$base"
+}
+
+# Enqueue one URL/path pair from manifest
+# - Resolves {PLACEHOLDERS} in 'raw_path' to get the final 'out' filename and 'dir'
+helpers_manifest_enqueue_one() {
+  local url="$1" raw_path="$2"
+  local path dir out resp gid
+  path="$(helpers_resolve_placeholders "$raw_path")" || return 1
+  dir="$(dirname -- "$path")"; out="$(basename -- "$path")"
+  mkdir -p -- "$dir"
+
+  # skip if completed file exists and no partial
+  if [[ -f "$path" && ! -f "$path.aria2" ]]; then
+    echo " - ⏭️ SKIPPING: $out (safetensors file exists)" >&2
+    return 0
+  fi
+
+  local gid
+  gid="$(helpers_rpc_add_uri "$url" "$dir" "$out" "")"
+  if [[ -n "$gid" ]]; then
+    echo " - 📥 Queue: $out" >&2
+    return 0
+  else
+    echo "ERROR adding $url to the queue (addUri: $resp). Could be a bad token, bad URL etc. Please check the logs." >&2
+    return 1
+  fi
+}
+
+#-----------------------------------------------------------------------
+# ---- Process json list for downloads to pull ----
+
+# ---- Manifest Enqueue ----
+helpers_download_from_manifest() {
+  _helpers_need curl; _helpers_need jq; _helpers_need awk
+
+  [[ -n "${MODEL_MANIFEST_URL:-}" ]] || { echo "MODEL_MANIFEST_URL is not set." >&2; return 1; }
+
+  local MAN; MAN="$(mktemp)"
+  curl -fsSL "$MODEL_MANIFEST_URL" -o "$MAN" || { echo "Failed to fetch manifest: $MODEL_MANIFEST_URL" >&2; return 1; }
+
+  # build vars map (even if not used later, keep parity)
+  local VARS_JSON; VARS_JSON="$(helpers_build_vars_json "$MAN")" || return 1
+
+  # find enabled sections
+  local SECTIONS_ALL ENABLED sec dl_var
+  SECTIONS_ALL="$(jq -r '.sections | keys[]' "$MAN")"
+  ENABLED=()
+  while read -r sec; do
+    dl_var="download_${sec}"
+    if [[ "${!sec:-}" == "true" || "${!sec:-}" == "1" || "${!dl_var:-}" == "true" || "${!dl_var:-}" == "1" ]]; then
+      ENABLED+=("$sec")
+    fi
+  done <<<"$SECTIONS_ALL"
+  if ((${#ENABLED[@]}==0)); then
+    echo "No sections enabled. Available:"; echo "$SECTIONS_ALL" | sed 's/^/  - /'; return 0
+  fi
+  mapfile -t ENABLED < <(printf '%s\n' "${ENABLED[@]}" | awk '!seen[$0]++')
+
+  helpers_start_aria2_daemon || return 1
+
+  local any=0
+
+  for sec in "${ENABLED[@]}"; do
+    echo ">>> Enqueue section: $sec"
+
+    # Build the TSV *first* (no process substitution, no pipeline)
+    local tsv
+    tsv="$(
+      jq -r --arg sec "$sec" '
+        def as_obj:
+          if   type=="object" then {url:(.url//""), path:(.path // ((.dir // "") + (if .out then "/" + .out else "" end)))}
+          elif type=="array"  then {url:(.[0]//""), path:(.[1]//"")}
+          elif type=="string" then {url:., path:""}
+          else {url:"", path:""} end;
+        (.sections[$sec] // [])[] | as_obj | select(.url|length>0)
+        | [.url, (if (.path|length)>0 then .path else (.url|sub("^.*/";"")) end)] | @tsv
+      ' "$MAN"
+    )"
+
+    # Iterate tsv in the *current* shell (no subshell)
+    while IFS=$'\t' read -r url raw_path; do
+      # unified enqueue -> records gid via helpers_rpc_add_uri
+      helpers_manifest_enqueue_one "$url" "$raw_path" && any=1
+    done <<<"$tsv"
+
+  done
+
+  echo "$any"
+}
+
+#=======================================================================================
+# ---- Main ARIA2 Spawn ----
+#=======================================================================================
+
+aria2_enqueue_and_wait_from_manifest() {
+  aria2_clear_results >/dev/null 2>&1 || true
+  helpers_have_aria2_rpc || helpers_start_aria2_daemon
+
+  local trapped=0
+  _cleanup_trap_manifest() {
+    (( trapped )) && return 0
+    trapped=1
+    echo; echo "⚠️  Interrupted — stopping queue and cleaning results…"
+    aria2_stop_all >/dev/null 2>&1 || true
+    aria2_clear_results >/dev/null 2>&1 || true
+    return 130
+  }
+  trap _cleanup_trap_manifest INT TERM
+
+  echo "================================================================================"
+  echo "==="
+  echo "=== Huggingface Model Downloader: Processing queuing @ $(date '+%Y-%m-%d %H:%M:%S') ==="
+  echo "==="
+
+  local any; any="$(helpers_download_from_manifest || echo 0)"
+  if [[ "$any" != "1" ]]; then
+    echo "Nothing to enqueue from json manifest."
+    trap - INT TERM
+    return 0
+  fi
+
+  # Loop while data is being processed
+  helpers_progress_snapshot_loop \
+    "${ARIA2_PROGRESS_INTERVAL:-15}" \
+    "${ARIA2_PROGRESS_BAR_WIDTH:-40}" \
+    "${COMFY_LOGS:-/workspace/logs}/aria2_progress.log"
+
+  aria2_clear_results >/dev/null 2>&1 || true
+  trap - INT TERM
+  return 0
+}
+
+#=======================================================================================
+#
+# ---------- Section 6: CivitAI ID downloader helpers ----------
+#
+#=======================================================================================
+
+# Env it uses (override in .env):
+: "${CHECKPOINT_IDS_TO_DOWNLOAD:=}"     # e.g. "12345, 67890, 23422:i2v"
+: "${LORAS_IDS_TO_DOWNLOAD:=}"          # e.g. "abc, def ghi"
+: "${CIVITAI_LOG_DIR:=${COMFY_LOGS:-/workspace/logs}/civitai}"
+
+#---------------------------------------------------------------------------------------
+
+# =========================
+# CivitAI (clean slate RPC)
+# =========================
+# Env:
+#   CIVITAI_TOKEN                 (required for private/limited files; optional for public)
+#   LORAS_IDS_TO_DOWNLOAD         e.g. "2361379, 234567"
+#   CHECKPOINT_IDS_TO_DOWNLOAD    e.g. "1234567 7654321"
+#   COMFY_HOME                    default: /workspace/ComfyUI
+#   CIVITAI_DEBUG=1               verbose
+#   CIVITAI_PROBE=0|1             1-byte probe before enqueue (default: 1)
+#
+# Requires:
+#   helpers_human_bytes, helpers_start_aria2_daemon,
+#   helpers_rpc_add_uri, helpers_have_aria2_rpc, helpers_start_aria2_daemon,
+#   helpers_progress_snapshot_loop, aria2_clear_results, aria2_stop_all
+
+# Keep ASCII-ish, tool-friendly names that Comfy pickers like.
+# Rules:
+# - strip straight/curly quotes
+# - collapse whitespace -> _
+# - ()[]{} -> __
+# - remove anything not [A-Za-z0-9._-] -> _
+# - collapse multiple _ -> single _
+# - trim leading/trailing _
+# - preserve/normalize extension case
 
 helpers_sanitize_basename() {
   local in="$1"
@@ -1276,106 +1272,6 @@ helpers_civitai_postprocess_dir() {
           mv -f -- "$moved" "$junk/"
         fi
       done
-}
-
-helpers_progress_snapshot_once() {
-  : "${ARIA2_HOST:=127.0.0.1}"; : "${ARIA2_PORT:=6969}"; : "${ARIA2_SECRET:=KissMeQuick}"
-  : "${ARIA2_PROGRESS_MAX:=999}"
-
-  local body resp
-  body="$(jq -cn --arg t "token:$ARIA2_SECRET" \
-    '{jsonrpc:"2.0",id:"A",method:"aria2.tellActive",params:[$t]},
-     {jsonrpc:"2.0",id:"W",method:"aria2.tellWaiting",params:[$t,0,1000]},
-     {jsonrpc:"2.0",id:"S",method:"aria2.tellStopped",params:[$t,0,200]}' )"
-  resp="$(curl -fsS "http://$ARIA2_HOST:$ARIA2_PORT/jsonrpc" -H 'Content-Type: application/json' --data-binary "$body" 2>/dev/null)" || {
-    echo "=== aria2 progress @ $(date '+%Y-%m-%d %H:%M:%S') ==="
-    echo "Active downloads: 0"; echo "--------------------------------------------------------------------------------"
-    echo "Group total: speed 0 B/s, done 0 B / 0 B"
-    return 0
-  }
-
-  # Slurp stream into array, then pick by id
-  local active waiting stopped
-  active="$(jq -c -sr '[.[]
-     | select(.id=="A").result
-     | .[] ]' <<<"$resp")"
-  waiting="$(jq -c -sr '[.[]
-     | select(.id=="W").result
-     | .[] ]' <<<"$resp")"
-  stopped="$(jq -c -sr '[.[]
-     | select(.id=="S").result
-     | .[] ]' <<<"$resp")"
-
-  local merged; merged="$(jq -c --argjson a "$active" --argjson w "$waiting" '$a+$w')" || merged='[]'
-  local count; count="$(jq -r 'length' <<<"$merged")"
-
-  echo "================================================================================"
-  echo "=== Huggingface Model Downloader: aria2 progress @ $(date '+%Y-%m-%d %H:%M:%S') ==="
-  echo "==="; 
-  echo "=== Active downloads: $count"; echo "--------------------------------------------------------------------------------"
-
-  if (( count == 0 )); then
-    echo "Group total: speed 0 B/s, done 0 B / 0 B"
-    return 0
-  fi
-
-  mapfile -t names < <(jq -r '.[] | (.files[0].path // .bittorrent.info.name // .infoHash // .gid // "unknown") | split("/") | last' <<<"$merged")
-  mapfile -t dirs  < <(jq -r '.[] | (.files[0].path // "") | split("/") | .[0:-1] | join("/")' <<<"$merged")
-  mapfile -t sizes < <(jq -r '.[] | (.totalLength // 0)' <<<"$merged")
-  mapfile -t dones < <(jq -r '.[] | (.completedLength // 0)' <<<"$merged")
-  mapfile -t speeds< <(jq -r '.[] | (.downloadSpeed // 0)' <<<"$merged")
-
-  local i max="$ARIA2_PROGRESS_MAX"
-  for ((i=0; i<count && i<max; i++)); do
-    local tot="${sizes[i]:-0}" done="${dones[i]:-0}" spd="${speeds[i]:-0}" pct=0
-    (( tot > 0 )) && pct=$(( done*100/tot ))
-    local bars=$(( (pct*40)/100 )) bar line
-    printf -v bar '%*s' "$bars" ''; bar=${bar// /#}
-    printf -v line '%-40s' "$bar"
-
-    local dir="${dirs[i]:-.}"
-    [[ -n "${COMFY:-}" && "$dir" == "$COMFY"* ]] && dir="${dir#$COMFY/}"
-
-    printf " %3d%% [%s] %4s/s  (%s / %s)  [ Destination -> %s ] %s\n" \
-      "$pct" "$line" \
-      "$(helpers_human_bytes "$spd")" \
-      "$(helpers_human_bytes "$done")" \
-      "$(helpers_human_bytes "$tot")" \
-      "$dir" \
-      "${names[i]}"
-  done
-
-  local total_done total_size total_speed
-  total_done="$(jq -r '[.[]|(.completedLength//0)]|add' <<<"$merged")"
-  total_size="$(jq -r '[.[]|(.totalLength//0)]|add'    <<<"$merged")"
-  total_speed="$(jq -r '[.[]|(.downloadSpeed//0)]|add' <<<"$merged")"
-  echo "--------------------------------------------------------------------------------"
-  printf "Group total: speed %s/s, done %s / %s\n" \
-    "$(helpers_human_bytes "$total_speed")" \
-    "$(helpers_human_bytes "$total_done")" \
-    "$(helpers_human_bytes "$total_size")"
-}
-
-# Print aligned "Completed (this session)" block from a list of "name<TAB>relpath<TAB>size"
-helpers_print_completed_block() {
-  local lines=("$@")
-  [[ ${#lines[@]} -eq 0 ]] && return 0
-
-  local maxlen=0
-  local name relpath size
-  # find longest name
-  for row in "${lines[@]}"; do
-    IFS=$'\t' read -r name relpath size <<<"$row"
-    (( ${#name} > maxlen )) && maxlen=${#name}
-  done
-
-  echo
-  echo "Completed (this session)"
-  echo "--------------------------------------------------------------------------------"
-  for row in "${lines[@]}"; do
-    IFS=$'\t' read -r name relpath size <<<"$row"
-    printf "✔ %-*s  %s  (%s)\n" "$maxlen" "$name" "$relpath" "$size"
-  done
 }
 
 # --- ID parsing: "1,2  3,,4" -> "1 2 3 4" (numbers only), drop placeholders
