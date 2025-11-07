@@ -1037,6 +1037,8 @@ aria2_enqueue_and_wait_from_manifest() {
     return 0
   fi
 
+  # … your queue header and call to helpers_download_from_manifest …
+
   local _refresh="${ARIA2_PROGRESS_REFRESH:-5}"
   : "${ARIA2_PROGRESS_BAR_WIDTH:=40}"
 
@@ -1108,12 +1110,11 @@ aria2_enqueue_and_wait_from_manifest() {
     { sleep "$_refresh" & wait $!; } || true
   done
 
-  # restore stricter mode
+  # restore stricter mode if you want it later
   set -e
   trap - INT TERM
   return 0
 }
-
 #=======================================================================================
 #
 # ---------- Section 6: CivitAI ID downloader helpers ----------
