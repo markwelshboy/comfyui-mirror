@@ -600,22 +600,26 @@ helpers_human_bytes() { # bytes -> human
 helpers_resolve_placeholders() {
   _helpers_need jq
   local raw="$1" ; local map_json="$2"
-  jq -c --argjson MAP "$map_json" '
-  def subst_all($m):
-    reduce ($m | to_entries[]) as $e (.;
-      gsub("\\{" + ($e.key|tostring) + "\\}"; ($e.value|tostring))
-    );
+  # Pass the map as a *string* so we can fromjson? inside jq without crashing
+  jq -nr --arg s "$raw" --arg MAP "$map_json" '
+    # Parse env-provided MAP; if it is not valid JSON, fall back to {}
+    ( $MAP | fromjson? ) as $M
+    | ( $M // {} ) as $M
 
-  def walk(f):
-    . as $in
-    | if type == "object" then
-        with_entries(.value |= walk(f))
-      elif type == "array" then
-        map(walk(f))
-      else f
-      end;
+    # Replace all tokens {KEY} where KEY is an exact key in $M (no regex backrefs)
+    def subst_all($text; $m):
+      reduce ($m | to_entries[]) as $e ($text;
+        gsub("\\{" + ($e.key|tostring) + "\\}"; ($e.value|tostring))
+      );
 
-  walk(if type=="string" then subst_all($MAP) else . end)
+    # If input isn’t a string, just return it
+    $s
+    |
+    if type == "string" then
+      subst_all(.; $M)
+    else
+      .
+    end
   '
 }
 
@@ -671,10 +675,11 @@ helpers_rpc_post() {
   : "${ARIA2_HOST:=127.0.0.1}" "${ARIA2_PORT:=6969}"
   curl -sS "http://${ARIA2_HOST}:${ARIA2_PORT}/jsonrpc" \
        -H 'Content-Type: application/json' \
-       --data-binary "${1:-{}}" || true
+       --data-binary "${1:-{}}" \
+       || true
 }
 
-# --- quick ping (used by aria2_clear_results) ---
+# ---- ping ----
 helpers_rpc_ping() {
   : "${ARIA2_HOST:=127.0.0.1}" "${ARIA2_PORT:=6969}" "${ARIA2_SECRET:=KissMeQuick}"
   curl -fsS "http://${ARIA2_HOST}:${ARIA2_PORT}/jsonrpc" \
@@ -976,26 +981,19 @@ aria2_enqueue_and_wait_from_manifest() {
     echo "=== Active downloads: $cnt"
     echo "--------------------------------------------------------------------------------"
     A="$act" jq -r '
-      # helper: human bytes
+      # human bytes
       def hb($n):
-        if ($n // 0) >= 1099511627776 then
-          ((($n // 0) / 1099511627776)|floor|tostring) + " TB"
-        elif ($n // 0) >= 1073741824 then
-          ((($n // 0) / 1073741824)|floor|tostring) + " GB"
-        elif ($n // 0) >= 1048576 then
-          ((($n // 0) / 1048576)|floor|tostring) + " MB"
-        elif ($n // 0) >= 1024 then
-          ((($n // 0) / 1024)|floor|tostring) + " KB"
-        else
-          (($n // 0)|tostring) + " B"
-        end ;
+        if ($n // 0) >= 1099511627776 then ((($n // 0) / 1099511627776)|floor|tostring) + " TB"
+        elif ($n // 0) >= 1073741824 then  ((($n // 0) / 1073741824 )|floor|tostring) + " GB"
+        elif ($n // 0) >= 1048576    then  ((($n // 0) / 1048576   )|floor|tostring) + " MB"
+        elif ($n // 0) >= 1024       then  ((($n // 0) / 1024      )|floor|tostring) + " KB"
+        else (($n // 0)|tostring) + " B" end;
 
-      # helper: ascii progress bar of width w
-      def bar($pct; $w):
-        ( ($w * ($pct / 100.0)) | floor ) as $f
-        | "[" + ( (range(0;$f) | "#") + (range($f;$w) | " ") ) + "]" ;
+      # ascii progress bar of width W
+      def bar($pct; $W):
+        (($W * ($pct/100.0))|floor) as $f
+        | "[" + ( (range(0;$f) | "#") + (range($f;$W) | "-") ) + "]";
 
-      # A is an env var containing JSON array from aria2.tellActive
       (env.A // "[]") | fromjson
       | .[]? as $t
       | ($t.completedLength|tonumber)   as $done
@@ -1007,10 +1005,11 @@ aria2_enqueue_and_wait_from_manifest() {
         else
           {"dir":"", "name":($t.bittorrent.info.name? // $t.infoHash // "unknown")}
         end) as $p
-      | ($tot | if .>0 then ((100.0 * $done) / .) else 0 end) as $pct
+      | ($tot | if .>0 then (100.0 * $done / .) else 0 end) as $pct
       | ($pct | if .>100 then 100 elif .<0 then 0 else . end) as $pc
-      | (bar($pc; (env.ARIA2_PROGRESS_BAR_WIDTH|tonumber? // 40))) as $B
-      | "\($p.name)\n  [\($B)] \((($pc*10)|round/10.0))%  \((hb($done))) / \((if $tot>0 then hb($tot) else "?" end))  \((hb($spd)))/s\n"
+      | (env.ARIA2_PROGRESS_BAR_WIDTH|tonumber? // 40) as $W
+      | (bar($pc; $W)) as $B
+      | "\($p.name)\n  \($B) \((($pc*10)|round/10.0))%  \((hb($done))) / \((if $tot>0 then hb($tot) else "?" end))  \((hb($spd)))/s\n"
     '
 
     echo "--------------------------------------------------------------------------------"
