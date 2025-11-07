@@ -800,22 +800,41 @@ helpers_progress_snapshot_once() {
     echo "--------------------------------------------------------------------------------"
     return 0
   }
-  echo "Never Get Here"
 
-  # Slurp stream into array, then pick by id
+  # Slurp stream into arrays by id, coalescing to [] safely
+  # - With -s (slurp), jq receives an *array* of the three replies
+  # - We pick .result by id and "add" them into one flat array
+  # - The // [] ensures we never get null, and the final add // [] ensures valid []
   local active waiting stopped
-  active="$(jq -c -sr '[.[]
-     | select(.id=="A").result
-     | .[] ]' <<<"$resp")"
-  waiting="$(jq -c -sr '[.[]
-     | select(.id=="W").result
-     | .[] ]' <<<"$resp")"
-  stopped="$(jq -c -sr '[.[]
-     | select(.id=="S").result
-     | .[] ]' <<<"$resp")"
 
-  local merged; merged="$(jq -c --argjson a "$active" --argjson w "$waiting" '$a+$w')" || merged='[]'
-  local count; count="$(jq -r 'length' <<<"$merged")"
+  active="$(
+    jq -c -sr '
+      map(select(.id=="A") | (.result // [])) | add // []
+    ' <<< "$resp" 2>/dev/null
+  )"
+  waiting="$(
+    jq -c -sr '
+      map(select(.id=="W") | (.result // [])) | add // []
+    ' <<< "$resp" 2>/dev/null
+  )"
+  stopped="$(
+    jq -c -sr '
+      map(select(.id=="S") | (.result // [])) | add // []
+    ' <<< "$resp" 2>/dev/null
+  )"
+
+  # absolute safety: if any var is empty string, force it to []
+  [[ -z "$active"  ]]  && active='[]'
+  [[ -z "$waiting" ]]  && waiting='[]'
+  [[ -z "$stopped" ]]  && stopped='[]'
+
+  # Merge active+waiting safely
+  local merged
+  merged="$(jq -c --argjson a "$active" --argjson w "$waiting" '$a + $w')" || merged='[]'
+
+  # Count without crashing if something still went weird
+  local count
+  count="$(jq -r 'length' <<<"$merged" 2>/dev/null || echo 0)"
   
   echo "================================================================================"
   echo "=== Huggingface Model Downloader: aria2 progress @ $(date '+%Y-%m-%d %H:%M:%S') ==="
@@ -1076,7 +1095,9 @@ aria2_enqueue_and_wait_from_manifest() {
     trap - INT TERM
     return 0
   fi
-
+  
+  # Let something start downloading
+  sleep 2
   # Loop while data is being processed
   helpers_progress_snapshot_loop \
     "${ARIA2_PROGRESS_INTERVAL:-15}" \
