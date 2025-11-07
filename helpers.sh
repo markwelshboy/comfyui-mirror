@@ -759,26 +759,14 @@ helpers_queue_empty() {
 
 # ---- Foreground progress with trap ----
 helpers_progress_snapshot_loop() {
-  #local interval="${1:-10}" log="${3:-/workspace/logs/aria2_progress.log}"
-  #mkdir -p "$(dirname "$log")"
-  #while true; do
-  #  helpers_progress_snapshot_once | tee -a "$log"
-  #  # Exit when both active and waiting are empty
-  #  if helpers_queue_empty; then break; fi
-  #  sleep "$interval"
-  #done
   local interval="${1:-10}" log="${3:-/workspace/logs/aria2_progress.log}"
   mkdir -p "$(dirname "$log")"
-  local tick=0
   while true; do
-    echo "--- tick $tick ---"                    # <-- add this
     helpers_progress_snapshot_once | tee -a "$log"
-    ((tick++))
     if helpers_queue_empty; then break; fi
     sleep "$interval" &
     wait $!                                   # <-- allows ^C to hit the shell, not a pipe
   done
-
 }
 
 helpers_progress_snapshot_once() {
@@ -822,6 +810,8 @@ helpers_progress_snapshot_once() {
 
   # Merge active + waiting (must use -n so jq doesn't read stdin)
   merged="$(jq -c -n --argjson a "$active" --argjson w "$waiting" '$a + $w')" || merged='[]'
+
+  # Count safely
   count="$(jq -r 'length' <<<"$merged" 2>/dev/null || echo 0)"
 
   echo "================================================================================"
@@ -862,9 +852,9 @@ helpers_progress_snapshot_once() {
   done
 
   local total_done total_size total_speed
-  total_done="$(jq -r '[.[]|(.completedLength//0)]|add' <<<"$merged")"
-  total_size="$(jq -r '[.[]|(.totalLength//0)]|add'    <<<"$merged")"
-  total_speed="$(jq -r '[.[]|(.downloadSpeed//0)]|add' <<<"$merged")"
+  total_done="$(jq -r '[.[] | ((.completedLength // "0") | tonumber)] | add' <<<"$merged" 2>/dev/null || echo 0)"
+  total_size="$(jq -r '[.[] | ((.totalLength    // "0") | tonumber)] | add' <<<"$merged" 2>/dev/null || echo 0)"
+  total_speed="$(jq -r '[.[] | ((.downloadSpeed // "0") | tonumber)] | add' <<<"$merged" 2>/dev/null || echo 0)"
   echo "--------------------------------------------------------------------------------"
   printf "Group total: speed %s/s, done %s / %s\n" \
     "$(helpers_human_bytes "$total_speed")" \
