@@ -589,6 +589,8 @@ push_bundle_if_requested() {
 
 mkdir -p "$COMFY_LOGS" "$COMFY/models" >/dev/null 2>&1 || true
 
+_helpers_need() { command -v "$1" >/dev/null || { echo "Missing $1" >&2; exit 1; }; }
+
 # ---- tiny utils ----
 helpers_human_bytes() { # bytes -> human
   local b=${1:-0} d=0 unit=Bytes
