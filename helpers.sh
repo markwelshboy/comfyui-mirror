@@ -1001,7 +1001,7 @@ helpers_download_from_manifest() {
         # Parse gid (handles both `"result": "...gid..."` and error objects)
         gid="$(jq -r '(.result // empty) // ""' <<<"$resp" 2>/dev/null)"
         if [[ -n "$gid" ]]; then
-          echo "📥 Queue: $out  (gid: $gid)"
+          echo "📥 Queue: $out  (gid: $gid)" >&2
           any=1
         else
           # Surface the error in full so we can see *why* (bad token, bad URL, etc.)
