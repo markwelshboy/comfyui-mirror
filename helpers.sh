@@ -601,26 +601,40 @@ helpers_human_bytes() { # bytes -> human
 
 helpers_resolve_placeholders() {
   _helpers_need jq
-  local raw="$1" ; local map_json="$2"
-  # Pass the map as a *string* so we can fromjson? inside jq without crashing
-  jq -nr --arg s "$raw" --arg MAP "$map_json" '
-    # Parse env-provided MAP; if it is not valid JSON, fall back to {}
-    ( $MAP | fromjson? ) as $M
-    | ( $M // {} ) as $M
+  local raw="$1"        # input string or JSON
+  local map_json="$2"   # JSON string of key->value map
 
-    # Replace all tokens {KEY} where KEY is an exact key in $M (no regex backrefs)
+  jq -nr --arg RAW "$raw" --arg MAP "$map_json" '
+    # ---- defs must precede any filters ----
     def subst_all($text; $m):
       reduce ($m | to_entries[]) as $e ($text;
         gsub("\\{" + ($e.key|tostring) + "\\}"; ($e.value|tostring))
       );
 
-    # If input isn’t a string, just return it
-    $s
+    def walk_strings(f):
+      if type == "object" then
+        with_entries(.value |= ( . | walk_strings(f) ))
+      elif type == "array" then
+        map( walk_strings(f) )
+      elif type == "string" then
+        f
+      else
+        .
+      end;
+
+    # ---- program ----
+    # parse MAP safely
+    ($MAP | fromjson? // {}) as $M
     |
-    if type == "string" then
-      subst_all(.; $M)
+    # Try to parse RAW as JSON; if that fails, treat as plain string
+    ( $RAW | fromjson? ) as $J
+    |
+    if $J != null then
+      # RAW is JSON: walk and substitute inside every string
+      ($J | walk_strings( subst_all(.; $M) )) | tojson
     else
-      .
+      # RAW is plain string
+      ($RAW | subst_all(.; $M))
     end
   '
 }
