@@ -600,13 +600,22 @@ helpers_human_bytes() { # bytes -> human
 helpers_resolve_placeholders() {
   _helpers_need jq
   local raw="$1" ; local map_json="$2"
-  jq -nr --arg s "$raw" --argjson M "$map_json" '
-    # replace all tokens like {NAME} where NAME is a key in M
-    def rep($s; $m):
-      reduce ($m|to_entries[]) as $e ($s;
-        gsub("\\{" + ($e.key|gsub("([\\^$.|?*+()\\[\\]{}\\\\])"; "\\\\\1")) + "\\}";
-             ($e.value|tostring)));
-    rep($s; $M)
+  jq -c --argjson MAP "$map_json" '
+  def subst_all($m):
+    reduce ($m | to_entries[]) as $e (.;
+      gsub("\\{" + ($e.key|tostring) + "\\}"; ($e.value|tostring))
+    );
+
+  def walk(f):
+    . as $in
+    | if type == "object" then
+        with_entries(.value |= walk(f))
+      elif type == "array" then
+        map(walk(f))
+      else f
+      end;
+
+  walk(if type=="string" then subst_all($MAP) else . end)
   '
 }
 
