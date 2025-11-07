@@ -604,8 +604,8 @@ helpers_resolve_placeholders() {
   local raw="$1"        # input string or JSON
   local map_json="$2"   # JSON string of key->value map
 
-  jq -nr --arg RAW "$raw" --arg MAP "$map_json" '
-    # ---- defs must precede any filters ----
+  jq -nr -r --arg RAW "$raw" --arg MAP "$map_json" '
+    # ---- defs must come first ----
     def subst_all($text; $m):
       reduce ($m | to_entries[]) as $e ($text;
         gsub("\\{" + ($e.key|tostring) + "\\}"; ($e.value|tostring))
@@ -623,18 +623,16 @@ helpers_resolve_placeholders() {
       end;
 
     # ---- program ----
-    # parse MAP safely
     ($MAP | fromjson? // {}) as $M
     |
-    # Try to parse RAW as JSON; if that fails, treat as plain string
     ( $RAW | fromjson? ) as $J
     |
     if $J != null then
-      # RAW is JSON: walk and substitute inside every string
+      # RAW is JSON: walk & substitute, then emit JSON text
       ($J | walk_strings( subst_all(.; $M) )) | tojson
     else
-      # RAW is plain string
-      ($RAW | subst_all(.; $M))
+      # RAW is plain string: substitute and emit (always prints a line)
+      (subst_all($RAW; $M) // $RAW)
     end
   '
 }
@@ -1012,10 +1010,10 @@ aria2_enqueue_and_wait_from_manifest() {
 
       (env.A // "[]") | fromjson
       | .[]? as $t
-      | ($t.completedLength|tonumber)   as $done
-      | ($t.totalLength|tonumber)       as $tot
-      | ($t.downloadSpeed|tonumber)     as $spd
-      | ($t.files|type)                 as $ft
+      | ($t.completedLength|tonumber) as $done
+      | ($t.totalLength|tonumber)     as $tot
+      | ($t.downloadSpeed|tonumber)   as $spd
+      | ($t.files|type) as $ft
       | (if $ft=="array" and ($t.files|length)>0 and ($t.files[0].path? // "")!="" then
           ($t.files[0].path | capture("(?<dir>.*)/(?<name>[^/]+)$"))
         else
@@ -1027,7 +1025,6 @@ aria2_enqueue_and_wait_from_manifest() {
       | (bar($pc; $W)) as $B
       | "\($p.name)\n  \($B) \((($pc*10)|round/10.0))%  \((hb($done))) / \((if $tot>0 then hb($tot) else "?" end))  \((hb($spd)))/s\n"
     '
-
     echo "--------------------------------------------------------------------------------"
     printf "Group total: speed %s/s, done %s / %s\n" \
       "$(helpers_human_bytes "$tot_speed")" \
