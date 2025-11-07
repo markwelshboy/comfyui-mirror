@@ -582,7 +582,7 @@ push_bundle_if_requested() {
 : "${ARIA2_HOST:=127.0.0.1}"
 : "${ARIA2_PORT:=6969}"
 : "${ARIA2_SECRET:=KissMeQuick}"
-: "${ARIA2_PROGRESS_INTERVAL:=5}"
+: "${ARIA2_PROGRESS_INTERVAL:=15}"
 : "${ARIA2_PROGRESS_BAR_WIDTH:=40}"
 : "${COMFY:=/workspace/ComfyUI}"
 : "${COMFY_LOGS:=/workspace/logs}"
@@ -734,16 +734,6 @@ aria2_clear_results() {
   helpers_rpc_ping || return 0
   helpers_rpc_post '{"jsonrpc":"2.0","id":"pd","method":"aria2.purgeDownloadResult","params":["token:'"$ARIA2_SECRET"'"]}' >/dev/null 2>&1 || true
 }
-
-#helpers_rpc() {
-#  local method="$1"; shift
-#  local params="${1:-[]}"
-#  : "${ARIA2_HOST:=127.0.0.1}" "${ARIA2_PORT:=6969}" "${ARIA2_SECRET:=KissMeQuick}"
-#  curl -sS "http://${ARIA2_HOST}:${ARIA2_PORT}/jsonrpc" \
-#    -H 'Content-Type: application/json' \
-#    --data-binary '{"jsonrpc":"2.0","id":"x","method":"'"$method"'","params":["token:'"$ARIA2_SECRET"'",'"$params"']}' \
-#    || true
-#}
 
 # helpers_rpc <method> <params_json_array>
 # params_json_array should be a JSON array (e.g. [ ["url"], {"dir":"...","out":"..."} ])
@@ -936,6 +926,49 @@ helpers_build_vars_json() {
   printf '%s' "$base"
 }
 
+#=======================================================================================
+# ---- GID book-keeping ----
+#=======================================================================================
+
+helpers__read_gid_pairs() {
+  # prints "gid<TAB>name" for all still-present gids
+  local f="${ARIA2_GID_FILE:-/tmp/.aria2_enqueued_gids}"
+  [[ -s "$f" ]] || return 1
+  # strip blank / duplicate lines
+  awk -F'\t' 'NF>=1 && $1!="" {print $0}' "$f" | awk '!seen[$1]++'
+}
+
+helpers__prune_gids_and_count_active() {
+  local tmp; tmp="$(mktemp)"
+  local active=0
+  local line gid name status
+
+  while IFS=$'\t' read -r gid name; do
+    [[ -z "$gid" ]] && continue
+    # fetch status (never crash on hiccups)
+    local js; js="$(helpers_rpc 'aria2.tellStatus' "$(jq -nc --arg g "$gid" '[$g]')" 2>/dev/null || true)"
+    status="$(jq -r '.result.status // empty' <<<"$js" 2>/dev/null)"
+    case "$status" in
+      active|waiting|paused)
+        printf '%s\t%s\n' "$gid" "$name" >> "$tmp"
+        ((active++))
+        ;;
+      complete|error|removed|"")
+        # drop it
+        ;;
+    esac
+  done < <(helpers__read_gid_pairs || true)
+
+  # replace the file atomically
+  local f="${ARIA2_GID_FILE:-/tmp/.aria2_enqueued_gids}"
+  mv -f "$tmp" "$f" 2>/dev/null || cp -f "$tmp" "$f"
+  printf '%s' "$active"
+}
+
+#=======================================================================================
+# ---- Process json list for downloads to pull ----
+#=======================================================================================
+
 # ---- Manifest Enqueue ----
 helpers_download_from_manifest() {
   _helpers_need curl; _helpers_need jq; _helpers_need awk
@@ -1010,6 +1043,9 @@ helpers_download_from_manifest() {
       if [[ -n "$gid" ]]; then
         echo " - 📥 Queue: $out" >&2
         any=1
+        # Record gid for download tracking
+        : "${ARIA2_GID_FILE:=/tmp/.aria2_enqueued_gids}"
+        printf '%s\t%s\n' "$gid" "$out" >> "$ARIA2_GID_FILE"
       else
         echo "ERROR adding $url to the queue (addUri: $resp). Could be a bad token, bad URL etc. Please check the logs." >&2
       fi
@@ -1020,24 +1056,101 @@ helpers_download_from_manifest() {
   echo "$any"
 }
 
-# ---- Top-level: enqueue + progress ----
-aria2_enqueue_and_wait_from_manifest() {
-  # ----- TRAP (must be first!) -----
-  _trap_manifest() {
-    echo "[trap] SIGINT/SIGTERM — pausing aria2..." >&2
-    helpers_rpc 'aria2.pauseAll' '[]' >/dev/null 2>&1 || true
+#=======================================================================================
+# ---- Single-shot status update ----
+#=======================================================================================
 
-    if [[ "${ARIA2_SHUTDOWN_ON_INT:-0}" == "1" ]]; then
-      echo "[trap] Forcing aria2 shutdown..." >&2
-      helpers_rpc 'aria2.forceShutdown' '[]' >/dev/null 2>&1 || true
-    else
-      echo "[trap] Leaving aria2 daemon running (ARIA2_SHUTDOWN_ON_INT=0)." >&2
-    fi
+helpers_show_status_update_once() {
+  local rows='[]'
+  while IFS=$'\t' read -r gid name; do
+    [[ -z "$gid" ]] && continue
+    local js; js="$(helpers_rpc 'aria2.tellStatus' "$(jq -nc --arg g "$gid" '[$g]')" 2>/dev/null || true)"
+    local one; one="$(jq -c --arg name "$name" '
+      .result as $t
+      | {
+          gid: ($t.gid // ""),
+          name: ($t.files[0].path | split("/") | last // $name),
+          completed: (($t.completedLength // "0")|tonumber),
+          total: (($t.totalLength // "0")|tonumber),
+          speed: (($t.downloadSpeed // "0")|tonumber),
+          status: ($t.status // "unknown")
+        }
+    ' <<<"$js" 2>/dev/null || echo '{}')"
+    rows="$(jq -c --argjson r "$one" '. + [$r]' <<<"$rows")"
+  done < <(helpers__read_gid_pairs || true)
+
+  ARIA2_PROGRESS_BAR_WIDTH="${ARIA2_PROGRESS_BAR_WIDTH:-40}" \
+  A="$rows" jq -r '
+    def hb($n):
+      if $n>=1099511627776 then "\((($n/1099511627776)|floor)) TB"
+      elif $n>=1073741824 then "\((($n/1073741824)|floor)) GB"
+      elif $n>=1048576 then "\((($n/1048576)|floor)) MB"
+      elif $n>=1024 then "\((($n/1024)|floor)) KB"
+      else "\($n) B" end;
+    def bar($pct; $W):
+      (($W*($pct/100.0))|floor) as $f
+      | "[" + ( (range(0;$f) | "#") + (range($f;$W) | "-") ) + "]";
+    (env.A // "[]") | fromjson
+    | sort_by(.name)
+    | .[] as $t
+    | ($t.total as $tot | if $tot > 0 then (100.0 * ($t.completed/$tot)) else 0 end) as $pct
+    | (env.ARIA2_PROGRESS_BAR_WIDTH|tonumber? // 40) as $W
+    | (bar($pct; $W)) as $B
+    | "\($t.name)\n  \($B) \((($pct*10)|round/10.0))%  \((hb($t.completed))) / \((if $t.total>0 then hb($t.total) else "?" end))  \((hb($t.speed)))/s  [\($t.status)]\n"
+  '
+}
+
+#=======================================================================================
+# ---- GID tracker/loop ----
+#=======================================================================================
+
+aria2_wait_by_gidfile() {
+  : "${ARIA2_PROGRESS_REFRESH:=15}"
+  : "${ARIA2_GID_FILE:=/tmp/.aria2_enqueued_gids}"
+
+  # Trap just for this loop
+  _trap_gids() {
+    echo "[trap (ARIA2)] SIGINT — pausing all current download sessions..." >&2
+    # fast path: pauseAll works even if new jobs were queued elsewhere
+    helpers_rpc 'aria2.pauseAll' '[]' >/dev/null 2>&1 || true
     exit 130
   }
-  trap _trap_manifest INT TERM
+  trap _trap_gids INT TERM
 
+  while :; do
+
+    echo "================================================================================"
+    echo "=== Reporting downloads @ $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "--------------------------------------------------------------------------------"
+
+    # show once
+    helpers_show_status_update_once 2>/dev/null || true
+
+    # prune and check active count
+    local active; active="$(helpers__prune_gids_and_count_active 2>/dev/null || echo 0)"
+    [[ "${ARIA2_GID_DEBUG:-0}" -eq 1 ]] && echo "--- Active GIDs: $active ---"
+    if [[ "$active" -eq 0 ]]; then
+      [[ "${ARIA2_GID_DEBUG:-0}" -eq 1 ]] && echo "[gid-watcher] no active GIDs — done."
+      break
+    fi
+
+    # ^C reliably interrupts wait
+    { sleep "$ARIA2_PROGRESS_REFRESH" & wait $!; } || true
+  done
+
+  trap - INT TERM
+}
+
+#=======================================================================================
+# ---- Main ARIA2 Spawn ----
+#=======================================================================================
+
+aria2_enqueue_and_wait_from_manifest() {
   helpers_start_aria2_daemon || return 1
+
+  # clear previous gid file
+  : "${ARIA2_GID_FILE:=/tmp/.aria2_enqueued_gids}"
+  : > "$ARIA2_GID_FILE"
 
   echo "================================================================================"
   echo "==="
@@ -1046,98 +1159,20 @@ aria2_enqueue_and_wait_from_manifest() {
 
   local any; any="$(helpers_download_from_manifest || echo 0)"
   if [[ "$any" == "0" ]]; then
-    trap - INT TERM
     echo "=== Nothing enqueued. Exiting without starting progress loop."
     return 0
   fi
 
-  # … your queue header and call to helpers_download_from_manifest …
-
-  local _refresh="${ARIA2_PROGRESS_REFRESH:-5}"
-  : "${ARIA2_PROGRESS_BAR_WIDTH:=40}"
+  local _refresh="${ARIA2_PROGRESS_REFRESH:-15}"
 
   echo ""
   echo "=== Starting progress loop (refresh every ${_refresh}s)..."
   echo "==="
 
-  # ---- PROGRESS LOOP (robust) ----
-  # Neutralize strict modes inside the loop
-  set +e
-  set +o pipefail
-  trap '' PIPE
+  aria2_wait_by_gidfile
 
-  : "${ARIA2_PROGRESS_BAR_WIDTH:=40}"
-  local _refresh="${ARIA2_PROGRESS_REFRESH:-15}"
-  local __tick=0
-
-  while true; do
-    # Pull aria2 state (never crash on transient RPC/jq issues)
-    local _act_json _wai_json _sto_json
-    _act_json="$(helpers_rpc 'aria2.tellActive'  '[]'            2>/dev/null || true)"
-    _wai_json="$(helpers_rpc 'aria2.tellWaiting' '[0,1000]'      2>/dev/null || true)"
-    _sto_json="$(helpers_rpc 'aria2.tellStopped' '[-1000,1000]'  2>/dev/null || true)"
-
-    local act wai sto active_count waiting_count
-    act="$(jq -c '(.result // [])' <<<"$_act_json" 2>/dev/null || echo '[]')"
-    wai="$(jq -c '(.result // [])' <<<"$_wai_json" 2>/dev/null || echo '[]')"
-    sto="$(jq -c '(.result // [])' <<<"$_sto_json" 2>/dev/null || echo '[]')"
-    active_count="$(jq -r 'length' <<<"$act" 2>/dev/null || echo 0)"
-    waiting_count="$(jq -r 'length' <<<"$wai" 2>/dev/null || echo 0)"
-
-    echo "================================================================================"
-    echo "=== Aria2 Downloader: Active downloads: $active_count (pending: $waiting_count) [tick $__tick]"
-    echo "--------------------------------------------------------------------------------"
-
-    # Pretty rows (inject env BEFORE jq)
-    A="$act" jq -r '
-      def hb($n):
-        if ($n // 0) >= 1099511627776 then ((($n // 0) / 1099511627776)|floor|tostring) + " TB"
-        elif ($n // 0) >= 1073741824 then  ((($n // 0) / 1073741824 )|floor|tostring) + " GB"
-        elif ($n // 0) >= 1048576    then  ((($n // 0) / 1048576   )|floor|tostring) + " MB"
-        elif ($n // 0) >= 1024       then  ((($n // 0) / 1024      )|floor|tostring) + " KB"
-        else (($n // 0)|tostring) + " B" end;
-      def bar($pct; $W):
-        (($W * ($pct/100.0))|floor) as $f
-        | "[" + ( (range(0;$f) | "#") + (range($f;$W) | "-") ) + "]";
-      (env.A // "[]") | fromjson
-      | .[]? as $t
-      | ($t.completedLength|tonumber) as $done
-      | ($t.totalLength|tonumber)     as $tot
-      | ($t.downloadSpeed|tonumber)   as $spd
-      | ($t.files|type) as $ft
-      | (if $ft=="array" and ($t.files|length)>0 and ($t.files[0].path? // "")!="" then
-          ($t.files[0].path | capture("(?<dir>.*)/(?<name>[^/]+)$"))
-        else
-          {"dir":"", "name":($t.bittorrent.info.name? // $t.infoHash // "unknown")}
-        end) as $p
-      | ($tot | if .>0 then (100.0 * $done / .) else 0 end) as $pct
-      | ($pct | if .>100 then 100 elif .<0 then 0 else . end) as $pc
-      | (env.ARIA2_PROGRESS_BAR_WIDTH|tonumber? // 40) as $W
-      | (bar($pc; $W)) as $B
-      | "\($p.name)\n  \($B) \((($pc*10)|round/10.0))%  \((hb($done))) / \((if $tot>0 then hb($tot) else "?" end))  \((hb($spd)))/s\n"
-    ' 2>/dev/null || true
-
-    # Exit when done
-    if [[ "$active_count" -eq 0 && "$waiting_count" -eq 0 ]]; then
-      echo "[progress] nothing active/waiting — exiting." >&2
-      echo "--- Completed items (last 10) ---"
-      jq -r 'reverse | .[:10] | .[] |
-            (.files[0].path // .bittorrent.info.name // .infoHash // "unknown")' \
-        <<<"$sto" 2>/dev/null || true
-      break
-    fi
-
-    # Sleep in a child and wait on it — SIGINT reliably interrupts this
-    # (if SIGINT arrives here, trap runs and exits; if not, we loop)
-    { sleep "$_refresh" & wait $!; } || true
-    : $(( __tick+=1 ))
-  done
-
-  # restore stricter modes if you want them after this function
-  set -e
-  set -o pipefail
-  trap - INT TERM
 }
+
 #=======================================================================================
 #
 # ---------- Section 6: CivitAI ID downloader helpers ----------
