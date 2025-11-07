@@ -764,8 +764,7 @@ helpers_progress_snapshot_loop() {
   while true; do
     helpers_progress_snapshot_once | tee -a "$log"
     if helpers_queue_empty; then break; fi
-    sleep "$interval" &
-    wait $!                                   # <-- allows ^C to hit the shell, not a pipe
+    sleep "$interval" & wait $!
   done
 }
 
