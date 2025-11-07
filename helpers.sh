@@ -946,7 +946,9 @@ helpers_download_from_manifest() {
     ' "$MAN" | while IFS=$'\t' read -r url raw_path; do
         # placeholder substitution
         local path dir out
+        echo "[enqueue-debug] RAW: $raw_path" >&2
         path="$(helpers_resolve_placeholders "$raw_path")"
+        echo "[enqueue-debug] RESOLVED: $path" >&2
         dir="$(dirname -- "$path")"; out="$(basename -- "$path")"
         mkdir -p -- "$dir"
         # skip if exists & looks complete
