@@ -644,14 +644,6 @@ helpers_resolve_placeholders() {
   printf '%s\n' "$s"
 }
 
-helpers_have_aria2_rpc() {
-  : "${ARIA2_HOST:=127.0.0.1}"; : "${ARIA2_PORT:=6969}"; : "${ARIA2_SECRET:=KissMeQuick}"
-  curl -fsS "http://$ARIA2_HOST:$ARIA2_PORT/jsonrpc" \
-    -H 'Content-Type: application/json' \
-    --data '{"jsonrpc":"2.0","id":"v","method":"aria2.getVersion","params":["token:'"$ARIA2_SECRET"'"]}' \
-    >/dev/null 2>&1
-}
-
 # start_aria2_daemon: launch aria2c daemon if not already running
 helpers_start_aria2_daemon() {
   : "${ARIA2_HOST:=127.0.0.1}"
@@ -692,218 +684,6 @@ helpers_start_aria2_daemon() {
   done
   echo "❌ aria2 RPC did not come up" >&2
   return 1
-}
-
-# --- raw JSON-RPC POST helper (the function your code calls) ---
-helpers_rpc_post() {
-  : "${ARIA2_HOST:=127.0.0.1}" "${ARIA2_PORT:=6969}"
-  curl -sS "http://${ARIA2_HOST}:${ARIA2_PORT}/jsonrpc" \
-       -H 'Content-Type: application/json' \
-       --data-binary "${1:-{}}" \
-       || true
-}
-
-# ---- ping ----
-helpers_rpc_ping() {
-  : "${ARIA2_HOST:=127.0.0.1}" "${ARIA2_PORT:=6969}" "${ARIA2_SECRET:=KissMeQuick}"
-  curl -fsS "http://${ARIA2_HOST}:${ARIA2_PORT}/jsonrpc" \
-       -H 'Content-Type: application/json' \
-       --data '{"jsonrpc":"2.0","id":"v","method":"aria2.getVersion","params":["token:'"$ARIA2_SECRET"'"]}' \
-       >/dev/null 2>&1
-}
-
-# addUri
-helpers_rpc_add_uri() {
-  local url="$1" dir="$2" out="$3" checksum="$4"
-  local tok="token:${ARIA2_SECRET}"
-  local opts
-  opts=$(jq -nc --arg d "$dir" --arg o "$out" '
-    { "dir": $d, "out": $o, "allow-overwrite": "true", "auto-file-renaming": "false" }')
-  # checksum optional
-  if [[ -n "$checksum" ]]; then
-    opts=$(jq -nc --argjson base "$opts" --arg c "$checksum" '$base + {"checksum":$c}')
-  fi
-  local payload
-  payload=$(jq -nc --arg tok "$tok" --arg u "$url" --argjson o "$opts" \
-    '{jsonrpc:"2.0", id:"add", method:"aria2.addUri", params:[$tok, [$u], $o]}')
-  helpers_rpc_post "$payload" | jq -r '.result // empty'
-}
-
-# clear results
-aria2_clear_results() {
-  helpers_rpc_ping || return 0
-  helpers_rpc_post '{"jsonrpc":"2.0","id":"pd","method":"aria2.purgeDownloadResult","params":["token:'"$ARIA2_SECRET"'"]}' >/dev/null 2>&1 || true
-}
-
-# helpers_rpc <method> <params_json_array>
-# params_json_array should be a JSON array (e.g. [ ["url"], {"dir":"...","out":"..."} ])
-
-helpers_rpc() {
-  local method="$1"; shift
-  local params_json="$1"
-  : "${ARIA2_HOST:=127.0.0.1}" "${ARIA2_PORT:=6969}" "${ARIA2_SECRET:=KissMeQuick}"
-
-  # Build final params = ["token:SECRET", ...original array items...]
-  local payload
-  if [[ -n "$ARIA2_SECRET" ]]; then
-    payload="$(
-      jq -nc \
-         --arg m "$method" \
-         --arg t "token:$ARIA2_SECRET" \
-         --argjson p "$params_json" '
-        {jsonrpc:"2.0", id:"x", method:$m,
-         params: ( [$t] + $p ) }'
-    )"
-  else
-    payload="$(
-      jq -nc --arg m "$method" --argjson p "$params_json" \
-        '{jsonrpc:"2.0", id:"x", method:$m, params:$p}'
-    )"
-  fi
-
-  curl -sS "http://$ARIA2_HOST:$ARIA2_PORT/jsonrpc" \
-       -H 'Content-Type: application/json' \
-       --data-binary "$payload"
-}
-
-aria2_stop_all() {
-  # pause and clear all results (daemon left running)
-  helpers_rpc 'aria2.pauseAll' >/dev/null 2>&1 || true
-  # remove stopped results
-  local gids
-  gids="$(helpers_rpc 'aria2.tellStopped' '[0,10000]' | jq -r '(.result // [])[]?.gid // empty')" || true
-  if [[ -n "$gids" ]]; then
-    while read -r gid; do
-      [[ -z "$gid" ]] && continue
-      helpers_rpc 'aria2.removeDownloadResult' '["'"$gid"'"]' >/dev/null 2>&1 || true
-    done <<<"$gids"
-  fi
-}
-
-aria2_pause_all() {
-  : "${ARIA2_SECRET:=KissMeQuick}"; : "${ARIA2_PORT:=6969}"; : "${ARIA2_HOST:=127.0.0.1}"
-  curl -fsS "http://$ARIA2_HOST:$ARIA2_PORT/jsonrpc" -H 'Content-Type: application/json' \
-    --data '{"jsonrpc":"2.0","id":"p","method":"aria2.pauseAll","params":["token:'"$ARIA2_SECRET"'"]}' >/dev/null 2>&1 || true
-}
-
-aria2_remove_stopped() {
-  : "${ARIA2_SECRET:=KissMeQuick}"; : "${ARIA2_PORT:=6969}"; : "${ARIA2_HOST:=127.0.0.1}"
-  curl -fsS "http://$ARIA2_HOST:$ARIA2_PORT/jsonrpc" -H 'Content-Type: application/json' \
-    --data '{"jsonrpc":"2.0","id":"c","method":"aria2.purgeDownloadResult","params":["token:'"$ARIA2_SECRET"'"]}' >/dev/null 2>&1 || true
-}
-
-helpers_shutdown_aria2_daemon() {
-  pkill -f 'aria2c --no-conf --enable-rpc' >/dev/null 2>&1 || true
-}
-
-# (no-op book-keeping hooks; keep for compatibility)
-helpers_reset_enqueued() { return 0; }
-helpers_record_gid() { :; }
-helpers_probe_url() { return 0; }  # silenced
-
-helpers_progress_snapshot_once() {
-  : "${ARIA2_HOST:=127.0.0.1}"; : "${ARIA2_PORT:=6969}"; : "${ARIA2_SECRET:=KissMeQuick}"
-  : "${ARIA2_PROGRESS_MAX:=999}"
-
-  local body resp
-  body="$(jq -cn --arg t "token:$ARIA2_SECRET" \
-    '{jsonrpc:"2.0",id:"A",method:"aria2.tellActive",params:[$t]},
-     {jsonrpc:"2.0",id:"W",method:"aria2.tellWaiting",params:[$t,0,1000]},
-     {jsonrpc:"2.0",id:"S",method:"aria2.tellStopped",params:[$t,0,200]}' )"
-  resp="$(curl -fsS "http://$ARIA2_HOST:$ARIA2_PORT/jsonrpc" -H 'Content-Type: application/json' --data-binary "$body" 2>/dev/null)" || {
-    echo "=== aria2 progress @ $(date '+%Y-%m-%d %H:%M:%S') ==="
-    echo "Active downloads: 0"; echo "--------------------------------------------------------------------------------"
-    echo "Group total: speed 0 B/s, done 0 B / 0 B"
-    return 0
-  }
-
-  # Slurp stream into array, then pick by id
-  local active waiting stopped
-  active="$(jq -c -sr '[.[]
-     | select(.id=="A").result
-     | .[] ]' <<<"$resp")"
-  waiting="$(jq -c -sr '[.[]
-     | select(.id=="W").result
-     | .[] ]' <<<"$resp")"
-  stopped="$(jq -c -sr '[.[]
-     | select(.id=="S").result
-     | .[] ]' <<<"$resp")"
-
-  local merged; merged="$(jq -c --argjson a "$active" --argjson w "$waiting" '$a+$w')" || merged='[]'
-  local count; count="$(jq -r 'length' <<<"$merged")"
-
-  echo "================================================================================"
-  echo "=== Huggingface Model Downloader: aria2 progress @ $(date '+%Y-%m-%d %H:%M:%S') ==="
-  echo "==="; echo "=== Active downloads: $count"; echo "--------------------------------------------------------------------------------"
-
-  if (( count == 0 )); then
-    echo "Group total: speed 0 B/s, done 0 B / 0 B"
-    return 0
-  fi
-
-  mapfile -t names < <(jq -r '.[] | (.files[0].path // .bittorrent.info.name // .infoHash // .gid // "unknown") | split("/") | last' <<<"$merged")
-  mapfile -t dirs  < <(jq -r '.[] | (.files[0].path // "") | split("/") | .[0:-1] | join("/")' <<<"$merged")
-  mapfile -t sizes < <(jq -r '.[] | (.totalLength // 0)' <<<"$merged")
-  mapfile -t dones < <(jq -r '.[] | (.completedLength // 0)' <<<"$merged")
-  mapfile -t speeds< <(jq -r '.[] | (.downloadSpeed // 0)' <<<"$merged")
-
-  local i max="$ARIA2_PROGRESS_MAX"
-  for ((i=0; i<count && i<max; i++)); do
-    local tot="${sizes[i]:-0}" done="${dones[i]:-0}" spd="${speeds[i]:-0}" pct=0
-    (( tot > 0 )) && pct=$(( done*100/tot ))
-    local bars=$(( (pct*40)/100 )) bar line
-    printf -v bar '%*s' "$bars" ''; bar=${bar// /#}
-    printf -v line '%-40s' "$bar"
-
-    local dir="${dirs[i]:-.}"
-    [[ -n "${COMFY:-}" && "$dir" == "$COMFY"* ]] && dir="${dir#$COMFY/}"
-
-    printf " %3d%% [%s] %4s/s  (%s / %s)  [ Destination -> %s ] %s\n" \
-      "$pct" "$line" \
-      "$(helpers_human_bytes "$spd")" \
-      "$(helpers_human_bytes "$done")" \
-      "$(helpers_human_bytes "$tot")" \
-      "$dir" \
-      "${names[i]}"
-  done
-
-  local total_done total_size total_speed
-  total_done="$(jq -r '[.[]|(.completedLength//0)]|add' <<<"$merged")"
-  total_size="$(jq -r '[.[]|(.totalLength//0)]|add'    <<<"$merged")"
-  total_speed="$(jq -r '[.[]|(.downloadSpeed//0)]|add' <<<"$merged")"
-  echo "--------------------------------------------------------------------------------"
-  printf "Group total: speed %s/s, done %s / %s\n" \
-    "$(helpers_human_bytes "$total_speed")" \
-    "$(helpers_human_bytes "$total_done")" \
-    "$(helpers_human_bytes "$total_size")"
-}
-
-helpers_queue_empty() {
-  : "${ARIA2_HOST:=127.0.0.1}"; : "${ARIA2_PORT:=6969}"; : "${ARIA2_SECRET:=KissMeQuick}"
-  local body resp a w
-  body="$(jq -cn --arg t "token:$ARIA2_SECRET" \
-    '{jsonrpc:"2.0",id:"A",method:"aria2.tellActive",params:[$t]},
-     {jsonrpc:"2.0",id:"W",method:"aria2.tellWaiting",params:[$t,0,1000]}' )"
-  resp="$(curl -fsS "http://$ARIA2_HOST:$ARIA2_PORT/jsonrpc" -H 'Content-Type: application/json' --data-binary "$body" 2>/dev/null)" || return 0
-  a="$(jq -sr '.[]
-    | select(.id=="A").result
-    | length' <<<"$resp")"
-  w="$(jq -sr '.[]
-    | select(.id=="W").result
-    | length' <<<"$resp")"
-  (( a==0 && w==0 ))
-}
-
-# ---- Foreground progress with trap ----
-helpers_progress_snapshot_loop() {
-  local interval="${1:-10}" log="${3:-/workspace/logs/aria2_progress.log}"
-  mkdir -p "$(dirname "$log")"
-  while true; do
-    helpers_progress_snapshot_once | tee -a "$log"
-    # Exit when both active and waiting are empty
-    if helpers_queue_empty; then break; fi
-    sleep "$interval"
-  done
 }
 
 helpers_build_vars_json() {
@@ -1211,6 +991,128 @@ aria2_enqueue_and_wait_from_manifest() {
 # - trim leading/trailing _
 # - preserve/normalize extension case
 
+# --- raw JSON-RPC POST helper (the function your code calls) ---
+helpers_rpc_post() {
+  : "${ARIA2_HOST:=127.0.0.1}" "${ARIA2_PORT:=6969}"
+  curl -sS "http://${ARIA2_HOST}:${ARIA2_PORT}/jsonrpc" \
+       -H 'Content-Type: application/json' \
+       --data-binary "${1:-{}}" \
+       || true
+}
+
+# ---- ping ----
+helpers_rpc_ping() {
+  : "${ARIA2_HOST:=127.0.0.1}" "${ARIA2_PORT:=6969}" "${ARIA2_SECRET:=KissMeQuick}"
+  curl -fsS "http://${ARIA2_HOST}:${ARIA2_PORT}/jsonrpc" \
+       -H 'Content-Type: application/json' \
+       --data '{"jsonrpc":"2.0","id":"v","method":"aria2.getVersion","params":["token:'"$ARIA2_SECRET"'"]}' \
+       >/dev/null 2>&1
+}
+
+# addUri
+helpers_rpc_add_uri() {
+  local url="$1" dir="$2" out="$3" checksum="$4"
+  local tok="token:${ARIA2_SECRET}"
+  local opts
+  opts=$(jq -nc --arg d "$dir" --arg o "$out" '
+    { "dir": $d, "out": $o, "allow-overwrite": "true", "auto-file-renaming": "false" }')
+  # checksum optional
+  if [[ -n "$checksum" ]]; then
+    opts=$(jq -nc --argjson base "$opts" --arg c "$checksum" '$base + {"checksum":$c}')
+  fi
+  local payload
+  payload=$(jq -nc --arg tok "$tok" --arg u "$url" --argjson o "$opts" \
+    '{jsonrpc:"2.0", id:"add", method:"aria2.addUri", params:[$tok, [$u], $o]}')
+  helpers_rpc_post "$payload" | jq -r '.result // empty'
+}
+
+# helpers_rpc <method> <params_json_array>
+# params_json_array should be a JSON array (e.g. [ ["url"], {"dir":"...","out":"..."} ])
+
+helpers_rpc() {
+  local method="$1"; shift
+  local params_json="$1"
+  : "${ARIA2_HOST:=127.0.0.1}" "${ARIA2_PORT:=6969}" "${ARIA2_SECRET:=KissMeQuick}"
+
+  # Build final params = ["token:SECRET", ...original array items...]
+  local payload
+  if [[ -n "$ARIA2_SECRET" ]]; then
+    payload="$(
+      jq -nc \
+         --arg m "$method" \
+         --arg t "token:$ARIA2_SECRET" \
+         --argjson p "$params_json" '
+        {jsonrpc:"2.0", id:"x", method:$m,
+         params: ( [$t] + $p ) }'
+    )"
+  else
+    payload="$(
+      jq -nc --arg m "$method" --argjson p "$params_json" \
+        '{jsonrpc:"2.0", id:"x", method:$m, params:$p}'
+    )"
+  fi
+
+  curl -sS "http://$ARIA2_HOST:$ARIA2_PORT/jsonrpc" \
+       -H 'Content-Type: application/json' \
+       --data-binary "$payload"
+}
+
+aria2_stop_all() {
+  # pause and clear all results (daemon left running)
+  helpers_rpc 'aria2.pauseAll' >/dev/null 2>&1 || true
+  # remove stopped results
+  local gids
+  gids="$(helpers_rpc 'aria2.tellStopped' '[0,10000]' | jq -r '(.result // [])[]?.gid // empty')" || true
+  if [[ -n "$gids" ]]; then
+    while read -r gid; do
+      [[ -z "$gid" ]] && continue
+      helpers_rpc 'aria2.removeDownloadResult' '["'"$gid"'"]' >/dev/null 2>&1 || true
+    done <<<"$gids"
+  fi
+}
+
+# clear results
+aria2_clear_results() {
+  helpers_rpc_ping || return 0
+  helpers_rpc_post '{"jsonrpc":"2.0","id":"pd","method":"aria2.purgeDownloadResult","params":["token:'"$ARIA2_SECRET"'"]}' >/dev/null 2>&1 || true
+}
+
+helpers_have_aria2_rpc() {
+  : "${ARIA2_HOST:=127.0.0.1}"; : "${ARIA2_PORT:=6969}"; : "${ARIA2_SECRET:=KissMeQuick}"
+  curl -fsS "http://$ARIA2_HOST:$ARIA2_PORT/jsonrpc" \
+    -H 'Content-Type: application/json' \
+    --data '{"jsonrpc":"2.0","id":"v","method":"aria2.getVersion","params":["token:'"$ARIA2_SECRET"'"]}' \
+    >/dev/null 2>&1
+}
+
+helpers_queue_empty() {
+  : "${ARIA2_HOST:=127.0.0.1}"; : "${ARIA2_PORT:=6969}"; : "${ARIA2_SECRET:=KissMeQuick}"
+  local body resp a w
+  body="$(jq -cn --arg t "token:$ARIA2_SECRET" \
+    '{jsonrpc:"2.0",id:"A",method:"aria2.tellActive",params:[$t]},
+     {jsonrpc:"2.0",id:"W",method:"aria2.tellWaiting",params:[$t,0,1000]}' )"
+  resp="$(curl -fsS "http://$ARIA2_HOST:$ARIA2_PORT/jsonrpc" -H 'Content-Type: application/json' --data-binary "$body" 2>/dev/null)" || return 0
+  a="$(jq -sr '.[]
+    | select(.id=="A").result
+    | length' <<<"$resp")"
+  w="$(jq -sr '.[]
+    | select(.id=="W").result
+    | length' <<<"$resp")"
+  (( a==0 && w==0 ))
+}
+
+# ---- Foreground progress with trap ----
+helpers_progress_snapshot_loop() {
+  local interval="${1:-10}" log="${3:-/workspace/logs/aria2_progress.log}"
+  mkdir -p "$(dirname "$log")"
+  while true; do
+    helpers_progress_snapshot_once | tee -a "$log"
+    # Exit when both active and waiting are empty
+    if helpers_queue_empty; then break; fi
+    sleep "$interval"
+  done
+}
+
 helpers_sanitize_basename() {
   local in="$1"
   [[ -z "$in" ]] && { printf "model.safetensors"; return; }
@@ -1374,6 +1276,84 @@ helpers_civitai_postprocess_dir() {
           mv -f -- "$moved" "$junk/"
         fi
       done
+}
+
+helpers_progress_snapshot_once() {
+  : "${ARIA2_HOST:=127.0.0.1}"; : "${ARIA2_PORT:=6969}"; : "${ARIA2_SECRET:=KissMeQuick}"
+  : "${ARIA2_PROGRESS_MAX:=999}"
+
+  local body resp
+  body="$(jq -cn --arg t "token:$ARIA2_SECRET" \
+    '{jsonrpc:"2.0",id:"A",method:"aria2.tellActive",params:[$t]},
+     {jsonrpc:"2.0",id:"W",method:"aria2.tellWaiting",params:[$t,0,1000]},
+     {jsonrpc:"2.0",id:"S",method:"aria2.tellStopped",params:[$t,0,200]}' )"
+  resp="$(curl -fsS "http://$ARIA2_HOST:$ARIA2_PORT/jsonrpc" -H 'Content-Type: application/json' --data-binary "$body" 2>/dev/null)" || {
+    echo "=== aria2 progress @ $(date '+%Y-%m-%d %H:%M:%S') ==="
+    echo "Active downloads: 0"; echo "--------------------------------------------------------------------------------"
+    echo "Group total: speed 0 B/s, done 0 B / 0 B"
+    return 0
+  }
+
+  # Slurp stream into array, then pick by id
+  local active waiting stopped
+  active="$(jq -c -sr '[.[]
+     | select(.id=="A").result
+     | .[] ]' <<<"$resp")"
+  waiting="$(jq -c -sr '[.[]
+     | select(.id=="W").result
+     | .[] ]' <<<"$resp")"
+  stopped="$(jq -c -sr '[.[]
+     | select(.id=="S").result
+     | .[] ]' <<<"$resp")"
+
+  local merged; merged="$(jq -c --argjson a "$active" --argjson w "$waiting" '$a+$w')" || merged='[]'
+  local count; count="$(jq -r 'length' <<<"$merged")"
+
+  echo "================================================================================"
+  echo "=== Huggingface Model Downloader: aria2 progress @ $(date '+%Y-%m-%d %H:%M:%S') ==="
+  echo "==="; 
+  echo "=== Active downloads: $count"; echo "--------------------------------------------------------------------------------"
+
+  if (( count == 0 )); then
+    echo "Group total: speed 0 B/s, done 0 B / 0 B"
+    return 0
+  fi
+
+  mapfile -t names < <(jq -r '.[] | (.files[0].path // .bittorrent.info.name // .infoHash // .gid // "unknown") | split("/") | last' <<<"$merged")
+  mapfile -t dirs  < <(jq -r '.[] | (.files[0].path // "") | split("/") | .[0:-1] | join("/")' <<<"$merged")
+  mapfile -t sizes < <(jq -r '.[] | (.totalLength // 0)' <<<"$merged")
+  mapfile -t dones < <(jq -r '.[] | (.completedLength // 0)' <<<"$merged")
+  mapfile -t speeds< <(jq -r '.[] | (.downloadSpeed // 0)' <<<"$merged")
+
+  local i max="$ARIA2_PROGRESS_MAX"
+  for ((i=0; i<count && i<max; i++)); do
+    local tot="${sizes[i]:-0}" done="${dones[i]:-0}" spd="${speeds[i]:-0}" pct=0
+    (( tot > 0 )) && pct=$(( done*100/tot ))
+    local bars=$(( (pct*40)/100 )) bar line
+    printf -v bar '%*s' "$bars" ''; bar=${bar// /#}
+    printf -v line '%-40s' "$bar"
+
+    local dir="${dirs[i]:-.}"
+    [[ -n "${COMFY:-}" && "$dir" == "$COMFY"* ]] && dir="${dir#$COMFY/}"
+
+    printf " %3d%% [%s] %4s/s  (%s / %s)  [ Destination -> %s ] %s\n" \
+      "$pct" "$line" \
+      "$(helpers_human_bytes "$spd")" \
+      "$(helpers_human_bytes "$done")" \
+      "$(helpers_human_bytes "$tot")" \
+      "$dir" \
+      "${names[i]}"
+  done
+
+  local total_done total_size total_speed
+  total_done="$(jq -r '[.[]|(.completedLength//0)]|add' <<<"$merged")"
+  total_size="$(jq -r '[.[]|(.totalLength//0)]|add'    <<<"$merged")"
+  total_speed="$(jq -r '[.[]|(.downloadSpeed//0)]|add' <<<"$merged")"
+  echo "--------------------------------------------------------------------------------"
+  printf "Group total: speed %s/s, done %s / %s\n" \
+    "$(helpers_human_bytes "$total_speed")" \
+    "$(helpers_human_bytes "$total_done")" \
+    "$(helpers_human_bytes "$total_size")"
 }
 
 # Print aligned "Completed (this session)" block from a list of "name<TAB>relpath<TAB>size"
