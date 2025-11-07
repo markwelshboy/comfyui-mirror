@@ -966,15 +966,16 @@ helpers_download_from_manifest() {
   local any=0
   for sec in "${ENABLED[@]}"; do
     echo ">>> Enqueue section: $sec"
-    jq -r --arg sec "$sec" '
-      def as_obj:
-        if type=="object" then {url:(.url//""), path:(.path // ((.dir // "") + (if .out then "/" + .out else "" end)))}
-        elif type=="array" then {url:(.[0]//""), path:(.[1]//"")}
-        elif type=="string" then {url:., path:""}
-        else {url:"", path:""} end;
-      (.sections[$sec] // [])[] | as_obj | select(.url|length>0)
-      | [.url, (if (.path|length)>0 then .path else (.url|sub("^.*/";"")) end)] | @tsv
-    ' "$MAN" | while IFS=$'\t' read -r url raw_path; do
+    #jq -r --arg sec "$sec" '
+    #  def as_obj:
+    #    if type=="object" then {url:(.url//""), path:(.path // ((.dir // "") + (if .out then "/" + .out else "" end)))}
+    #    elif type=="array" then {url:(.[0]//""), path:(.[1]//"")}
+    #    elif type=="string" then {url:., path:""}
+    #    else {url:"", path:""} end;
+    #  (.sections[$sec] // [])[] | as_obj | select(.url|length>0)
+    #  | [.url, (if (.path|length)>0 then .path else (.url|sub("^.*/";"")) end)] | @tsv
+    #' "$MAN" | while IFS=$'\t' read -r url raw_path; do
+    while IFS=$'\t' read -r url raw_path; do
         # placeholder substitution
         local path dir out
         path="$(helpers_resolve_placeholders "$raw_path")"
@@ -993,16 +994,28 @@ helpers_download_from_manifest() {
         #echo "📥 Queue (in): $out"
         #helpers_rpc 'aria2.addUri' "$(jq -n --arg d "$dir" --arg o "$out" --arg u "$url" '[["\($u)"], {"dir": $d, "out": $o}]')" >/dev/null
         #any=1
-        resp="$(helpers_rpc 'aria2.addUri' "$(jq -n --arg d "$dir" --arg o "$out" --arg u "$url" '[["\($u)"], {"dir": $d, "out": $o}]')")"
-        gid="$(jq -r '.result // empty' <<<"$resp")"
+        resp="$(helpers_rpc 'aria2.addUri' "$(jq -n --arg d "$dir" --arg o "$out" --arg u "$url" \
+          '[["\($u)"], {"dir": $d, "out": $o}]')")"
+        # Always log what aria2 returned (first item is enough, but safe to keep)
+        echo "[enqueue-debug] addUri resp: ${resp:0:200}" >&2
+        # Parse gid (handles both `"result": "...gid..."` and error objects)
+        gid="$(jq -r '(.result // empty) // ""' <<<"$resp" 2>/dev/null)"
         if [[ -n "$gid" ]]; then
-          echo "📥 Queue: $out  (gid: $gid)" >&2 
+          echo "📥 Queue: $out  (gid: $gid)"
+          any=1
         else
+          # Surface the error in full so we can see *why* (bad token, bad URL, etc.)
           echo "[enqueue-debug] Sans Queue :( -> ERROR addUri: $resp" >&2
         fi
-        echo "[enqueue-debug] --------------- finished processing this entry......" >&2  
-        any=1
-      done
+    done < <( jq -r --arg sec "$sec" '
+        def as_obj:
+        if type=="object" then {url:(.url//""), path:(.path // ((.dir // "") + (if .out then "/" + .out else "" end)))}
+        elif type=="array" then {url:(.[0]//""), path:(.[1]//"")}
+        elif type=="string" then {url:., path:""}
+        else {url:"", path:""} end;
+        (.sections[$sec] // [])[] | as_obj | select(.url|length>0)
+        | [.url, (if (.path|length)>0 then .path else (.url|sub("^.*/";"")) end)] | @tsv
+      ' "$MAN" )
   done
   echo "$any"
 }
