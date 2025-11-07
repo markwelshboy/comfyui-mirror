@@ -640,6 +640,7 @@ helpers_resolve_placeholders() {
   # 2) If jq printed nothing (unexpected), do a robust fallback with Perl.
   #    This replaces {VARNAME} -> $ENV{VARNAME}, leaving unknown tokens intact.
   if [ -z "$out" ]; then
+    echo "Trying perl approach..."
     out="$(printf '%s' "$raw" | perl -pe 's/\{([A-Z0-9_]+)\}/$ENV{$1} // $&/gie')"
     # If still empty (very unlikely), echo the raw input as a last resort.
     [ -z "$out" ] && out="$raw"
