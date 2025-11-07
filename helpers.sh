@@ -599,15 +599,19 @@ helpers_human_bytes() { # bytes -> human
   printf "%d %s" "$b" "${u[$d]}"
 }
 
+# Replace {VAR} in either a plain string OR a JSON blob using environment variables.
+# Usage:
+#   helpers_resolve_placeholders "plain/path/{DIFFUSION_MODELS_DIR}/file"
+#   helpers_resolve_placeholders '{"url":"https://...","dst":"{VAE_DIR}/foo"}'
 helpers_resolve_placeholders() {
   _helpers_need jq
-  local raw="$1"        # input string or JSON
-  local map_json="$2"   # JSON string of key->value map
+  local raw
+  raw=$1
 
-  jq -nr -r --arg RAW "$raw" --arg MAP "$map_json" '
-    # ---- defs must come first ----
-    def subst_all($text; $m):
-      reduce ($m | to_entries[]) as $e ($text;
+  jq -nr -r --arg RAW "$raw" '
+    # Replace all {KEY} tokens using values from the process environment
+    def subst_env($text):
+      reduce (env | to_entries[]) as $e ($text;
         gsub("\\{" + ($e.key|tostring) + "\\}"; ($e.value|tostring))
       );
 
@@ -622,17 +626,13 @@ helpers_resolve_placeholders() {
         .
       end;
 
-    # ---- program ----
-    ($MAP | fromjson? // {}) as $M
-    |
+    # Try to parse RAW as JSON; if that fails, treat it as a plain string
     ( $RAW | fromjson? ) as $J
     |
     if $J != null then
-      # RAW is JSON: walk & substitute, then emit JSON text
-      ($J | walk_strings( subst_all(.; $M) )) | tojson
+      ($J | walk_strings( subst_env(.) )) | tojson
     else
-      # RAW is plain string: substitute and emit (always prints a line)
-      (subst_all($RAW; $M) // $RAW)
+      subst_env($RAW)
     end
   '
 }
@@ -939,7 +939,7 @@ helpers_download_from_manifest() {
     ' "$MAN" | while IFS=$'\t' read -r url raw_path; do
         # placeholder substitution
         local path dir out
-        path="$(helpers_resolve_placeholders "$raw_path" "$VARS_JSON")"
+        path="$(helpers_resolve_placeholders "$raw_path")"
         dir="$(dirname -- "$path")"; out="$(basename -- "$path")"
         mkdir -p -- "$dir"
         # skip if exists & looks complete
