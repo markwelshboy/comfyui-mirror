@@ -732,14 +732,45 @@ aria2_clear_results() {
   helpers_rpc_post '{"jsonrpc":"2.0","id":"pd","method":"aria2.purgeDownloadResult","params":["token:'"$ARIA2_SECRET"'"]}' >/dev/null 2>&1 || true
 }
 
+#helpers_rpc() {
+#  local method="$1"; shift
+#  local params="${1:-[]}"
+#  : "${ARIA2_HOST:=127.0.0.1}" "${ARIA2_PORT:=6969}" "${ARIA2_SECRET:=KissMeQuick}"
+#  curl -sS "http://${ARIA2_HOST}:${ARIA2_PORT}/jsonrpc" \
+#    -H 'Content-Type: application/json' \
+#    --data-binary '{"jsonrpc":"2.0","id":"x","method":"'"$method"'","params":["token:'"$ARIA2_SECRET"'",'"$params"']}' \
+#    || true
+#}
+
+# helpers_rpc <method> <params_json_array>
+# params_json_array should be a JSON array (e.g. [ ["url"], {"dir":"...","out":"..."} ])
+
 helpers_rpc() {
   local method="$1"; shift
-  local params="${1:-[]}"
+  local params_json="$1"
   : "${ARIA2_HOST:=127.0.0.1}" "${ARIA2_PORT:=6969}" "${ARIA2_SECRET:=KissMeQuick}"
-  curl -sS "http://${ARIA2_HOST}:${ARIA2_PORT}/jsonrpc" \
-    -H 'Content-Type: application/json' \
-    --data-binary '{"jsonrpc":"2.0","id":"x","method":"'"$method"'","params":["token:'"$ARIA2_SECRET"'",'"$params"']}' \
-    || true
+
+  # Build final params = ["token:SECRET", ...original array items...]
+  local payload
+  if [[ -n "$ARIA2_SECRET" ]]; then
+    payload="$(
+      jq -nc \
+         --arg m "$method" \
+         --arg t "token:$ARIA2_SECRET" \
+         --argjson p "$params_json" '
+        {jsonrpc:"2.0", id:"x", method:$m,
+         params: ( [$t] + $p ) }'
+    )"
+  else
+    payload="$(
+      jq -nc --arg m "$method" --argjson p "$params_json" \
+        '{jsonrpc:"2.0", id:"x", method:$m, params:$p}'
+    )"
+  fi
+
+  curl -sS "http://$ARIA2_HOST:$ARIA2_PORT/jsonrpc" \
+       -H 'Content-Type: application/json' \
+       --data-binary "$payload"
 }
 
 aria2_stop_all() {
@@ -953,11 +984,24 @@ helpers_download_from_manifest() {
         mkdir -p -- "$dir"
         # skip if exists & looks complete
         if [[ -f "$path" && ! -f "$path.aria2" ]]; then
+          echo "[enqueue-debug] SKIP (path exists, no path.aria2): $path" >&2
           : $(( any+=0 ))
           continue
         fi
-        echo "📥 Queue: $out"
-        helpers_rpc 'aria2.addUri' "$(jq -n --arg d "$dir" --arg o "$out" --arg u "$url" '[["\($u)"], {"dir": $d, "out": $o}]')" >/dev/null
+        echo "[enqueue-debug] URL: $url" >&2
+        echo "[enqueue-debug] RAW: $raw_path" >&2
+        echo "[enqueue-debug] RESOLVED: $path" >&2    
+        echo "[enqueue-debug] DIR: $dir" >&2    
+        #echo "📥 Queue (in): $out"
+        #helpers_rpc 'aria2.addUri' "$(jq -n --arg d "$dir" --arg o "$out" --arg u "$url" '[["\($u)"], {"dir": $d, "out": $o}]')" >/dev/null
+        #any=1
+        resp="$(helpers_rpc 'aria2.addUri' "$(jq -n --arg d "$dir" --arg o "$out" --arg u "$url" '[["\($u)"], {"dir": $d, "out": $o}]')")"
+        gid="$(jq -r '.result // empty' <<<"$resp")"
+        if [[ -n "$gid" ]]; then
+          echo "📥 Queue: $out  (gid: $gid)"
+        else
+          echo "[enqueue-debug] Sans Queue :( -> ERROR addUri: $resp" >&2
+        fi
         any=1
       done
   done
