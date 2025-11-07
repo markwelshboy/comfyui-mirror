@@ -972,7 +972,7 @@ helpers_download_from_manifest() {
         # placeholder substitution
         local path dir out
         path="$(helpers_resolve_placeholders "$raw_path")"
-        dir="$(dirname -- "$path")"; out="$(basename -- "$path")"
+        dir="$(dirname -- "$sspath")"; out="$(basename -- "$path")"
         mkdir -p -- "$dir"
         # skip if exists & looks complete
         if [[ -f "$path" && ! -f "$path.aria2" ]]; then
