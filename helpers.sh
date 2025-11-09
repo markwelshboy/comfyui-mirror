@@ -592,11 +592,16 @@ mkdir -p "$COMFY_LOGS" "$COMFY/models" >/dev/null 2>&1 || true
 _helpers_need() { command -v "$1" >/dev/null || { echo "Missing $1" >&2; exit 1; }; }
 
 # ---- tiny utils ----
-helpers_human_bytes() { # bytes -> human
-  local b=${1:-0} d=0 unit=Bytes
-  local -a u=(Bytes KB MB GB TB PB)
-  while (( b >= 1024 && d < ${#u[@]}-1 )); do b=$((b/1024)); ((d++)); done
-  printf "%d %s" "$b" "${u[$d]}"
+helpers_human_bytes() { # bytes -> human-readable
+  local b=${1:-0} d=0
+  local -a u=("Bytes" "KB" "MB" "GB" "TB" "PB")
+
+  while (( b >= 1024 && d < (${#u[@]} - 1) )); do
+    b=$(awk -v v="$b" 'BEGIN {printf "%.2f", v/1024}')
+    ((d++))
+  done
+
+  printf "%s %s" "$b" "${u[$d]}"
 }
 
 #=======================================================================
@@ -1493,7 +1498,7 @@ helpers_civitai_pick_name() {
 }
 
 # --- Enqueue a single VERSION into aria2 RPC; returns 0 if enqueued
-helpers_civitai_enqueue_version() {
+civitai_download_versionid() {
   local ver_id="$1" dest_dir="$2"
   local vjson name url
 
@@ -1558,7 +1563,7 @@ aria2_enqueue_and_wait_from_civitai() {
   if [[ -n "${ids// }" ]]; then
     [[ "$CIVITAI_DEBUG" -eq 1 ]] && echo "→ Parsed $(wc -w <<<"$ids") LoRA id(s): $ids" >&2
     for vid in $ids; do
-      if helpers_civitai_enqueue_version "$vid" "$lora_dir"; then any=1; fi
+      if civitai_download_versionid "$vid" "$lora_dir"; then any=1; fi
     done
   else
     echo "⏭️ No LoRA id(s) parsed." >&2
@@ -1569,7 +1574,7 @@ aria2_enqueue_and_wait_from_civitai() {
   if [[ -n "${ids// }" ]]; then
     [[ "$CIVITAI_DEBUG" -eq 1 ]] && echo "→ Parsed $(wc -w <<<"$ids") Checkpoint id(s): $ids" >&2
     for vid in $ids; do
-      if helpers_civitai_enqueue_version "$vid" "$ckpt_dir"; then any=1; fi
+      if civitai_download_versionid "$vid" "$ckpt_dir"; then any=1; fi
     done
   else
     echo "⏭️ No Checkpoint id(s) parsed."
