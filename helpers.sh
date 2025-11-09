@@ -1126,22 +1126,14 @@ aria2_download_from_manifest() {
 
   # Dedupe sections
   if ((${#ENABLED[@]} == 0)); then
-    echo "aria2_download_from_manifest: no download_* environment variables set that match section tags in manifest '$src'." >&2
+    echo "aria2_download_from_manifest: no sections enabled in manifest '$src'." >&2
     echo 0               # <- $any = 0 (nothing enqueued), but NOT an error
     [[ -n "$tmp" ]] && rm -f "$tmp"
     return 0
   fi
   mapfile -t ENABLED < <(printf '%s\n' "${ENABLED[@]}" | awk '!seen[$0]++')
 
-  # Start daemon if needed
-
-  aria2_clear_results >/dev/null 2>&1 || true
-  echo "== Ensuring aria2 daemon is running before manifest enqueue ==" >&2
-  if ! helpers_have_aria2_rpc; then
-    echo "Starting aria2 RPC daemon..."
-    aria2_start_daemon
-  fi
-
+  # (Daemon should already be running; leave that to top-level)
   local any=0
 
   for sec in "${ENABLED[@]}"; do
@@ -1240,6 +1232,9 @@ aria2_enqueue_and_wait_from_manifest() {
     "${ARIA2_PROGRESS_INTERVAL:-15}" \
     "${ARIA2_PROGRESS_BAR_WIDTH:-40}" \
     "${COMFY_LOGS:-/workspace/logs}/aria2_progress.log"
+
+  # Show completed block when done
+  helpers_print_completed_from_aria2 2>/dev/null || true
 
   aria2_clear_results >/dev/null 2>&1 || true
   trap - INT TERM
