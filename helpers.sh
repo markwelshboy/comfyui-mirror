@@ -911,9 +911,8 @@ aria2_show_download_snapshot() {
         if [[ -n "${COMFY:-${COMFY_HOME:-}}" && "$dir" == "${COMFY:-${COMFY_HOME:-}}/"* ]]; then
           dir="${dir#${COMFY:-${COMFY_HOME:-}}/}"
         fi
-        printf " %5.1f%% %-*s %9s/s (%9s / %9s)  [ %-20s ] %s\n" \
-              "$pct" "${ARIA2_PROGRESS_BAR_WIDTH:-40}" "$B" "$spdH" "$doneH" "$totH" "$dir" "$name"      
-      done
+        printf " %5.1f%% %-*s %10s/s (%8s / %8s)  [ %-24s ] %s\n" \
+          "$pct" "${ARIA2_PROGRESS_BAR_WIDTH:-40}" "$B" "$spdH" "$doneH" "$totH" "$dir" "$name"      done
   fi
 
   ########################################################################
@@ -975,9 +974,19 @@ aria2_show_download_snapshot() {
   ########################################################################
   local merged total_done total_size total_speed
   merged="$(jq -c -n --argjson a "$act" --argjson w "$wai" '$a + $w')" || merged='[]'
-  total_done="$(jq -r '[.[] | ((.completedLength // "0") | tonumber)] | add' <<<"$merged" 2>/dev/null || echo 0)"
-  total_size="$(jq -r '[.[] | ((.totalLength    // "0") | tonumber)] | add' <<<"$merged" 2>/dev/null || echo 0)"
-  total_speed="$(jq -r '[.[] | ((.downloadSpeed // "0") | tonumber)] | add' <<<"$merged" 2>/dev/null || echo 0)"
+
+  total_done="$(
+    jq -r '[.[] | ((.completedLength // "0") | tonumber)] | add // 0' \
+      <<<"$merged" 2>/dev/null || echo 0
+  )"
+  total_size="$(
+    jq -r '[.[] | ((.totalLength    // "0") | tonumber)] | add // 0' \
+      <<<"$merged" 2>/dev/null || echo 0
+  )"
+  total_speed="$(
+    jq -r '[.[] | ((.downloadSpeed // "0") | tonumber)] | add // 0' \
+      <<<"$merged" 2>/dev/null || echo 0
+  )"
 
   echo "--------------------------------------------------------------------------------"
   printf "Group total: speed %s/s, done %s / %s\n" \
