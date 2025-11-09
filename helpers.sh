@@ -912,7 +912,8 @@ aria2_show_download_snapshot() {
           dir="${dir#${COMFY:-${COMFY_HOME:-}}/}"
         fi
         printf " %5.1f%% %-*s %10s/s (%8s / %8s)  [ %-24s ] %s\n" \
-          "$pct" "${ARIA2_PROGRESS_BAR_WIDTH:-40}" "$B" "$spdH" "$doneH" "$totH" "$dir" "$name"      done
+          "$pct" "${ARIA2_PROGRESS_BAR_WIDTH:-40}" "$B" "$spdH" "$doneH" "$totH" "$dir" "$name"
+      done
   fi
 
   ########################################################################
