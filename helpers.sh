@@ -606,7 +606,7 @@ helpers_human_bytes() { # bytes -> human
 #=======================================================================
 
 # start_aria2_daemon: launch aria2c daemon if not already running
-helpers_start_aria2_daemon() {
+aria2_start_daemon() {
   : "${ARIA2_HOST:=127.0.0.1}"
   : "${ARIA2_PORT:=6969}"
   : "${ARIA2_SECRET:=KissMeQuick}"
@@ -758,129 +758,217 @@ helpers_queue_empty() {
 }
 
 # ---- Foreground progress with trap ----
-helpers_progress_snapshot_loop() {
-  local interval="${1:-10}" log="${3:-/workspace/logs/aria2_progress.log}"
+aria2_monitor_progress() {
+  local interval="${1:-10}" barw="${2:-40}" log="${3:-/workspace/logs/aria2_progress.log}"
   mkdir -p "$(dirname "$log")"
-  while true; do
-    helpers_progress_snapshot_once | tee -a "$log"
-    if helpers_queue_empty; then break; fi
-    sleep "$interval" & wait $!
+
+  local _stop=0
+  _loop_trap() {
+    echo "⚠️  Aria2 Downloader Interrupted — pausing queue…" >&2
+    helpers_rpc 'aria2.pauseAll' '[]' >/dev/null 2>&1 || true
+    if [[ "${ARIA2_SHUTDOWN_ON_INT:-0}" == "1" ]]; then
+      echo "⚠️  Shutting down aria2 daemon…" >&2
+      helpers_rpc 'aria2.forceShutdown' '[]' >/dev/null 2>&1 || true
+    fi
+    _stop=1
+  }
+  trap _loop_trap INT TERM
+
+  while :; do
+    aria2_show_download_snapshot | tee -a "$log"
+    if helpers_queue_empty || [[ $_stop -eq 1 ]]; then
+      break
+    fi
+    sleep "$interval"
   done
+
+  trap - INT TERM
 }
 
-helpers_progress_snapshot_once() {
+aria2_show_download_snapshot() {
   : "${ARIA2_HOST:=127.0.0.1}"; : "${ARIA2_PORT:=6969}"; : "${ARIA2_SECRET:=KissMeQuick}"
   : "${ARIA2_PROGRESS_MAX:=999}"
+  : "${ARIA2_PROGRESS_BAR_WIDTH:=40}"
 
-  local body resp
-  body="$(jq -cn --arg t "token:$ARIA2_SECRET" \
-    '{jsonrpc:"2.0",id:"A",method:"aria2.tellActive",params:[$t]},
-     {jsonrpc:"2.0",id:"W",method:"aria2.tellWaiting",params:[$t,0,1000]},
-     {jsonrpc:"2.0",id:"S",method:"aria2.tellStopped",params:[$t,0,200]}' )"
-  # inside helpers_progress_snapshot_once
-  resp="$(curl --max-time 4 -fsS "http://$ARIA2_HOST:$ARIA2_PORT/jsonrpc" \
-            -H 'Content-Type: application/json' \
-            --data-binary "$body" 2>/dev/null)" || {
-    echo "================================================================================"
-    echo "=== Huggingface Model Downloader: aria2 progress @ $(date '+%Y-%m-%d %H:%M:%S') ==="
-    echo "=== (RPC timeout or unreachable; showing zero activity)"
-    echo "--------------------------------------------------------------------------------"
-    return 0
-  }
+  # --- Fetch three views from aria2 ---
+  local a_json w_json s_json
+  a_json="$(helpers_rpc 'aria2.tellActive'  '[]'          2>/dev/null || echo '{"result":[]}' )"
+  w_json="$(helpers_rpc 'aria2.tellWaiting' '[0,1000]'    2>/dev/null || echo '{"result":[]}' )"
+  s_json="$(helpers_rpc 'aria2.tellStopped' '[-1000,1000]' 2>/dev/null || echo '{"result":[]}' )"
 
-  # Slurp stream into arrays by id, coalescing to [] safely
-  # - With -s (slurp), jq receives an *array* of the three replies
-  # - We pick .result by id and "add" them into one flat array
-  # - The // [] ensures we never get null, and the final add // [] ensures valid []
-  local active waiting stopped
+  # Normalize to compact arrays for active/waiting/stopped
+  local act wai sto
+  act="$(jq -c '(.result // [])' <<<"$a_json" 2>/dev/null || echo '[]')"
+  wai="$(jq -c '(.result // [])' <<<"$w_json" 2>/dev/null || echo '[]')"
+  sto="$(jq -c '(.result // [])' <<<"$s_json" 2>/dev/null || echo '[]')"
 
-  # Slurp stream into arrays (always valid JSON arrays)
-  active="$(
-    jq -c -sr 'map(select(.id=="A") | (.result // [])) | add // []' <<<"$resp" 2>/dev/null
-  )"; [[ -z "$active"  ]]  && active='[]'
+  [[ -z "$act" ]] && act='[]'
+  [[ -z "$wai" ]] && wai='[]'
+  [[ -z "$sto" ]] && sto='[]'
 
-  waiting="$(
-    jq -c -sr 'map(select(.id=="W") | (.result // [])) | add // []' <<<"$resp" 2>/dev/null
-  )"; [[ -z "$waiting" ]] && waiting='[]'
+  local active_count waiting_count completed_count
+  active_count="$(jq -r 'length' <<<"$act" 2>/dev/null || echo 0)"
+  waiting_count="$(jq -r 'length' <<<"$wai" 2>/dev/null || echo 0)"
+  completed_count="$(jq -r 'length' <<<"$sto" 2>/dev/null || echo 0)"
 
-  stopped="$(
-    jq -c -sr 'map(select(.id=="S") | (.result // [])) | add // []' <<<"$resp" 2>/dev/null
-  )"; [[ -z "$stopped" ]] && stopped='[]'
-
-  # Merge active + waiting (must use -n so jq doesn't read stdin)
-  merged="$(jq -c -n --argjson a "$active" --argjson w "$waiting" '$a + $w')" || merged='[]'
-
-  # Count safely
-  count="$(jq -r 'length' <<<"$merged" 2>/dev/null || echo 0)"
-
+  # --- Header ---
   echo "================================================================================"
-  echo "=== Huggingface Model Downloader: aria2 progress @ $(date '+%Y-%m-%d %H:%M:%S') ==="
-  echo "==="
-  echo "=== Active downloads: $count"
-  echo "--------------------------------------------------------------------------------"
+  echo "=== Aria2 Downloader Snapshot @ $(date '+%Y-%m-%d %H:%M:%S')"
+  echo "=== Active: $active_count   Pending: $waiting_count   Completed: $completed_count"
+  echo "================================================================================"
 
-  if (( count == 0 )); then
-    echo "Group total: speed 0 B/s, done 0 B / 0 B"
-    return 0
+  # ============================================================
+  # PENDING SECTION (wait queue, show URL + dest dir/file)
+  # ============================================================
+  echo
+  echo "Pending (waiting queue)"
+  echo "--------------------------------------------------------------------------------"
+  if (( waiting_count == 0 )); then
+    echo "  (none)"
+  else
+    # collect TSV lines: name<TAB>dir<TAB>uri
+    local -a pending_rows=()
+    mapfile -t pending_rows < <(
+      jq -r '
+        (.result // [])[]
+        | ( if (.files|type=="array" and (.files|length)>0 and (.files[0].path? // "")!="")
+            then .files[0].path
+            else .bittorrent.info.name? // .infoHash // "unknown"
+            end ) as $full
+        | ( if ($full|contains("/")) then
+              ($full | capture("(?<dir>.*)/(?<name>[^/]+)$"))
+            else
+              {dir:"", name:$full}
+            end ) as $p
+        | ( .files[0].uris[0].uri? // "" ) as $u
+        | "\($p.name)\t\($p.dir)\t\($u)"
+      ' <<<"$w_json" 2>/dev/null
+    )
+
+    # find widest name for pretty alignment
+    local maxlen=0 row name dir url
+    for row in "${pending_rows[@]}"; do
+      IFS=$'\t' read -r name dir url <<<"$row"
+      (( ${#name} > maxlen )) && maxlen=${#name}
+    done
+
+    for row in "${pending_rows[@]}"; do
+      IFS=$'\t' read -r name dir url <<<"$row"
+      if [[ -n "${COMFY:-${COMFY_HOME:-}}" && "$dir" == "${COMFY:-${COMFY_HOME:-}}"* ]]; then
+        dir="${dir#${COMFY:-${COMFY_HOME:-}}/}"
+      fi
+      printf "  ⏳ %-*s  %-40s  %s\n" "$maxlen" "$name" "$dir" "$url"
+    done
   fi
 
-  mapfile -t names < <(jq -r '.[] | (.files[0].path // .bittorrent.info.name // .infoHash // .gid // "unknown") | split("/") | last' <<<"$merged")
-  mapfile -t dirs  < <(jq -r '.[] | (.files[0].path // "") | split("/") | .[0:-1] | join("/")' <<<"$merged")
-  mapfile -t sizes < <(jq -r '.[] | (.totalLength // 0)' <<<"$merged")
-  mapfile -t dones < <(jq -r '.[] | (.completedLength // 0)' <<<"$merged")
-  mapfile -t speeds< <(jq -r '.[] | (.downloadSpeed // 0)' <<<"$merged")
+  # ============================================================
+  # DOWNLOADING SECTION (active, with bars/speeds/sizes)
+  # ============================================================
+  echo
+  echo "Downloading (active transfers)"
+  echo "--------------------------------------------------------------------------------"
+  if (( active_count == 0 )); then
+    echo "  (none)"
+  else
+    A="$act" ARIA2_PROGRESS_BAR_WIDTH="$ARIA2_PROGRESS_BAR_WIDTH" jq -r '
+      def hb($n):
+        ($n|tonumber) as $x
+        | if   $x>=1099511627776 then ((($x/1099511627776)|floor|tostring) + " TB")
+          elif $x>=1073741824    then ((($x/1073741824 )|floor|tostring) + " GB")
+          elif $x>=1048576       then ((($x/1048576   )|floor|tostring) + " MB")
+          elif $x>=1024          then ((($x/1024      )|floor|tostring) + " KB")
+          else ($x|tostring) + " Bytes"
+          end;
 
-  local i max="$ARIA2_PROGRESS_MAX"
-  for ((i=0; i<count && i<max; i++)); do
-    local tot="${sizes[i]:-0}" done="${dones[i]:-0}" spd="${speeds[i]:-0}" pct=0
-    (( tot > 0 )) && pct=$(( done*100/tot ))
-    local bars=$(( (pct*40)/100 )) bar line
-    printf -v bar '%*s' "$bars" ''; bar=${bar// /#}
-    printf -v line '%-40s' "$bar"
+      def bar($pct; $W):
+        ( ($W * ($pct/100.0)) | floor ) as $f
+        | "[" + ( (range(0;$f) | "#") + (range($f;$W) | "-") ) + "]";
 
-    local dir="${dirs[i]:-.}"
-    [[ -n "${COMFY:-}" && "$dir" == "$COMFY"* ]] && dir="${dir#$COMFY/}"
+      (env.A // "[]") | fromjson
+      | .[]? as $t
+      | ($t.completedLength|tonumber) as $done
+      | ($t.totalLength    |tonumber) as $tot
+      | ($t.downloadSpeed  |tonumber) as $spd
+      | ($t.files|type) as $ft
+      | (if $ft=="array" and ($t.files|length)>0 and ($t.files[0].path? // "")!="" then
+           ($t.files[0].path | capture("(?<dir>.*)/(?<name>[^/]+)$"))
+         else
+           {"dir":"", "name":($t.bittorrent.info.name? // $t.infoHash // "unknown")}
+         end) as $p
+      | (if $tot>0 then 100.0 * $done / $tot else 0 end) as $pct
+      | (if $pct>100 then 100 elif $pct<0 then 0 else $pct end) as $pc
+      | (env.ARIA2_PROGRESS_BAR_WIDTH|tonumber? // 40) as $W
+      | (bar($pc; $W)) as $B
+      # TSV: pct | bar | spd_h | done_h | tot_h | dir | name
+      | [ ((($pc*10)|round)/10.0), $B, hb($spd), hb($done), (if $tot>0 then hb($tot) else "?" end), $p.dir, $p.name ]
+      | @tsv
+    ' 2>/dev/null \
+    | while IFS=$'\t' read -r pct B spdH doneH totH dir name; do
+        [[ -n "${COMFY:-${COMFY_HOME:-}}" && "$dir" == "${COMFY:-${COMFY_HOME:-}}"* ]] && dir="${dir#${COMFY:-${COMFY_HOME:-}}/}"
+        printf " %5.1f%% %-*s %10s  (%12s / %12s)  [ %-20s ] %s\n" \
+          "$pct" "$ARIA2_PROGRESS_BAR_WIDTH" "$B" "$spdH" "$doneH" "$totH" "$dir" "$name"
+      done
+  fi
 
-    printf " %3d%% [%s] %4s/s  (%s / %s)  [ Destination -> %s ] %s\n" \
-      "$pct" "$line" \
-      "$(helpers_human_bytes "$spd")" \
-      "$(helpers_human_bytes "$done")" \
-      "$(helpers_human_bytes "$tot")" \
-      "$dir" \
-      "${names[i]}"
-  done
+  # ============================================================
+  # COMPLETED SECTION (stopped, this session)
+  # ============================================================
+  echo
+  echo "Completed (this session)"
+  echo "--------------------------------------------------------------------------------"
+  if (( completed_count == 0 )); then
+    echo "  (none)"
+  else
+    # collect as name<TAB>relpath<TAB>size_bytes and reuse style
+    local -a completed_rows=()
+    mapfile -t completed_rows < <(
+      jq -r '
+        (.result // [])[]
+        | ( if (.files|type=="array" and (.files|length)>0 and (.files[0].path? // "")!="")
+            then .files[0].path
+            else .bittorrent.info.name? // .infoHash // "unknown"
+            end ) as $full
+        | ( if ($full|contains("/")) then
+              ($full | capture("(?<dir>.*)/(?<name>[^/]+)$"))
+            else
+              {dir:"", name:$full}
+            end ) as $p
+        | "\($p.name)\t\($p.dir)\t\((.totalLength // "0") | tonumber)"
+      ' <<<"$s_json" 2>/dev/null
+    )
 
-  local total_done total_size total_speed
+    # compute width for alignment
+    local maxlen=0 crow cname cdir cbytes
+    for crow in "${completed_rows[@]}"; do
+      IFS=$'\t' read -r cname cdir cbytes <<<"$crow"
+      (( ${#cname} > maxlen )) && maxlen=${#cname}
+    done
+
+    for crow in "${completed_rows[@]}"; do
+      IFS=$'\t' read -r cname cdir cbytes <<<"$crow"
+      if [[ -n "${COMFY:-${COMFY_HOME:-}}" && "$cdir" == "${COMFY:-${COMFY_HOME:-}}"* ]]; then
+        cdir="${cdir#${COMFY:-${COMFY_HOME:-}}/}"
+      fi
+      local human_size
+      human_size="$(helpers_human_bytes "${cbytes:-0}")"
+      printf " ✅ %-*s  %-40s  (%s)\n" "$maxlen" "$cname" "$cdir" "$human_size"
+    done
+  fi
+
+  # ============================================================
+  # GROUP TOTALS
+  # ============================================================
+  local merged total_done total_size total_speed
+  merged="$(jq -c -n --argjson a "$act" --argjson w "$wai" '$a + $w')" || merged='[]'
   total_done="$(jq -r '[.[] | ((.completedLength // "0") | tonumber)] | add' <<<"$merged" 2>/dev/null || echo 0)"
   total_size="$(jq -r '[.[] | ((.totalLength    // "0") | tonumber)] | add' <<<"$merged" 2>/dev/null || echo 0)"
   total_speed="$(jq -r '[.[] | ((.downloadSpeed // "0") | tonumber)] | add' <<<"$merged" 2>/dev/null || echo 0)"
+
   echo "--------------------------------------------------------------------------------"
   printf "Group total: speed %s/s, done %s / %s\n" \
     "$(helpers_human_bytes "$total_speed")" \
     "$(helpers_human_bytes "$total_done")" \
     "$(helpers_human_bytes "$total_size")"
-}
-
-# Print aligned "Completed (this session)" block from a list of "name<TAB>relpath<TAB>size"
-helpers_print_completed_block() {
-  local lines=("$@")
-  [[ ${#lines[@]} -eq 0 ]] && return 0
-
-  local maxlen=0
-  local name relpath size
-  # find longest name
-  for row in "${lines[@]}"; do
-    IFS=$'\t' read -r name relpath size <<<"$row"
-    (( ${#name} > maxlen )) && maxlen=${#name}
-  done
-
-  echo
-  echo "Completed (this session)"
-  echo "--------------------------------------------------------------------------------"
-  for row in "${lines[@]}"; do
-    IFS=$'\t' read -r name relpath size <<<"$row"
-    printf "✔ %-*s  %s  (%s)\n" "$maxlen" "$name" "$relpath" "$size"
-  done
 }
 
 #-----------------------------------------------------------------------
@@ -984,16 +1072,40 @@ helpers_manifest_enqueue_one() {
 # ---- Process json list for downloads to pull ----
 
 # ---- Manifest Enqueue ----
-helpers_download_from_manifest() {
+aria2_download_from_manifest() {
   _helpers_need curl; _helpers_need jq; _helpers_need awk
 
-  [[ -n "${MODEL_MANIFEST_URL:-}" ]] || { echo "MODEL_MANIFEST_URL is not set." >&2; return 1; }
+  # Optional arg: manifest source; if empty, fall back to MODEL_MANIFEST_URL.
+  # Source can be:
+  #   - local file path (JSON)
+  #   - URL (http/https)
+  local src="${1:-${MODEL_MANIFEST_URL:-}}"
+  if [[ -z "$src" ]]; then
+    echo "aria2_download_from_manifest: no manifest source given and MODEL_MANIFEST_URL is not set." >&2
+    return 1
+  fi
 
-  local MAN; MAN="$(mktemp)"
-  curl -fsSL "$MODEL_MANIFEST_URL" -o "$MAN" || { echo "Failed to fetch manifest: $MODEL_MANIFEST_URL" >&2; return 1; }
+  local MAN tmp=""
+  if [[ -f "$src" ]]; then
+    # Local file
+    MAN="$src"
+  else
+    # Treat as URL and download to temp file
+    MAN="$(mktemp)"
+    tmp="$MAN"
+    if ! curl -fsSL "$src" -o "$MAN"; then
+      echo "aria2_download_from_manifest: failed to fetch manifest: $src" >&2
+      rm -f "$tmp"
+      return 1
+    fi
+  fi
 
-  # build vars map (even if not used later, keep parity)
-  local VARS_JSON; VARS_JSON="$(helpers_build_vars_json "$MAN")" || return 1
+  # build vars map (kept for parity, even if not directly used)
+  local VARS_JSON
+  VARS_JSON="$(helpers_build_vars_json "$MAN")" || {
+    [[ -n "$tmp" ]] && rm -f "$tmp"
+    return 1
+  }
 
   # find enabled sections
   local SECTIONS_ALL ENABLED sec dl_var
@@ -1001,23 +1113,36 @@ helpers_download_from_manifest() {
   ENABLED=()
   while read -r sec; do
     dl_var="download_${sec}"
-    if [[ "${!sec:-}" == "true" || "${!sec:-}" == "1" || "${!dl_var:-}" == "true" || "${!dl_var:-}" == "1" ]]; then
+    if [[ "${!sec:-}" == "true" || "${!sec:-}" == "1" || \
+          "${!dl_var:-}" == "true" || "${!dl_var:-}" == "1" ]]; then
       ENABLED+=("$sec")
     fi
   done <<<"$SECTIONS_ALL"
-  if ((${#ENABLED[@]}==0)); then
-    echo "No sections enabled. Available:"; echo "$SECTIONS_ALL" | sed 's/^/  - /'; return 0
+
+  # Dedupe sections
+  if ((${#ENABLED[@]} == 0)); then
+    echo "aria2_download_from_manifest: no download_* environment variables set that match section tags in manifest '$src'." >&2
+    echo 0               # <- $any = 0 (nothing enqueued), but NOT an error
+    [[ -n "$tmp" ]] && rm -f "$tmp"
+    return 0
   fi
   mapfile -t ENABLED < <(printf '%s\n' "${ENABLED[@]}" | awk '!seen[$0]++')
 
-  helpers_start_aria2_daemon || return 1
+  # Start daemon if needed
+
+  aria2_clear_results >/dev/null 2>&1 || true
+  echo "== Ensuring aria2 daemon is running before manifest enqueue ==" >&2
+  if ! helpers_have_aria2_rpc; then
+    echo "Starting aria2 RPC daemon..."
+    aria2_start_daemon
+  fi
 
   local any=0
 
   for sec in "${ENABLED[@]}"; do
     echo ">>> Enqueue section: $sec" >&2
 
-    # Build the TSV *first* (no process substitution, no pipeline)
+    # Build TSV in this shell
     local tsv
     tsv="$(
       jq -r --arg sec "$sec" '
@@ -1031,15 +1156,34 @@ helpers_download_from_manifest() {
       ' "$MAN"
     )"
 
-    # Iterate tsv in the *current* shell (no subshell)
+    # If this section has no actual URL entries, just continue
+    [[ -z "$tsv" ]] && continue
+
+    # Iterate TSV lines
     while IFS=$'\t' read -r url raw_path; do
       # unified enqueue -> records gid via helpers_rpc_add_uri
-      if helpers_manifest_enqueue_one "$url" "$raw_path"; then any=1; fi
+      # helpers_manifest_enqueue_one should:
+      #   - print Queue / SKIP messages to stderr
+      #   - return 0 if success/skip, non-zero on error
+      #   - increment any only if something was enqueued
+      if helpers_manifest_enqueue_one "$url" "$raw_path"; then
+        any=1
+      fi
     done <<<"$tsv"
 
   done
 
+  [[ -n "$tmp" ]] && rm -f "$tmp"
+
+  # At this point:
+  #   any = 1  -> at least one item enqueued
+  #   any = 0  -> sections enabled but everything was already present/skipped
+  if [[ "$any" == "0" ]]; then
+    echo "aria2_download_from_manifest: nothing new to enqueue (all targets already present) from '$src'." >&2
+  fi
+
   printf '%s\n' "$any"
+  return 0
 }
 
 #=======================================================================================
@@ -1047,15 +1191,20 @@ helpers_download_from_manifest() {
 #=======================================================================================
 
 aria2_enqueue_and_wait_from_manifest() {
+  local manifest_src="${1:-}"   # optional: URL or local JSON; default MODEL_MANIFEST_URL inside downloader
+
   aria2_clear_results >/dev/null 2>&1 || true
-  helpers_have_aria2_rpc || helpers_start_aria2_daemon
+  helpers_have_aria2_rpc || aria2_start_daemon
 
   local trapped=0
   _cleanup_trap_manifest() {
     (( trapped )) && return 0
     trapped=1
-    echo; echo "⚠️  Aria2 Downloader Interrupted — stopping queue and cleaning results…"
-    aria2_stop_all >/dev/null 2>&1 || true
+    echo
+    echo "⚠️  Aria2 Downloader Interrupted — stopping queue and cleaning results…"
+    # Nice to show what's left when user interrupts
+    helpers_print_pending_from_aria2 2>/dev/null || true
+    aria2_stop_all    >/dev/null 2>&1 || true
     aria2_clear_results >/dev/null 2>&1 || true
     return 130
   }
@@ -1066,17 +1215,23 @@ aria2_enqueue_and_wait_from_manifest() {
   echo "=== Huggingface Model Downloader: Processing queuing @ $(date '+%Y-%m-%d %H:%M:%S') ==="
   echo "==="
 
-  local any; any="$(helpers_download_from_manifest || echo 0)"
-  if [[ "$any" == "0" ]] && ! helpers_queue_empty; then
-    echo "Nothing to enqueue from json manifest."
+  local any
+  if ! any="$(aria2_download_from_manifest "$manifest_src")"; then
+    echo "aria2_enqueue_and_wait_from_manifest: manifest processing failed." >&2
+    trap - INT TERM
+    return 1
+  fi
+
+  # Downloader *already* printed any "nothing to enqueue" messages.
+  # Here we just decide whether to start the monitor loop.
+  if [[ "$any" == "0" ]] && helpers_queue_empty; then
+    # No new items and queue empty -> nothing to wait for
     trap - INT TERM
     return 0
   fi
-  
-  # Let something start downloading
-  sleep 2
-  # Loop while data is being processed
-  helpers_progress_snapshot_loop \
+
+  # Otherwise: either we enqueued something, or queue already had items.
+  aria2_monitor_progress \
     "${ARIA2_PROGRESS_INTERVAL:-15}" \
     "${ARIA2_PROGRESS_BAR_WIDTH:-40}" \
     "${COMFY_LOGS:-/workspace/logs}/aria2_progress.log"
@@ -1112,9 +1267,9 @@ aria2_enqueue_and_wait_from_manifest() {
 #   CIVITAI_PROBE=0|1             1-byte probe before enqueue (default: 1)
 #
 # Requires:
-#   helpers_human_bytes, helpers_start_aria2_daemon,
-#   helpers_rpc_add_uri, helpers_have_aria2_rpc, helpers_start_aria2_daemon,
-#   helpers_progress_snapshot_loop, aria2_clear_results, aria2_stop_all
+#   helpers_human_bytes, aria2_start_daemon,
+#   helpers_rpc_add_uri, helpers_have_aria2_rpc, aria2_start_daemon,
+#   aria2_monitor_progress, aria2_clear_results, aria2_stop_all
 
 # Keep ASCII-ish, tool-friendly names that Comfy pickers like.
 # Rules:
@@ -1379,7 +1534,7 @@ helpers_civitai_enqueue_version() {
 # --- Batch: parse env lists, enqueue to correct dirs, run your progress loop
 aria2_enqueue_and_wait_from_civitai() {
   aria2_clear_results >/dev/null 2>&1 || true
-  helpers_have_aria2_rpc || helpers_start_aria2_daemon
+  helpers_have_aria2_rpc || aria2_start_daemon
 
   local trapped=0
   _cleanup_trap_civitai() {
@@ -1429,7 +1584,7 @@ aria2_enqueue_and_wait_from_civitai() {
   fi
 
   # Use your existing nice progress UI
-  helpers_progress_snapshot_loop "${ARIA2_PROGRESS_INTERVAL:-30}" "${ARIA2_PROGRESS_BAR_WIDTH:-40}" \
+  aria2_monitor_progress "${ARIA2_PROGRESS_INTERVAL:-30}" "${ARIA2_PROGRESS_BAR_WIDTH:-40}" \
     "${COMFY_LOGS:-/workspace/logs}/aria2_progress.log"
 
   aria2_clear_results >/dev/null 2>&1 || true
