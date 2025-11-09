@@ -799,9 +799,9 @@ aria2_show_download_snapshot() {
 
   # --- Fetch three views from aria2 ---
   local a_json w_json s_json
-  a_json="$(helpers_rpc 'aria2.tellActive'  '[]'            2>/dev/null || echo '{"result":[]}' )"
-  w_json="$(helpers_rpc 'aria2.tellWaiting' '[0,1000]'      2>/dev/null || echo '{"result":[]}' )"
-  s_json="$(helpers_rpc 'aria2.tellStopped' '[-1000,1000]'  2>/dev/null || echo '{"result":[]}' )"
+  a_json="$(helpers_rpc 'aria2.tellActive'  '[]'           2>/dev/null || echo '{"result":[]}' )"
+  w_json="$(helpers_rpc 'aria2.tellWaiting' '[0,1000]'     2>/dev/null || echo '{"result":[]}' )"
+  s_json="$(helpers_rpc 'aria2.tellStopped' '[0,1000]'     2>/dev/null || echo '{"result":[]}' )"
 
   local act wai sto
   act="$(jq -c '(.result // [])' <<<"$a_json" 2>/dev/null || echo '[]')"
@@ -911,7 +911,7 @@ aria2_show_download_snapshot() {
         if [[ -n "${COMFY:-${COMFY_HOME:-}}" && "$dir" == "${COMFY:-${COMFY_HOME:-}}/"* ]]; then
           dir="${dir#${COMFY:-${COMFY_HOME:-}}/}"
         fi
-        printf " %5.1f%% %-*s %10s  (%12s / %12s)  [ Destination -> %-28s ] %s\n" \
+        printf " %5.1f%% %-*s %5s/s (%4s / %4s)  [ %-20s ] %s\n" \
               "$pct" "${ARIA2_PROGRESS_BAR_WIDTH:-40}" "$B" "$spdH" "$doneH" "$totH" "$dir" "$name"
       done
   fi
