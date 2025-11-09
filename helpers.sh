@@ -596,7 +596,6 @@ helpers_human_bytes() { # bytes -> human
   local b=${1:-0} d=0
   local -a u=(Bytes KB MB GB TB PB)
 
-  # b and d are always integers here; safe under set -u
   while (( b >= 1024 && d < ${#u[@]}-1 )); do
     b=$(( b / 1024 ))
     ((d++))
@@ -888,7 +887,9 @@ aria2_show_download_snapshot() {
 
       def bar($pct; $W):
         ( ($W * ($pct/100.0)) | floor ) as $f
-        | "[" + ( (range(0;$f) | "#") + (range($f;$W) | "-") ) + "]";
+        | "[" +
+          ( [ range(0;$W) | if . < $f then "#" else "-" end ] | join("") )
+          + "]";
 
       .[]
       | (.completedLength // "0" | tonumber) as $done
@@ -896,9 +897,9 @@ aria2_show_download_snapshot() {
       | (.downloadSpeed   // "0" | tonumber) as $spd
       | (.files|type) as $ft
       | (if $ft=="array" and (.files|length)>0 and (.files[0].path? // "")!=""
-         then (.files[0].path | capture("(?<dir>.*)/(?<name>[^/]+)$"))
-         else {"dir":"", "name":(.bittorrent.info.name? // .infoHash // "unknown")}
-         end) as $p
+        then (.files[0].path | capture("(?<dir>.*)/(?<name>[^/]+)$"))
+        else {"dir":"", "name":(.bittorrent.info.name? // .infoHash // "unknown")}
+        end) as $p
       | (if $tot>0 then 100.0 * $done / $tot else 0 end) as $pct
       | (if $pct>100 then 100 elif $pct<0 then 0 else $pct end) as $pc
       | ($W|tonumber? // 40) as $w
@@ -910,8 +911,8 @@ aria2_show_download_snapshot() {
         if [[ -n "${COMFY:-${COMFY_HOME:-}}" && "$dir" == "${COMFY:-${COMFY_HOME:-}}/"* ]]; then
           dir="${dir#${COMFY:-${COMFY_HOME:-}}/}"
         fi
-        printf " %5.1f%% %-*s %10s  (%12s / %12s)  [ %-28s ] %s\n" \
-               "$pct" "${ARIA2_PROGRESS_BAR_WIDTH:-40}" "$B" "$spdH" "$doneH" "$totH" "$dir" "$name"
+        printf " %5.1f%% %-*s %10s  (%12s / %12s)  [ Destination -> %-28s ] %s\n" \
+              "$pct" "${ARIA2_PROGRESS_BAR_WIDTH:-40}" "$B" "$spdH" "$doneH" "$totH" "$dir" "$name"
       done
   fi
 
