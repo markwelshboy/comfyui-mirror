@@ -791,17 +791,18 @@ aria2_monitor_progress() {
 }
 
 aria2_show_download_snapshot() {
-  : "${ARIA2_HOST:=127.0.0.1}"; : "${ARIA2_PORT:=6969}"; : "${ARIA2_SECRET:=KissMeQuick}"
+  : "${ARIA2_HOST:=127.0.0.1}"
+  : "${ARIA2_PORT:=6969}"
+  : "${ARIA2_SECRET:=KissMeQuick}"
   : "${ARIA2_PROGRESS_MAX:=999}"
   : "${ARIA2_PROGRESS_BAR_WIDTH:=40}"
 
   # --- Fetch three views from aria2 ---
   local a_json w_json s_json
-  a_json="$(helpers_rpc 'aria2.tellActive'  '[]'          2>/dev/null || echo '{"result":[]}' )"
-  w_json="$(helpers_rpc 'aria2.tellWaiting' '[0,1000]'    2>/dev/null || echo '{"result":[]}' )"
-  s_json="$(helpers_rpc 'aria2.tellStopped' '[-1000,1000]' 2>/dev/null || echo '{"result":[]}' )"
+  a_json="$(helpers_rpc 'aria2.tellActive'  '[]'            2>/dev/null || echo '{"result":[]}' )"
+  w_json="$(helpers_rpc 'aria2.tellWaiting' '[0,1000]'      2>/dev/null || echo '{"result":[]}' )"
+  s_json="$(helpers_rpc 'aria2.tellStopped' '[-1000,1000]'  2>/dev/null || echo '{"result":[]}' )"
 
-  # Normalize to compact arrays for active/waiting/stopped
   local act wai sto
   act="$(jq -c '(.result // [])' <<<"$a_json" 2>/dev/null || echo '[]')"
   wai="$(jq -c '(.result // [])' <<<"$w_json" 2>/dev/null || echo '[]')"
@@ -822,16 +823,15 @@ aria2_show_download_snapshot() {
   echo "=== Active: $active_count   Pending: $waiting_count   Completed: $completed_count"
   echo "================================================================================"
 
-  # ============================================================
-  # PENDING SECTION (wait queue, show URL + dest dir/file)
-  # ============================================================
+  ########################################################################
+  # PENDING (WAITING QUEUE)
+  ########################################################################
   echo
   echo "Pending (waiting queue)"
   echo "--------------------------------------------------------------------------------"
   if (( waiting_count == 0 )); then
     echo "  (none)"
   else
-    # collect TSV lines: name<TAB>dir<TAB>uri
     local -a pending_rows=()
     mapfile -t pending_rows < <(
       jq -r '
@@ -842,15 +842,14 @@ aria2_show_download_snapshot() {
             end ) as $full
         | ( if ($full|contains("/")) then
               ($full | capture("(?<dir>.*)/(?<name>[^/]+)$"))
-            else
+          else
               {dir:"", name:$full}
-            end ) as $p
+          end ) as $p
         | ( .files[0].uris[0].uri? // "" ) as $u
         | "\($p.name)\t\($p.dir)\t\($u)"
       ' <<<"$w_json" 2>/dev/null
     )
 
-    # find widest name for pretty alignment
     local maxlen=0 row name dir url
     for row in "${pending_rows[@]}"; do
       IFS=$'\t' read -r name dir url <<<"$row"
@@ -859,22 +858,23 @@ aria2_show_download_snapshot() {
 
     for row in "${pending_rows[@]}"; do
       IFS=$'\t' read -r name dir url <<<"$row"
-      if [[ -n "${COMFY:-${COMFY_HOME:-}}" && "$dir" == "${COMFY:-${COMFY_HOME:-}}"* ]]; then
+      if [[ -n "${COMFY:-${COMFY_HOME:-}}" && "$dir" == "${COMFY:-${COMFY_HOME:-}}/"* ]]; then
         dir="${dir#${COMFY:-${COMFY_HOME:-}}/}"
       fi
       printf "  ⏳ %-*s  %-40s  %s\n" "$maxlen" "$name" "$dir" "$url"
     done
   fi
 
-  # ============================================================
-  # DOWNLOADING SECTION (active, with bars/speeds/sizes)
-  # ============================================================
+  ########################################################################
+  # DOWNLOADING (ACTIVE TRANSFERS)
+  ########################################################################
   echo
   echo "Downloading (active transfers)"
   echo "--------------------------------------------------------------------------------"
   if (( active_count == 0 )); then
     echo "  (none)"
   else
+    # we use env.A to pass the JSON array; if jq explodes, we just swallow and move on
     A="$act" ARIA2_PROGRESS_BAR_WIDTH="$ARIA2_PROGRESS_BAR_WIDTH" jq -r '
       def hb($n):
         ($n|tonumber) as $x
@@ -904,27 +904,25 @@ aria2_show_download_snapshot() {
       | (if $pct>100 then 100 elif $pct<0 then 0 else $pct end) as $pc
       | (env.ARIA2_PROGRESS_BAR_WIDTH|tonumber? // 40) as $W
       | (bar($pc; $W)) as $B
-      # TSV: pct | bar | spd_h | done_h | tot_h | dir | name
       | [ ((($pc*10)|round)/10.0), $B, hb($spd), hb($done), (if $tot>0 then hb($tot) else "?" end), $p.dir, $p.name ]
       | @tsv
     ' 2>/dev/null \
     | while IFS=$'\t' read -r pct B spdH doneH totH dir name; do
-        [[ -n "${COMFY:-${COMFY_HOME:-}}" && "$dir" == "${COMFY:-${COMFY_HOME:-}}"* ]] && dir="${dir#${COMFY:-${COMFY_HOME:-}}/}"
-        printf " %5.1f%% %-*s %10s  (%12s / %12s)  [ %-20s ] %s\n" \
-          "$pct" "$ARIA2_PROGRESS_BAR_WIDTH" "$B" "$spdH" "$doneH" "$totH" "$dir" "$name"
+        [[ -n "${COMFY:-${COMFY_HOME:-}}" && "$dir" == "${COMFY:-${COMFY_HOME:-}}/"* ]] && dir="${dir#${COMFY:-${COMFY_HOME:-}}/}"
+        printf " %5.1f%% %-*s %10s  (%12s / %12s)  [ Destination -> %-28s ] %s\n" \
+               "$pct" "${ARIA2_PROGRESS_BAR_WIDTH:-40}" "$B" "$spdH" "$doneH" "$totH" "$dir" "$name"
       done
   fi
 
-  # ============================================================
-  # COMPLETED SECTION (stopped, this session)
-  # ============================================================
+  ########################################################################
+  # COMPLETED (THIS SESSION)
+  ########################################################################
   echo
   echo "Completed (this session)"
   echo "--------------------------------------------------------------------------------"
   if (( completed_count == 0 )); then
     echo "  (none)"
   else
-    # collect as name<TAB>relpath<TAB>size_bytes and reuse style
     local -a completed_rows=()
     mapfile -t completed_rows < <(
       jq -r '
@@ -942,7 +940,6 @@ aria2_show_download_snapshot() {
       ' <<<"$s_json" 2>/dev/null
     )
 
-    # compute width for alignment
     local maxlen=0 crow cname cdir cbytes
     for crow in "${completed_rows[@]}"; do
       IFS=$'\t' read -r cname cdir cbytes <<<"$crow"
@@ -951,7 +948,7 @@ aria2_show_download_snapshot() {
 
     for crow in "${completed_rows[@]}"; do
       IFS=$'\t' read -r cname cdir cbytes <<<"$crow"
-      if [[ -n "${COMFY:-${COMFY_HOME:-}}" && "$cdir" == "${COMFY:-${COMFY_HOME:-}}"* ]]; then
+      if [[ -n "${COMFY:-${COMFY_HOME:-}}" && "$cdir" == "${COMFY:-${COMFY_HOME:-}}/"* ]]; then
         cdir="${cdir#${COMFY:-${COMFY_HOME:-}}/}"
       fi
       local human_size
@@ -960,9 +957,9 @@ aria2_show_download_snapshot() {
     done
   fi
 
-  # ============================================================
+  ########################################################################
   # GROUP TOTALS
-  # ============================================================
+  ########################################################################
   local merged total_done total_size total_speed
   merged="$(jq -c -n --argjson a "$act" --argjson w "$wai" '$a + $w')" || merged='[]'
   total_done="$(jq -r '[.[] | ((.completedLength // "0") | tonumber)] | add' <<<"$merged" 2>/dev/null || echo 0)"
