@@ -1338,7 +1338,7 @@ helpers_civitai_extract_and_move_zip() {
     dest="$(helpers_unique_dest "$target_dir" "$clean")"
     mkdir -p "$(dirname "$dest")"
     mv -f -- "$f" "$dest"
-    echo "📦 Extracted: $(basename -- "$dest")"
+    echo "📦 Extracted: $(basename -- "$dest")" >&2
     ((moved++))
   done
   shopt -u nullglob
@@ -1347,13 +1347,13 @@ helpers_civitai_extract_and_move_zip() {
   rm -rf -- "$tmpdir"
 
   if (( moved == 0 )); then
-    echo "⚠️  No .safetensors found in ZIP: $(basename -- "$zip_path")"
+    echo "⚠️  No .safetensors found in ZIP: $(basename -- "$zip_path")" >&2
     # Option A: keep ZIP in place (already in loras dir)
     # Option B (recommended): park it in an _incoming folder so it’s out of the picker’s way
     local park_dir="${target_dir%/}/_incoming"
     mkdir -p "$park_dir"
     mv -f -- "$zip_path" "$park_dir/" || true
-    echo "➡️  Moved ZIP to: $park_dir/$(basename -- "$zip_path")"
+    echo "➡️  Moved ZIP to: $park_dir/$(basename -- "$zip_path")" >&2
   else
     # If at least one .safetensors extracted, remove the ZIP
     rm -f -- "$zip_path"
@@ -1361,7 +1361,7 @@ helpers_civitai_extract_and_move_zip() {
 }
 
 # Case-insensitive match for *.safetensors
-_helpers_zip_has_safetensors() {
+helpers_zip_has_safetensors() {
   local zip="$1"
   if command -v unzip >/dev/null 2>&1; then
     unzip -Z1 -- "$zip" 2>/dev/null | awk 'tolower($0) ~ /\.safetensors$/ {found=1} END{exit !(found)}'
@@ -1374,7 +1374,7 @@ _helpers_zip_has_safetensors() {
 }
 
 # Extract only *.safetensors (case-insensitive) from ZIP into $dest_dir
-_helpers_extract_safetensors_from_zip() {
+helpers_extract_safetensors_from_zip() {
   local zip="$1" dest_dir="$2"
   mkdir -p -- "$dest_dir"
   if command -v unzip >/dev/null 2>&1; then
@@ -1426,21 +1426,21 @@ helpers_civitai_postprocess_dir() {
         # quick size sanity (<= 64 KB → likely metadata-only)
         local bytes; bytes="$(stat -c %s "$moved" 2>/dev/null || stat -f %z "$moved")"
         if [[ -n "$bytes" && "$bytes" -le 65536 ]]; then
-          echo "⚠️  $(basename "$moved") is tiny ($bytes B) — no extraction; quarantining."
+          echo "⚠️  $(basename "$moved") is tiny ($bytes B) — no extraction; quarantining." >&2
           mv -f -- "$moved" "$junk/"
           continue
         fi
 
-        if _helpers_zip_has_safetensors "$moved"; then
-          if _helpers_extract_safetensors_from_zip "$moved" "$dest_dir"; then
-            echo "✅ Extracted safetensors from $(basename "$moved"); removing ZIP."
+        if helpers_zip_has_safetensors "$moved"; then
+          if helpers_extract_safetensors_from_zip "$moved" "$dest_dir"; then
+            echo "✅ Extracted safetensors from $(basename "$moved"); removing ZIP." >&2
             rm -f -- "$moved"
           else
-            echo "⚠️  Extraction failed for $(basename "$moved"); quarantining."
+            echo "⚠️  Extraction failed for $(basename "$moved"); quarantining." >&2
             mv -f -- "$moved" "$junk/"
           fi
         else
-          echo "⚠️  No .safetensors found in $(basename "$moved"); quarantining."
+          echo "⚠️  No .safetensors found in $(basename "$moved"); quarantining." >&2
           mv -f -- "$moved" "$junk/"
         fi
       done
@@ -1521,12 +1521,10 @@ helpers_civitai_enqueue_version() {
   # IMPORTANT: 4th param is checksum in your helpers; pass empty string.
   # Do NOT pass headers here (token is already in the URL).
   if helpers_rpc_add_uri "$url" "$dest_dir" "$name" ""; then
-    [[ "$CIVITAI_DEBUG" -eq 1 ]] && {
-      echo "📥 CivitAI v${ver_id}"
-    }
+    echo "📥 CivitAI v${ver_id}" >&2
     return 0
   else
-    [[ "$CIVITAI_DEBUG" -eq 1 ]] && echo "❌ v${ver_id}: addUri failed" >&2
+    echo "❌ v${ver_id}: addUri failed" >&2
     return 1
   fi
 }
@@ -1540,7 +1538,7 @@ aria2_enqueue_and_wait_from_civitai() {
   _cleanup_trap_civitai() {
     (( trapped )) && return 0
     trapped=1
-    echo; echo "⚠️  Interrupted — stopping queue and cleaning results…"
+    echo; echo "⚠️  Interrupted — stopping queue and cleaning results…" >&2
     aria2_stop_all >/dev/null 2>&1 || true
     aria2_clear_results >/dev/null 2>&1 || true
     return 130
@@ -1550,35 +1548,35 @@ aria2_enqueue_and_wait_from_civitai() {
   local comfy="${COMFY_HOME:-/workspace/ComfyUI}"
   local lora_dir="$comfy/models/loras"
   local ckpt_dir="$comfy/models/checkpoints"
-  echo "📦 Target (LoRAs): $lora_dir"
-  echo "📦 Target (Checkpoints): $ckpt_dir"
+  echo "📦 Target (LoRAs): $lora_dir" >&2
+  echo "📦 Target (Checkpoints): $ckpt_dir" >&2
 
   local any=0 ids vid
 
   # LoRA version IDs
   ids="$(helpers_civitai_tokenize_ids "${LORAS_IDS_TO_DOWNLOAD:-}")"
   if [[ -n "${ids// }" ]]; then
-    [[ "$CIVITAI_DEBUG" -eq 1 ]] && echo "→ Parsed $(wc -w <<<"$ids") LoRA id(s): $ids"
+    [[ "$CIVITAI_DEBUG" -eq 1 ]] && echo "→ Parsed $(wc -w <<<"$ids") LoRA id(s): $ids" >&2
     for vid in $ids; do
       if helpers_civitai_enqueue_version "$vid" "$lora_dir"; then any=1; fi
     done
   else
-    [[ "$CIVITAI_DEBUG" -eq 1 ]] && echo "⏭️ No LoRA id(s) parsed."
+    echo "⏭️ No LoRA id(s) parsed." >&2
   fi
 
   # Checkpoint version IDs
   ids="$(helpers_civitai_tokenize_ids "${CHECKPOINT_IDS_TO_DOWNLOAD:-}")"
   if [[ -n "${ids// }" ]]; then
-    [[ "$CIVITAI_DEBUG" -eq 1 ]] && echo "→ Parsed $(wc -w <<<"$ids") Checkpoint id(s): $ids"
+    [[ "$CIVITAI_DEBUG" -eq 1 ]] && echo "→ Parsed $(wc -w <<<"$ids") Checkpoint id(s): $ids" >&2
     for vid in $ids; do
       if helpers_civitai_enqueue_version "$vid" "$ckpt_dir"; then any=1; fi
     done
   else
-    [[ "$CIVITAI_DEBUG" -eq 1 ]] && echo "⏭️ No Checkpoint id(s) parsed."
+    echo "⏭️ No Checkpoint id(s) parsed."
   fi
 
   if [[ "$any" != "1" ]]; then
-    echo "Nothing to enqueue from CivitAI tokens."
+    echo "Nothing to enqueue from CivitAI tokens." >&2
     trap - INT TERM
     return 0
   fi
