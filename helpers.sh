@@ -911,8 +911,8 @@ aria2_show_download_snapshot() {
         if [[ -n "${COMFY:-${COMFY_HOME:-}}" && "$dir" == "${COMFY:-${COMFY_HOME:-}}/"* ]]; then
           dir="${dir#${COMFY:-${COMFY_HOME:-}}/}"
         fi
-        printf " %5.1f%% %-*s %5s/s (%4s / %4s)  [ %-20s ] %s\n" \
-              "$pct" "${ARIA2_PROGRESS_BAR_WIDTH:-40}" "$B" "$spdH" "$doneH" "$totH" "$dir" "$name"
+        printf " %5.1f%% %-*s %9s/s (%9s / %9s)  [ %-20s ] %s\n" \
+              "$pct" "${ARIA2_PROGRESS_BAR_WIDTH:-40}" "$B" "$spdH" "$doneH" "$totH" "$dir" "$name"      
       done
   fi
 
@@ -923,40 +923,51 @@ aria2_show_download_snapshot() {
   echo "Completed (this session)"
   echo "--------------------------------------------------------------------------------"
   if (( completed_count == 0 )); then
-    echo "  (none)"
+    echo "  (none)" 2>&1
   else
     local -a completed_rows=()
+
+    # IMPORTANT: feed `sto` (plain array), NOT the raw RPC envelope
     mapfile -t completed_rows < <(
       jq -r '
-        (.result // [])[]
-        | ( if (.files|type=="array" and (.files|length)>0 and (.files[0].path? // "")!="")
+        .[]
+        | (
+            if (.files|type=="array" and (.files|length>0) and (.files[0].path? // "")!="")
             then .files[0].path
             else .bittorrent.info.name? // .infoHash // "unknown"
-            end ) as $full
-        | ( if ($full|contains("/")) then
+            end
+          ) as $full
+        | (
+            if ($full|contains("/")) then
               ($full | capture("(?<dir>.*)/(?<name>[^/]+)$"))
             else
               {dir:"", name:$full}
-            end ) as $p
+            end
+          ) as $p
         | "\($p.name)\t\($p.dir)\t\((.totalLength // "0") | tonumber)"
-      ' <<<"$s_json" 2>/dev/null
+      ' <<<"$sto" 2>/dev/null
     )
 
-    local maxlen=0 crow cname cdir cbytes
-    for crow in "${completed_rows[@]}"; do
-      IFS=$'\t' read -r cname cdir cbytes <<<"$crow"
-      (( ${#cname} > maxlen )) && maxlen=${#cname}
-    done
+    # If for some reason jq fails, still show something
+    if ((${#completed_rows[@]} == 0)); then
+      echo "  (none)" 2>&1
+    else
+      local maxlen=0 crow cname cdir cbytes
+      for crow in "${completed_rows[@]}"; do
+        IFS=$'\t' read -r cname cdir cbytes <<<"$crow"
+        (( ${#cname} > maxlen )) && maxlen=${#cname}
+      done
 
-    for crow in "${completed_rows[@]}"; do
-      IFS=$'\t' read -r cname cdir cbytes <<<"$crow"
-      if [[ -n "${COMFY:-${COMFY_HOME:-}}" && "$cdir" == "${COMFY:-${COMFY_HOME:-}}/"* ]]; then
-        cdir="${cdir#${COMFY:-${COMFY_HOME:-}}/}"
-      fi
-      local human_size
-      human_size="$(helpers_human_bytes "${cbytes:-0}")"
-      printf " ✅ %-*s  %-40s  (%s)\n" "$maxlen" "$cname" "$cdir" "$human_size"
-    done
+      for crow in "${completed_rows[@]}"; do
+        IFS=$'\t' read -r cname cdir cbytes <<<"$crow"
+        if [[ -n "${COMFY:-${COMFY_HOME:-}}" && "$cdir" == "${COMFY:-${COMFY_HOME:-}}/"* ]]; then
+          cdir="${cdir#${COMFY:-${COMFY_HOME:-}}/}"
+        fi
+        local human_size
+        human_size="$(helpers_human_bytes "${cbytes:-0}")"
+        printf " ✅ %-*s  %-40s  (%s)\n" "$maxlen" "$cname" "$cdir" "$human_size"
+      done
+    fi
   fi
 
   ########################################################################
