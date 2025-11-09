@@ -592,16 +592,17 @@ mkdir -p "$COMFY_LOGS" "$COMFY/models" >/dev/null 2>&1 || true
 _helpers_need() { command -v "$1" >/dev/null || { echo "Missing $1" >&2; exit 1; }; }
 
 # ---- tiny utils ----
-helpers_human_bytes() { # bytes -> human-readable
+helpers_human_bytes() { # bytes -> human
   local b=${1:-0} d=0
-  local -a u=("Bytes" "KB" "MB" "GB" "TB" "PB")
+  local -a u=(Bytes KB MB GB TB PB)
 
-  while (( b >= 1024 && d < (${#u[@]} - 1) )); do
-    b=$(awk -v v="$b" 'BEGIN {printf "%.2f", v/1024}')
+  # b and d are always integers here; safe under set -u
+  while (( b >= 1024 && d < ${#u[@]}-1 )); do
+    b=$(( b / 1024 ))
     ((d++))
   done
 
-  printf "%s %s" "$b" "${u[$d]}"
+  printf "%d %s" "$b" "${u[$d]}"
 }
 
 #=======================================================================
@@ -874,8 +875,8 @@ aria2_show_download_snapshot() {
   if (( active_count == 0 )); then
     echo "  (none)"
   else
-    # we use env.A to pass the JSON array; if jq explodes, we just swallow and move on
-    A="$act" ARIA2_PROGRESS_BAR_WIDTH="$ARIA2_PROGRESS_BAR_WIDTH" jq -r '
+    # Pipe act JSON *directly* into jq; no env JSON tricks
+    jq -r --arg W "${ARIA2_PROGRESS_BAR_WIDTH:-40}" '
       def hb($n):
         ($n|tonumber) as $x
         | if   $x>=1099511627776 then ((($x/1099511627776)|floor|tostring) + " TB")
@@ -889,27 +890,27 @@ aria2_show_download_snapshot() {
         ( ($W * ($pct/100.0)) | floor ) as $f
         | "[" + ( (range(0;$f) | "#") + (range($f;$W) | "-") ) + "]";
 
-      (env.A // "[]") | fromjson
-      | .[]? as $t
-      | ($t.completedLength|tonumber) as $done
-      | ($t.totalLength    |tonumber) as $tot
-      | ($t.downloadSpeed  |tonumber) as $spd
-      | ($t.files|type) as $ft
-      | (if $ft=="array" and ($t.files|length)>0 and ($t.files[0].path? // "")!="" then
-           ($t.files[0].path | capture("(?<dir>.*)/(?<name>[^/]+)$"))
-         else
-           {"dir":"", "name":($t.bittorrent.info.name? // $t.infoHash // "unknown")}
+      .[]
+      | (.completedLength // "0" | tonumber) as $done
+      | (.totalLength     // "0" | tonumber) as $tot
+      | (.downloadSpeed   // "0" | tonumber) as $spd
+      | (.files|type) as $ft
+      | (if $ft=="array" and (.files|length)>0 and (.files[0].path? // "")!=""
+         then (.files[0].path | capture("(?<dir>.*)/(?<name>[^/]+)$"))
+         else {"dir":"", "name":(.bittorrent.info.name? // .infoHash // "unknown")}
          end) as $p
       | (if $tot>0 then 100.0 * $done / $tot else 0 end) as $pct
       | (if $pct>100 then 100 elif $pct<0 then 0 else $pct end) as $pc
-      | (env.ARIA2_PROGRESS_BAR_WIDTH|tonumber? // 40) as $W
-      | (bar($pc; $W)) as $B
+      | ($W|tonumber? // 40) as $w
+      | (bar($pc; $w)) as $B
       | [ ((($pc*10)|round)/10.0), $B, hb($spd), hb($done), (if $tot>0 then hb($tot) else "?" end), $p.dir, $p.name ]
       | @tsv
-    ' 2>/dev/null \
+    ' <<<"$act" 2>/dev/null \
     | while IFS=$'\t' read -r pct B spdH doneH totH dir name; do
-        [[ -n "${COMFY:-${COMFY_HOME:-}}" && "$dir" == "${COMFY:-${COMFY_HOME:-}}/"* ]] && dir="${dir#${COMFY:-${COMFY_HOME:-}}/}"
-        printf " %5.1f%% %-*s %10s  (%12s / %12s)  [ Destination -> %-28s ] %s\n" \
+        if [[ -n "${COMFY:-${COMFY_HOME:-}}" && "$dir" == "${COMFY:-${COMFY_HOME:-}}/"* ]]; then
+          dir="${dir#${COMFY:-${COMFY_HOME:-}}/}"
+        fi
+        printf " %5.1f%% %-*s %10s  (%12s / %12s)  [ %-28s ] %s\n" \
                "$pct" "${ARIA2_PROGRESS_BAR_WIDTH:-40}" "$B" "$spdH" "$doneH" "$totH" "$dir" "$name"
       done
   fi
