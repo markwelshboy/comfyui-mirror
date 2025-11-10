@@ -864,54 +864,47 @@ aria2_show_download_snapshot() {
   fi
   echo
 
-  # --- Downloading (active transfers) ---
   echo "Downloading (active transfers)"
   echo "--------------------------------------------------------------------------------"
   if (( active_count == 0 )); then
     echo "  (none)"
   else
     local -a dl_rows
-    local row done tot spd path pct bar_len bar W dir name
+    local row done tot spd path pct bar_len bar W dir name ROOT
 
+    ROOT="${COMFY:-${COMFY_HOME:-/workspace/ComfyUI}}"
     W="${ARIA2_PROGRESS_BAR_WIDTH:-40}"
 
-    # Extract simple TSV from the active array
     mapfile -t dl_rows < <(
       jq -r '
         .[]?
         | [.completedLength // "0",
-           .totalLength     // "0",
-           .downloadSpeed   // "0",
-           (.files[0].path  // "")]
+          .totalLength     // "0",
+          .downloadSpeed   // "0",
+          (.files[0].path  // "")]
         | @tsv
       ' <<<"$act" 2>/dev/null || true
     )
 
     for row in "${dl_rows[@]}"; do
       IFS=$'\t' read -r done tot spd path <<<"$row"
-      # skip if no path (shouldn’t really happen, but be safe)
       [[ -z "$path" ]] && continue
 
-      # Cast to integers
       done=$((done+0))
       tot=$((tot+0))
       spd=$((spd+0))
 
-      # Percentage (integer)
       pct=0
       (( tot > 0 )) && pct=$(( done * 100 / tot ))
 
-      # Build progress bar
       bar_len=$(( W * pct / 100 ))
       printf -v bar '%*s' "$bar_len" ''
       bar=${bar// /#}
       printf -v bar '%-*s' "$W" "$bar"
 
-      # Split path into dir + name
       dir="${path%/*}"
       name="${path##*/}"
 
-      # Trim COMFY / COMFY_HOME prefix if present
       if [[ -n "$ROOT" && "$dir" == "$ROOT/"* ]]; then
         dir="${dir#$ROOT/}"
       fi
@@ -926,35 +919,33 @@ aria2_show_download_snapshot() {
   fi
   echo
 
-  # --- Completed (this session) ---
   echo "Completed (this session)"
   echo "--------------------------------------------------------------------------------"
-  if (( completed_count == 0 )); then
+
+  # Build TSV rows: name<TAB>relpath<TAB>size
+  local completed_tsv
+  completed_tsv="$(
+    jq -r '
+      .[]?
+      | select(.status == "complete")
+      | (.files[0].path // "") as $full
+      | select($full != "")
+      | ($full | split("/") | last) as $name
+      | ($full | split("/") | .[0:-1] | join("/")) as $dir
+      | (.totalLength // "0") as $sz
+      | [$name, $dir, $sz] | @tsv
+    ' <<<"$sto" 2>/dev/null || true
+  )"
+
+  if [[ -z "$completed_tsv" ]]; then
     echo "  (none)"
     echo "--------------------------------------------------------------------------------"
   else
+    # turn TSV into array and pretty-print
     local -a completed_rows
-    mapfile -t completed_rows < <(
-      jq -r '
-        .[]?
-        | select(.status == "complete")
-        | (.files[0].path // "") as $p
-        | if $p == "" then empty else
-            ($p | capture("(?<dir>.*)/(?<name>[^/]+)$")) as $m
-            | (.totalLength // 0 | tonumber) as $len
-            | "\($m.name)\t\($m.dir)\t\($len)"
-          end
-      ' <<<"$sto" 2>/dev/null || true
-    )
-
-    if ((${#completed_rows[@]} == 0)); then
-      echo "  (none)"
-      echo "--------------------------------------------------------------------------------"
-    else
-      # Reuse your helpers_print_completed_block
-      helpers_print_completed_block "${completed_rows[@]}"
-      echo "--------------------------------------------------------------------------------"
-    fi
+    IFS=$'\n' read -r -d '' -a completed_rows <<<"$completed_tsv"$'\n'
+    helpers_print_completed_block "${completed_rows[@]}"
+    echo "--------------------------------------------------------------------------------"
   fi
 
   # --- Group totals (active + waiting) ---
@@ -985,6 +976,27 @@ aria2_show_download_snapshot() {
   echo "Group total: speed $(aria2__hb "$total_speed")/s, done $(aria2__hb "$total_done") / $(aria2__hb "$total_size")"
 
   set -e
+}
+
+# Print aligned "Completed (this session)" block from a list of "name<TAB>relpath<TAB>size"
+helpers_print_completed_block() {
+  local lines=("$@")
+  [[ ${#lines[@]} -eq 0 ]] && return 0
+
+  local maxlen=0
+  local name relpath size row
+  # find longest name
+  for row in "${lines[@]}"; do
+    IFS=$'\t' read -r name relpath size <<<"$row"
+    (( ${#name} > maxlen )) && maxlen=${#name}
+  done
+
+  echo "Completed (this session)"
+  echo "--------------------------------------------------------------------------------"
+  for row in "${lines[@]}"; do
+    IFS=$'\t' read -r name relpath size <<<"$row"
+    printf "✅ %-*s  %s  (%s)\n" "$maxlen" "$name" "$relpath" "$size"
+  done
 }
 
 aria2_debug_queue_counts() {
