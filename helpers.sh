@@ -911,7 +911,7 @@ aria2_show_download_snapshot() {
         if [[ -n "${COMFY:-${COMFY_HOME:-}}" && "$dir" == "${COMFY:-${COMFY_HOME:-}}/"* ]]; then
           dir="${dir#${COMFY:-${COMFY_HOME:-}}/}"
         fi
-        printf " %5.1f%% %-*s %10s/s (%8s / %8s)  [ %-24s ] %s\n" \
+        printf " %5.1f%% %-*s %10s/s (%10s / %10s)  [ %-24s ] %s\n" \
           "$pct" "${ARIA2_PROGRESS_BAR_WIDTH:-40}" "$B" "$spdH" "$doneH" "$totH" "$dir" "$name"
       done
   fi
@@ -923,36 +923,34 @@ aria2_show_download_snapshot() {
   echo "Completed (this session)"
   echo "--------------------------------------------------------------------------------"
   if (( completed_count == 0 )); then
-    echo "  (none)" 2>&1
+    echo "  (none)"
   else
     local -a completed_rows=()
 
-    # IMPORTANT: feed `sto` (plain array), NOT the raw RPC envelope
+    # IMPORTANT: we feed the plain array JSON `sto`, not the RPC envelope
     mapfile -t completed_rows < <(
       jq -r '
         .[]
         | (
-            if (.files|type=="array" and (.files|length>0) and (.files[0].path? // "")!="")
+            if (.files | type=="array" and (.files|length)>0 and (.files[0].path? // "") != "")
             then .files[0].path
             else .bittorrent.info.name? // .infoHash // "unknown"
             end
           ) as $full
-        | (
-            if ($full|contains("/")) then
-              ($full | capture("(?<dir>.*)/(?<name>[^/]+)$"))
-            else
-              {dir:"", name:$full}
-            end
-          ) as $p
-        | "\($p.name)\t\($p.dir)\t\((.totalLength // "0") | tonumber)"
+        | if ($full|contains("/")) then
+            ($full | capture("(?<dir>.*)/(?<name>[^/]+)$")) as $p
+            | "\($p.name)\t\($p.dir)\t\((.totalLength // "0") | tonumber)"
+          else
+            "\($full)\t\t\((.totalLength // "0") | tonumber)"
+          end
       ' <<<"$sto" 2>/dev/null
     )
 
-    # If for some reason jq fails, still show something
     if ((${#completed_rows[@]} == 0)); then
-      echo "  (none)" 2>&1
+      echo "  (none)"
     else
       local maxlen=0 crow cname cdir cbytes
+      # find longest filename to align nicely
       for crow in "${completed_rows[@]}"; do
         IFS=$'\t' read -r cname cdir cbytes <<<"$crow"
         (( ${#cname} > maxlen )) && maxlen=${#cname}
@@ -960,12 +958,15 @@ aria2_show_download_snapshot() {
 
       for crow in "${completed_rows[@]}"; do
         IFS=$'\t' read -r cname cdir cbytes <<<"$crow"
+
         if [[ -n "${COMFY:-${COMFY_HOME:-}}" && "$cdir" == "${COMFY:-${COMFY_HOME:-}}/"* ]]; then
           cdir="${cdir#${COMFY:-${COMFY_HOME:-}}/}"
         fi
+
         local human_size
         human_size="$(helpers_human_bytes "${cbytes:-0}")"
-        printf " ✅ %-*s  %-40s  (%s)\n" "$maxlen" "$cname" "$cdir" "$human_size"
+        printf " ✅ %-*s  %-40s  (%s)\n" \
+               "$maxlen" "$cname" "$cdir" "$human_size"
       done
     fi
   fi
@@ -973,21 +974,41 @@ aria2_show_download_snapshot() {
   ########################################################################
   # GROUP TOTALS
   ########################################################################
-  local merged total_done total_size total_speed
-  merged="$(jq -c -n --argjson a "$act" --argjson w "$wai" '$a + $w')" || merged='[]'
 
-  total_done="$(
+  # merged = act + wai, but we don’t need the array itself; just totals
+  local total_done_act total_done_wai total_size_act total_size_wai total_speed_act total_speed_wai
+
+  total_done_act="$(
     jq -r '[.[] | ((.completedLength // "0") | tonumber)] | add // 0' \
-      <<<"$merged" 2>/dev/null || echo 0
+      <<<"$act" 2>/dev/null || echo 0
   )"
-  total_size="$(
-    jq -r '[.[] | ((.totalLength    // "0") | tonumber)] | add // 0' \
-      <<<"$merged" 2>/dev/null || echo 0
+  total_done_wai="$(
+    jq -r '[.[] | ((.completedLength // "0") | tonumber)] | add // 0' \
+      <<<"$wai" 2>/dev/null || echo 0
   )"
-  total_speed="$(
+
+  total_size_act="$(
+    jq -r '[.[] | ((.totalLength // "0") | tonumber)] | add // 0' \
+      <<<"$act" 2>/dev/null || echo 0
+  )"
+  total_size_wai="$(
+    jq -r '[.[] | ((.totalLength // "0") | tonumber)] | add // 0' \
+      <<<"$wai" 2>/dev/null || echo 0
+  )"
+
+  total_speed_act="$(
     jq -r '[.[] | ((.downloadSpeed // "0") | tonumber)] | add // 0' \
-      <<<"$merged" 2>/dev/null || echo 0
+      <<<"$act" 2>/dev/null || echo 0
   )"
+  total_speed_wai="$(
+    jq -r '[.[] | ((.downloadSpeed // "0") | tonumber)] | add // 0' \
+      <<<"$wai" 2>/dev/null || echo 0
+  )"
+
+  local total_done total_size total_speed
+  total_done=$(( total_done_act + total_done_wai ))
+  total_size=$(( total_size_act + total_size_wai ))
+  total_speed=$(( total_speed_act + total_speed_wai ))
 
   echo "--------------------------------------------------------------------------------"
   printf "Group total: speed %s/s, done %s / %s\n" \
