@@ -829,18 +829,63 @@ aria2_show_download_snapshot() {
   }
 
   # ------------------------------------------------------------------
-  # Split into three simple line-lists: one JSON object per line
+  # Build THREE arrays: active, waiting, stopped
+  # (We slurp all 3 RPC results into an array, then reduce by id)
   # ------------------------------------------------------------------
-  local act_lines wai_lines sto_lines
-  act_lines="$(jq -c 'select(.id=="A").result[]' <<<"$resp" 2>/dev/null || echo)"
-  wai_lines="$(jq -c 'select(.id=="W").result[]' <<<"$resp" 2>/dev/null || echo)"
-  sto_lines="$(jq -c 'select(.id=="S").result[]' <<<"$resp" 2>/dev/null || echo)"
+  local active waiting stopped
 
-  # counts: "how many non-empty lines"
+  active="$(
+    jq -c -s '
+      reduce .[] as $m ([];
+        if $m.id == "A" then
+          . + ($m.result // [])
+        else . end
+      )
+    ' <<<"$resp" 2>/dev/null || echo '[]'
+  )"
+
+  waiting="$(
+    jq -c -s '
+      reduce .[] as $m ([];
+        if $m.id == "W" then
+          . + ($m.result // [])
+        else . end
+      )
+    ' <<<"$resp" 2>/dev/null || echo '[]'
+  )"
+
+  stopped="$(
+    jq -c -s '
+      reduce .[] as $m ([];
+        if $m.id == "S" then
+          . + ($m.result // [])
+        else . end
+      )
+    ' <<<"$resp" 2>/dev/null || echo '[]'
+  )"
+
+  # Normalise in case jq returned "null" on error
+  [[ -z "$active"  || "$active"  == "null" ]] && active='[]'
+  [[ -z "$waiting" || "$waiting" == "null" ]] && waiting='[]'
+  [[ -z "$stopped" || "$stopped" == "null" ]] && stopped='[]'
+
   local active_count waiting_count completed_count
-  active_count="$(printf '%s\n' "$act_lines" | sed '/^$/d' | wc -l | tr -d ' ' || echo 0)"
-  waiting_count="$(printf '%s\n' "$wai_lines" | sed '/^$/d' | wc -l | tr -d ' ' || echo 0)"
-  completed_count="$(printf '%s\n' "$sto_lines" | sed '/^$/d' | wc -l | tr -d ' ' || echo 0)"
+
+  active_count="$(jq -r 'length' <<<"$active" 2>/dev/null || echo 0)"
+  waiting_count="$(jq -r 'length' <<<"$waiting" 2>/dev/null || echo 0)"
+
+  # Completed = subset of stopped where completedLength == totalLength > 0
+  completed_count="$(
+    jq -r '
+      [ .[]
+        | select(
+            ((.totalLength? // "0") != "0")
+            and ((.completedLength? // "0") == (.totalLength? // "0"))
+          )
+      ]
+      | length
+    ' <<<"$stopped" 2>/dev/null || echo 0
+  )"
 
   echo "================================================================================"
   echo "=== Aria2 Downloader Snapshot @ $(date '+%Y-%m-%d %H:%M:%S')"
@@ -870,15 +915,14 @@ aria2_show_download_snapshot() {
   }
 
   # ------------------------------------------------------------------
-  # Pending (waiting queue)
+  # Pending (waiting queue) – show short lines
   # ------------------------------------------------------------------
   echo "Pending (waiting queue)"
   echo "--------------------------------------------------------------------------------"
   if (( waiting_count == 0 )); then
     echo "  (none)"
   else
-    # Iterate each waiting item (one JSON per line)
-    while IFS= read -r item; do
+    jq -rc '.[]' <<<"$waiting" | while IFS= read -r item; do
       [[ -z "$item" ]] && continue
       local dir name size_bytes size_h rel_dir
       IFS=$'\t' read -r dir name <<<"$(printf '%s\n' "$item" | _aria2_dir_name)"
@@ -886,36 +930,38 @@ aria2_show_download_snapshot() {
       size_h="$(helpers_human_bytes "${size_bytes:-0}")"
       rel_dir="$(_aria2_rel_dir "$dir")"
       printf "  %-40s  %-40s (%s)\n" "$rel_dir" "$name" "$size_h"
-    done <<<"$wai_lines"
+    done
   fi
 
   echo
 
   # ------------------------------------------------------------------
-  # Active (downloading)
+  # Active (downloading) – detailed + aligned output
   # ------------------------------------------------------------------
   echo "Downloading (active transfers)"
   echo "--------------------------------------------------------------------------------"
   if (( active_count == 0 )); then
     echo "  (none)"
   else
-    while IFS= read -r item; do
+    local W="${ARIA2_PROGRESS_BAR_WIDTH:-40}"
+    jq -rc '.[]' <<<"$active" | while IFS= read -r item; do
       [[ -z "$item" ]] && continue
-      # Extract numbers & path pieces from this one item
       local done tot spd pct bar dir name rel_dir
       done="$(printf '%s\n' "$item" | jq -r '(.completedLength // "0")')"
       tot="$(printf '%s\n' "$item" | jq -r '(.totalLength     // "0")')"
       spd="$(printf '%s\n' "$item" | jq -r '(.downloadSpeed   // "0")')"
 
-      # percent (integer, safe if tot==0)
       if [[ "${tot:-0}" != "0" ]]; then
         pct=$(( 100 * done / tot ))
       else
         pct=0
       fi
 
-      # bar
-      local W="${ARIA2_PROGRESS_BAR_WIDTH:-40}"
+      # Clamp %
+      (( pct < 0 )) && pct=0
+      (( pct > 100 )) && pct=100
+
+      # Build bar
       local filled=$(( W * pct / 100 ))
       printf -v bar '%*s' "$filled" ''
       bar=${bar// /#}
@@ -937,28 +983,26 @@ aria2_show_download_snapshot() {
 
       printf " %6.2f%% %-*s %8s/s (%9s / %9s)  [ %-22s ] %s\n" \
         "$pct" "$W" "$bar" "$spdH" "$doneH" "$totH" "$rel_dir" "$name"
-    done <<<"$act_lines"
+    done
   fi
 
   echo
 
   # ------------------------------------------------------------------
-  # Completed (this session)
+  # Completed (this session) – from stopped, only 100% items
   # ------------------------------------------------------------------
   echo "Completed (this session)"
   echo "--------------------------------------------------------------------------------"
   if (( completed_count == 0 )); then
     echo "  (none)"
   else
-    # Only items where completedLength == totalLength and totalLength > 0
-    # De-dupe by dir+name via sort -u
-    printf '%s\n' "$sto_lines" \
-    | jq -rc '
-        select(
-          ((.completedLength? // "0") == (.totalLength? // "0"))
-          and ((.totalLength? // "0") != "0")
+    jq -rc '
+      .[]
+      | select(
+          ((.totalLength? // "0") != "0")
+          and ((.completedLength? // "0") == (.totalLength? // "0"))
         )
-      ' \
+    ' <<<"$stopped" \
     | while IFS= read -r item; do
         [[ -z "$item" ]] && continue
         local dir name size_bytes size_h rel_dir
@@ -975,16 +1019,14 @@ aria2_show_download_snapshot() {
   # ------------------------------------------------------------------
   local sums spd_sum done_sum tot_sum
   sums="$(
-    printf '%s\n%s\n' "$act_lines" "$wai_lines" \
+    printf '%s\n%s\n' "$active" "$waiting" \
     | jq -sr '
-        (.[]
-          | {spd:(.downloadSpeed  | tonumber? // 0),
-             done:(.completedLength|tonumber? // 0),
-             tot:(.totalLength    |tonumber? // 0)}
-        ) as $a
-        | [$a.spd,$a.done,$a.tot]
-        | transpose
-        | map(add)
+        (add // []) as $all
+        | reduce $all[] as $t ([0,0,0];
+            .[0] += ($t.downloadSpeed   | tonumber? // 0) |
+            .[1] += ($t.completedLength | tonumber? // 0) |
+            .[2] += ($t.totalLength     | tonumber? // 0)
+          )
         | @tsv
       ' 2>/dev/null || echo -e "0\t0\t0"
   )"
