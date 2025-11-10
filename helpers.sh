@@ -919,9 +919,6 @@ aria2_show_download_snapshot() {
   fi
   echo
 
-  echo "Completed (this session)"
-  echo "--------------------------------------------------------------------------------"
-
   # Build TSV rows: name<TAB>relpath<TAB>size
   local completed_tsv
   completed_tsv="$(
@@ -938,6 +935,8 @@ aria2_show_download_snapshot() {
   )"
 
   if [[ -z "$completed_tsv" ]]; then
+    echo "Completed (this session)"
+    echo "--------------------------------------------------------------------------------"
     echo "  (none)"
     echo "--------------------------------------------------------------------------------"
   else
@@ -982,7 +981,9 @@ aria2_show_download_snapshot() {
   total_size=$(( total_size_active + total_size_waiting ))
   total_speed=$(( total_speed_active ))   # waiting has no speed
 
+  echo
   echo "Group total: speed $(helpers_human_bytes "$total_speed")/s, done $(helpers_human_bytes "$total_done") / $(helpers_human_bytes "$total_size")"
+  echo
 
   set -e
 }
@@ -1004,7 +1005,7 @@ helpers_print_completed_block() {
   echo "--------------------------------------------------------------------------------"
   for row in "${lines[@]}"; do
     IFS=$'\t' read -r name relpath size <<<"$row"
-    printf "✅ %-*s  %s  (%s)\n" "$maxlen" "$name" "$relpath" "$size"
+    printf "✅ %-*s  %s  (%s)\n" "$maxlen" "$name" "$relpath" "$(helpers_human_bytes $size)"
   done
 }
 
