@@ -828,16 +828,11 @@ aria2_show_download_snapshot() {
     return 0
   }
 
-  # ---- Slurp the batch into an array for all jq calls ----
-  # resp_s is an array like: [ {id:"A",...}, {id:"W",...}, {id:"S",...} ]
-  local resp_s
-  resp_s="$(jq -sr '.' <<<"$resp")"
-
-  # --- Counts ---
+  # ---- Counts (single slurp over $resp) ----
   local active_count waiting_count completed_count
-  active_count="$(jq -r '[ .[] | select(.id=="A") | .result[] ] | length' <<<"$resp_s" 2>/dev/null || echo 0)"
-  waiting_count="$(jq -r '[ .[] | select(.id=="W") | .result[] ] | length' <<<"$resp_s" 2>/dev/null || echo 0)"
-  completed_count="$(jq -r '[ .[] | select(.id=="S") | .result[] ] | length' <<<"$resp_s" 2>/dev/null || echo 0)"
+  active_count="$(jq -sr '[ .[] | select(.id=="A") | .result[] ] | length' <<<"$resp" 2>/dev/null || echo 0)"
+  waiting_count="$(jq -sr '[ .[] | select(.id=="W") | .result[] ] | length' <<<"$resp" 2>/dev/null || echo 0)"
+  completed_count="$(jq -sr '[ .[] | select(.id=="S") | .result[] ] | length' <<<"$resp" 2>/dev/null || echo 0)"
 
   echo "================================================================================"
   echo "=== Aria2 Downloader Snapshot @ $(date '+%Y-%m-%d %H:%M:%S')"
@@ -862,7 +857,7 @@ aria2_show_download_snapshot() {
       ($parts[-1]) as $name |
       (.totalLength // "0") as $bytes |
       [$dir,$name,$bytes] | @tsv
-    ' <<<"$resp_s" | while IFS=$'\t' read -r dir name bytes; do
+    ' <<<"$resp" 2>/dev/null | while IFS=$'\t' read -r dir name bytes; do
       local size rel_dir
       size="$(helpers_human_bytes "${bytes:-0}")"
       rel_dir="$dir"
@@ -887,7 +882,7 @@ aria2_show_download_snapshot() {
       def pct(done; tot):
         (tot|tonumber? // 0) as $t
         | if $t > 0
-          then (100.0 * (done|tonumber? // 0) / $t)
+          then (100 * (done|tonumber? // 0) / $t)
           else 0
           end;
 
@@ -909,7 +904,7 @@ aria2_show_download_snapshot() {
       | (if ($parts|length)>1 then ($parts[0:-1] | join("/")) else "." end) as $dir
       | ($parts[-1]) as $name
       | [$p, $B, $spd, $done, $tot, $dir, $name] | @tsv
-    ' <<<"$resp_s" | while IFS=$'\t' read -r pct bar spd done tot dir name; do
+    ' <<<"$resp" 2>/dev/null | while IFS=$'\t' read -r pct bar spd done tot dir name; do
       local spdH doneH totH rel_dir
       spdH="$(helpers_human_bytes "${spd:-0}")"
       doneH="$(helpers_human_bytes "${done:-0}")"
@@ -949,7 +944,7 @@ aria2_show_download_snapshot() {
       | ($parts[-1]) as $name
       | (.totalLength // .completedLength // "0") as $bytes
       | [$dir,$name,$bytes] | @tsv
-    ' <<<"$resp_s" | sort -u | while IFS=$'\t' read -r dir name bytes; do
+    ' <<<"$resp" 2>/dev/null | sort -u | while IFS=$'\t' read -r dir name bytes; do
       local size rel_dir
       size="$(helpers_human_bytes "${bytes:-0}")"
       rel_dir="$dir"
@@ -973,7 +968,7 @@ aria2_show_download_snapshot() {
       ($all | map(.completedLength| tonumber? // 0) | add) as $done |
       ($all | map(.totalLength    | tonumber? // 0) | add) as $tot  |
       [$spd,$done,$tot] | @tsv
-    ' <<<"$resp_s" 2>/dev/null || echo -e "0\t0\t0"
+    ' <<<"$resp" 2>/dev/null || echo -e "0\t0\t0"
   )"
   IFS=$'\t' read -r spd_sum done_sum tot_sum <<<"$sums"
 
