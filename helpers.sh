@@ -797,162 +797,185 @@ aria2_show_download_snapshot() {
   : "${ARIA2_PROGRESS_MAX:=999}"
   : "${ARIA2_PROGRESS_BAR_WIDTH:=40}"
 
-  local t="token:${ARIA2_SECRET}"
-  local url="http://${ARIA2_HOST}:${ARIA2_PORT}/jsonrpc"
+  # Be robust even if set -e is globally enabled
+  set +e
 
-  # ── Fetch JSON from aria2 ─────────────────────────────────────────────
+  # --- Fetch JSON from aria2 ---
   local act_json wai_json sto_json
-  act_json="$(curl -fsS "$url" \
-    -H 'Content-Type: application/json' \
-    --data-binary "$(jq -cn --arg t "$t" \
-      '{jsonrpc:"2.0",id:"A",method:"aria2.tellActive",params:[$t]}')" \
-  )" || {
-    echo "================================================================================"
-    echo "=== Aria2 Downloader Snapshot @ $(date '+%Y-%m-%d %H:%M:%S')"
-    echo "=== (RPC error; showing zero activity)"
-    echo "================================================================================"
-    echo
-    echo "Pending (waiting queue)"
-    echo "--------------------------------------------------------------------------------"
-    echo "  (none)"
-    echo
-    echo "Downloading (active transfers)"
-    echo "--------------------------------------------------------------------------------"
-    echo "  (none)"
-    echo
-    echo "Completed (this session)"
-    echo "--------------------------------------------------------------------------------"
-    echo "  (none)"
-    echo "--------------------------------------------------------------------------------"
-    echo "Group total: speed 0 Bytes/s, done 0 Bytes / 0 Bytes"
-    return 0
-  }
+  act_json="$(helpers_rpc 'aria2.tellActive' '[]' 2>/dev/null || true)"
+  wai_json="$(helpers_rpc 'aria2.tellWaiting' '[0,1000]' 2>/dev/null || true)"
+  sto_json="$(helpers_rpc 'aria2.tellStopped' '[0,1000]' 2>/dev/null || true)"
 
-  wai_json="$(curl -fsS "$url" \
-    -H 'Content-Type: application/json' \
-    --data-binary "$(jq -cn --arg t "$t" \
-      '{jsonrpc:"2.0",id:"W",method:"aria2.tellWaiting",params:[$t,0,1000]}')" \
-  )" || wai_json='{"result":[]}'
-  sto_json="$(curl -fsS "$url" \
-    -H 'Content-Type: application/json' \
-    --data-binary "$(jq -cn --arg t "$t" \
-      '{jsonrpc:"2.0",id:"S",method:"aria2.tellStopped",params:[$t,-1000,1000]}')" \
-  )" || sto_json='{"result":[]}'
-
-  # ── Extract arrays ────────────────────────────────────────────────────
+  # --- Extract arrays ---
   local act wai sto
   act="$(jq -c '(.result // [])' <<<"$act_json" 2>/dev/null || echo '[]')"
   wai="$(jq -c '(.result // [])' <<<"$wai_json" 2>/dev/null || echo '[]')"
   sto="$(jq -c '(.result // [])' <<<"$sto_json" 2>/dev/null || echo '[]')"
 
-  local active_count waiting_count completed_count
+  # --- Counts ---
+  local active_count pending_count completed_count
   active_count="$(jq -r 'length' <<<"$act" 2>/dev/null || echo 0)"
-  waiting_count="$(jq -r 'length' <<<"$wai" 2>/dev/null || echo 0)"
-  # completed = stopped items with status=="complete"
-  completed_count="$(jq -r '[.[] | select(.status=="complete")] | length' \
-                    <<<"$sto" 2>/dev/null || echo 0)"
+  pending_count="$(jq -r 'length' <<<"$wai" 2>/dev/null || echo 0)"
+  completed_count="$(jq -r 'length' <<<"$sto" 2>/dev/null || echo 0)"
 
   echo "================================================================================"
   echo "=== Aria2 Downloader Snapshot @ $(date '+%Y-%m-%d %H:%M:%S')"
-  echo "=== Active: $active_count   Pending: $waiting_count   Completed: $completed_count"
+  echo "=== Active: $active_count   Pending: $pending_count   Completed: $completed_count"
   echo "================================================================================"
   echo
 
-  # ── Pending (waiting queue) ───────────────────────────────────────────
+  # Helper: trim COMFY/COMFY_HOME from a dir
+  local ROOT
+  ROOT="${COMFY:-${COMFY_HOME:-}}"
+
+  # --- Pending (waiting queue) ---
   echo "Pending (waiting queue)"
   echo "--------------------------------------------------------------------------------"
-  if [[ "$waiting_count" -eq 0 ]]; then
+  if (( pending_count == 0 )); then
     echo "  (none)"
   else
-    jq -r '
-      .[] |
-      (.files[0].path // .bittorrent.info.name // .gid // "unknown") as $p
-      | ($p | split("/") | last) as $name
-      | ($p | split("/") | .[0:-1] | join("/") ) as $dir
-      | "\($name)\t\($dir)"
-    ' <<<"$wai" | while IFS=$'\t' read -r name dir; do
-      if [[ -n "${COMFY:-${COMFY_HOME:-}}" && "$dir" == "${COMFY:-${COMFY_HOME:-}}/"* ]]; then
-        dir="${dir#${COMFY:-${COMFY_HOME:-}}/}"
+    local -a pending_rows pending_rows2
+    local row name dir maxw=0
+
+    mapfile -t pending_rows < <(
+      jq -r '
+        .[]?
+        | (.files[0].path // "") as $p
+        | if $p == "" then empty else
+            ($p | capture("(?<dir>.*)/(?<name>[^/]+)$")) as $m
+            | "\($m.name)\t\($m.dir)"
+          end
+      ' <<<"$wai" 2>/dev/null || true
+    )
+
+    for row in "${pending_rows[@]}"; do
+      IFS=$'\t' read -r name dir <<<"$row"
+      if [[ -n "$ROOT" && "$dir" == "$ROOT/"* ]]; then
+        dir="${dir#$ROOT/}"
       fi
-      printf "  - %-40s [%s]\n" "$name" "$dir"
+      pending_rows2+=( "$name"$'\t'"$dir" )
+      (( ${#name} > maxw )) && maxw=${#name}
+    done
+
+    for row in "${pending_rows2[@]}"; do
+      IFS=$'\t' read -r name dir <<<"$row"
+      printf "  - %-*s [%s]\n" "$maxw" "$name" "$dir"
     done
   fi
-
   echo
-  # ── Active (with bars) ────────────────────────────────────────────────
+
+  # --- Downloading (active transfers) ---
   echo "Downloading (active transfers)"
   echo "--------------------------------------------------------------------------------"
-  if [[ "$active_count" -eq 0 ]]; then
+  if (( active_count == 0 )); then
     echo "  (none)"
   else
-    jq -r --argjson W "${ARIA2_PROGRESS_BAR_WIDTH:-40}" '
-      def bar(p; W):
-        ( (W * (p/100.0)) | floor ) as $f
-        | "[" + ( (range(0;$f) | "#") + (range($f;W) | "-") ) + "]";
-      .[] |
-      (.completedLength // "0" | tonumber) as $done
-      | (.totalLength     // "0" | tonumber) as $tot
-      | (.downloadSpeed   // "0" | tonumber) as $spd
-      | (if $tot > 0 then (100.0*$done/$tot) else 0 end) as $pct
-      | (if $pct < 0 then 0 elif $pct > 100 then 100 else $pct end) as $pc
-      | bar($pc; $W) as $B
-      | (.files[0].path // .bittorrent.info.name // .gid // "unknown") as $p
-      | ($p | split("/") | last) as $name
-      | ($p | split("/") | .[0:-1] | join("/") ) as $dir
-      | "\($pc)\t\($B)\t\($spd)\t\($done)\t\($tot)\t\($dir)\t\($name)"
-    ' <<<"$act" | while IFS=$'\t' read -r pct B spd done tot dir name; do
-      local spdH doneH totH
-      spdH="$(helpers_human_bytes "$spd")"
-      doneH="$(helpers_human_bytes "$done")"
-      totH="$(helpers_human_bytes "$tot")"
-      if [[ -n "${COMFY:-${COMFY_HOME:-}}" && "$dir" == "${COMFY:-${COMFY_HOME:-}}/"* ]]; then
-        dir="${dir#${COMFY:-${COMFY_HOME:-}}/}"
-      fi
-      printf " %6.2f%% %-*s %8s/s (%8s / %8s)  [ %-20s ] %s\n" \
-        "$pct" "${ARIA2_PROGRESS_BAR_WIDTH:-40}" "$B" "$spdH" "$doneH" "$totH" "$dir" "$name"
-    done
-  fi
+    local -a dl_rows
+    mapfile -t dl_rows < <(
+      ARIA2_PROGRESS_BAR_WIDTH="$ARIA2_PROGRESS_BAR_WIDTH" \
+      jq -r '
+        def hb(n):
+          if n == null or n == "" then "0 Bytes"
+          else (n|tonumber) as $x
+          | if   $x >= 1099511627776 then "\((($x/1099511627776)|floor)) TB"
+            elif $x >= 1073741824    then "\((($x/1073741824)|floor)) GB"
+            elif $x >= 1048576       then "\((($x/1048576)|floor)) MB"
+            elif $x >= 1024          then "\((($x/1024)|floor)) KB"
+            else "\($x) Bytes"
+            end
+          end;
 
+        def bar(p; w):
+          (w * (p/100.0)) as $W
+          | ($W|floor) as $full
+          | "[" + ( (range(0;$full) | "#") + (range($full;$W) | "-") ) + "]";
+
+        (env.ARIA2_PROGRESS_BAR_WIDTH|tonumber? // 40) as $W;
+
+        .[]?
+        | (.completedLength // "0" | tonumber) as $done
+        | (.totalLength     // "0" | tonumber) as $tot
+        | (.downloadSpeed   // "0" | tonumber) as $spd
+        | (.files[0].path // "") as $p
+        | if $p == "" then empty else
+            ($p | capture("(?<dir>.*)/(?<name>[^/]+)$")) as $m
+            | (if $tot>0 then (100.0*$done/$tot) else 0 end) as $pct
+            | "\($pct)\t\(bar($pct; $W))\t\(hb($spd))\t\(hb($done))\t\(
+                if $tot>0 then hb($tot) else "?" end)\t\($m.dir)\t\($m.name)"
+          end
+      ' <<<"$act" 2>/dev/null || true
+    )
+
+    local B pct spdH doneH totH dir name
+    while IFS=$'\t' read -r pct B spdH doneH totH dir name; do
+      if [[ -n "$ROOT" && "$dir" == "$ROOT/"* ]]; then
+        dir="${dir#$ROOT/}"
+      fi
+      printf " %6.2f%% %-*s %10s/s (%10s / %10s)  [ %-20s ] %s\n" \
+        "$pct" "$ARIA2_PROGRESS_BAR_WIDTH" "$B" "$spdH" "$doneH" "$totH" "$dir" "$name"
+    done <<<"$(printf '%s\n' "${dl_rows[@]}")"
+  fi
   echo
-  # ── Completed (this session) ──────────────────────────────────────────
+
+  # --- Completed (this session) ---
   echo "Completed (this session)"
   echo "--------------------------------------------------------------------------------"
-  if [[ "$completed_count" -eq 0 ]]; then
+  if (( completed_count == 0 )); then
     echo "  (none)"
+    echo "--------------------------------------------------------------------------------"
   else
-    jq -r '
-      .[] | select(.status=="complete") |
-      (.files[0].path // .bittorrent.info.name // .gid // "unknown") as $p
-      | ($p | split("/") | last) as $name
-      | ($p | split("/") | .[0:-1] | join("/") ) as $dir
-      | (.totalLength // "0" | tonumber) as $tot
-      | "\($name)\t\($dir)\t\($tot)"
-    ' <<<"$sto" | while IFS=$'\t' read -r name dir tot; do
-      local totH
-      totH="$(helpers_human_bytes "$tot")"
-      if [[ -n "${COMFY:-${COMFY_HOME:-}}" && "$dir" == "${COMFY:-${COMFY_HOME:-}}/"* ]]; then
-        dir="${dir#${COMFY:-${COMFY_HOME:-}}/}"
-      fi
-      printf "  ✅ %-40s [%-20s] (%s)\n" "$name" "$dir" "$totH"
-    done
+    local -a completed_rows
+    mapfile -t completed_rows < <(
+      jq -r '
+        .[]?
+        | select(.status == "complete")
+        | (.files[0].path // "") as $p
+        | if $p == "" then empty else
+            ($p | capture("(?<dir>.*)/(?<name>[^/]+)$")) as $m
+            | (.totalLength // 0 | tonumber) as $len
+            | "\($m.name)\t\($m.dir)\t\($len)"
+          end
+      ' <<<"$sto" 2>/dev/null || true
+    )
+
+    if ((${#completed_rows[@]} == 0)); then
+      echo "  (none)"
+      echo "--------------------------------------------------------------------------------"
+    else
+      # Reuse your helpers_print_completed_block
+      helpers_print_completed_block "${completed_rows[@]}"
+      echo "--------------------------------------------------------------------------------"
+    fi
   fi
 
-  echo "--------------------------------------------------------------------------------"
-
-  # ── Group totals from active+waiting ──────────────────────────────────
-  local merged total_done total_size total_speed
+  # --- Group totals (active + waiting) ---
+  local total_done total_size total_speed merged
   merged="$(jq -c --argjson a "$act" --argjson w "$wai" '$a + $w' 2>/dev/null || echo '[]')"
-  total_done="$(jq -r '[.[]|(.completedLength//0|tonumber)]|add' <<<"$merged" 2>/dev/null || echo 0)"
-  total_size="$(jq -r '[.[]|(.totalLength//0|tonumber)]|add'    <<<"$merged" 2>/dev/null || echo 0)"
-  total_speed="$(jq -r '[.[]|(.downloadSpeed//0|tonumber)]|add' <<<"$merged" 2>/dev/null || echo 0)"
 
-  local total_doneH total_sizeH total_speedH
-  total_doneH="$(helpers_human_bytes "$total_done")"
-  total_sizeH="$(helpers_human_bytes "$total_size")"
-  total_speedH="$(helpers_human_bytes "$total_speed")"
+  total_done="$(jq -r '[.[]? | (.completedLength//"0"|tonumber)] | add // 0' <<<"$merged" 2>/dev/null || echo 0)"
+  total_size="$(jq -r '[.[]? | (.totalLength//"0"|tonumber)]    | add // 0' <<<"$merged" 2>/dev/null || echo 0)"
+  total_speed="$(jq -r '[.[]? | (.downloadSpeed//"0"|tonumber)] | add // 0' <<<"$merged" 2>/dev/null || echo 0)"
 
-  printf "Group total: speed %s/s, done %s / %s\n" \
-    "$total_speedH" "$total_doneH" "$total_sizeH"
+  # Simple local human-bytes, in case helpers_human_bytes isn't ideal here
+  aria2__hb() {
+    local n="$1"
+    if [[ -z "$n" || "$n" == "0" ]]; then
+      printf "0 Bytes"
+      return
+    fi
+    local u value
+    if   (( n >= 1099511627776 )); then u="TB"; value=$(( n/1099511627776 ))
+    elif (( n >= 1073741824    )); then u="GB"; value=$(( n/1073741824 ))
+    elif (( n >= 1048576       )); then u="MB"; value=$(( n/1048576 ))
+    elif (( n >= 1024          )); then u="KB"; value=$(( n/1024 ))
+    else u="Bytes"; value=$n
+    fi
+    printf "%d %s" "$value" "$u"
+  }
+
+  echo "Group total: speed $(aria2__hb "$total_speed")/s, done $(aria2__hb "$total_done") / $(aria2__hb "$total_size")"
+
+  set -e
 }
 
 aria2_debug_queue_counts() {
