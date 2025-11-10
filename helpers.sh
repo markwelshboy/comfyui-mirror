@@ -949,31 +949,40 @@ aria2_show_download_snapshot() {
   fi
 
   # --- Group totals (active + waiting) ---
-  local total_done total_size total_speed merged
-  merged="$(jq -c --argjson a "$act" --argjson w "$wai" '$a + $w' 2>/dev/null || echo '[]')"
+  local total_done_active total_size_active total_speed_active
+  local total_done_waiting total_size_waiting
+  local total_done total_size total_speed
 
-  total_done="$(jq -r '[.[]? | (.completedLength//"0"|tonumber)] | add // 0' <<<"$merged" 2>/dev/null || echo 0)"
-  total_size="$(jq -r '[.[]? | (.totalLength//"0"|tonumber)]    | add // 0' <<<"$merged" 2>/dev/null || echo 0)"
-  total_speed="$(jq -r '[.[]? | (.downloadSpeed//"0"|tonumber)] | add // 0' <<<"$merged" 2>/dev/null || echo 0)"
+  # Sum over active transfers
+  total_done_active="$(
+    jq -r '[.[] | (.completedLength // "0" | tonumber)] | add // 0' \
+      <<<"$act" 2>/dev/null || echo 0
+  )"
+  total_size_active="$(
+    jq -r '[.[] | (.totalLength     // "0" | tonumber)] | add // 0' \
+      <<<"$act" 2>/dev/null || echo 0
+  )"
+  total_speed_active="$(
+    jq -r '[.[] | (.downloadSpeed   // "0" | tonumber)] | add // 0' \
+      <<<"$act" 2>/dev/null || echo 0
+  )"
 
-  # Simple local human-bytes, in case helpers_human_bytes isn't ideal here
-  aria2__hb() {
-    local n="$1"
-    if [[ -z "$n" || "$n" == "0" ]]; then
-      printf "0 Bytes"
-      return
-    fi
-    local u value
-    if   (( n >= 1099511627776 )); then u="TB"; value=$(( n/1099511627776 ))
-    elif (( n >= 1073741824    )); then u="GB"; value=$(( n/1073741824 ))
-    elif (( n >= 1048576       )); then u="MB"; value=$(( n/1048576 ))
-    elif (( n >= 1024          )); then u="KB"; value=$(( n/1024 ))
-    else u="Bytes"; value=$n
-    fi
-    printf "%d %s" "$value" "$u"
-  }
+  # Sum over waiting transfers (speed is always 0)
+  total_done_waiting="$(
+    jq -r '[.[] | (.completedLength // "0" | tonumber)] | add // 0' \
+      <<<"$wai" 2>/dev/null || echo 0
+  )"
+  total_size_waiting="$(
+    jq -r '[.[] | (.totalLength     // "0" | tonumber)] | add // 0' \
+      <<<"$wai" 2>/dev/null || echo 0
+  )"
 
-  echo "Group total: speed $(aria2__hb "$total_speed")/s, done $(aria2__hb "$total_done") / $(aria2__hb "$total_size")"
+  # Combine
+  total_done=$(( total_done_active + total_done_waiting ))
+  total_size=$(( total_size_active + total_size_waiting ))
+  total_speed=$(( total_speed_active ))   # waiting has no speed
+
+  echo "Group total: speed $(helpers_human_bytes "$total_speed")/s, done $(helpers_human_bytes "$total_done") / $(helpers_human_bytes "$total_size")"
 
   set -e
 }
