@@ -833,16 +833,20 @@ aria2_show_download_snapshot() {
     echo "  (none)"
   else
     mapfile -t pending_rows < <(
-      jq -r '
-        .[]?
+      W="$wai" jq -r '
+        (env.W // "[]") | fromjson
+        | .[]?
         | (if (.files|type=="array" and (.files|length)>0 and (.files[0].path? // "")!="")
-          then .files[0].path else "unknown" end) as $full
-        | if ($full|contains("/"))
-          then ($full | capture("(?<dir>.*)/(?<name>[^/]+)$"))
-          else {dir:"",name:$full}
+            then .files[0].path
+            else "unknown"
+          end) as $full
+        | if ($full | contains("/")) then
+            ($full | capture("(?<dir>.*)/(?<name>[^/]+)$")) as $p
+            | "\($p.dir)\t\($p.name)"
+          else
+            "\t\($full)"
           end
-        | "\(.dir)\t\(.name)"
-      ' <<<"$wai" 2>/dev/null
+      ' 2>/dev/null
     )
 
     if ((${#pending_rows[@]} == 0)); then
@@ -850,6 +854,10 @@ aria2_show_download_snapshot() {
     else
       for row in "${pending_rows[@]}"; do
         IFS=$'\t' read -r dir name <<<"$row"
+        # shorten dir relative to COMFY/COMFY_HOME if applicable
+        if [[ -n "${COMFY:-${COMFY_HOME:-}}" && "$dir" == "${COMFY:-${COMFY_HOME:-}}/"* ]]; then
+          dir="${dir#${COMFY:-${COMFY_HOME:-}}/}"
+        fi
         printf " ⏳ %-40s  %s\n" "$dir" "$name"
       done
     fi
@@ -916,16 +924,21 @@ aria2_show_download_snapshot() {
     echo "  (none)"
   else
     mapfile -t completed_rows < <(
-      jq -r '
-        .[]?
+      S="$sto" jq -r '
+        (env.S // "[]") | fromjson
+        | .[]?
         | (if (.files|type=="array" and (.files|length)>0 and (.files[0].path? // "")!="")
-          then .files[0].path else "unknown" end) as $full
-        | if ($full|contains("/"))
-          then ($full | capture("(?<dir>.*)/(?<name>[^/]+)$")) as $p
-              | "\($p.dir)\t\($p.name)\t\((.totalLength // 0) | tonumber)"
-          else "\t\($full)\t\((.totalLength // 0) | tonumber)"
+            then .files[0].path
+            else "unknown"
+          end) as $full
+        | (.totalLength // 0) as $bytes
+        | if ($full | contains("/")) then
+            ($full | capture("(?<dir>.*)/(?<name>[^/]+)$")) as $p
+            | "\($p.dir)\t\($p.name)\t\($bytes)"
+          else
+            "\t\($full)\t\($bytes)"
           end
-      ' <<<"$sto" 2>/dev/null
+      ' 2>/dev/null
     )
 
     if ((${#completed_rows[@]} == 0)); then
@@ -933,6 +946,10 @@ aria2_show_download_snapshot() {
     else
       for row in "${completed_rows[@]}"; do
         IFS=$'\t' read -r dir name bytes <<<"$row"
+        # normalize dir
+        if [[ -n "${COMFY:-${COMFY_HOME:-}}" && "$dir" == "${COMFY:-${COMFY_HOME:-}}/"* ]]; then
+          dir="${dir#${COMFY:-${COMFY_HOME:-}}/}"
+        fi
         size_h="$(helpers_human_bytes "${bytes:-0}")"
         printf " ✅ %-40s  %-50s  (%s)\n" "$dir" "$name" "$size_h"
       done
