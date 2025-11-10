@@ -828,11 +828,16 @@ aria2_show_download_snapshot() {
     return 0
   }
 
-  # --- Counts based directly on resp ---
+  # ---- Slurp the batch into an array for all jq calls ----
+  # resp_s is an array like: [ {id:"A",...}, {id:"W",...}, {id:"S",...} ]
+  local resp_s
+  resp_s="$(jq -sr '.' <<<"$resp")"
+
+  # --- Counts ---
   local active_count waiting_count completed_count
-  active_count="$(jq -r '[ .[] | select(.id=="A") | .result[] ] | length' <<<"$resp" 2>/dev/null || echo 0)"
-  waiting_count="$(jq -r '[ .[] | select(.id=="W") | .result[] ] | length' <<<"$resp" 2>/dev/null || echo 0)"
-  completed_count="$(jq -r '[ .[] | select(.id=="S") | .result[] ] | length' <<<"$resp" 2>/dev/null || echo 0)"
+  active_count="$(jq -r '[ .[] | select(.id=="A") | .result[] ] | length' <<<"$resp_s" 2>/dev/null || echo 0)"
+  waiting_count="$(jq -r '[ .[] | select(.id=="W") | .result[] ] | length' <<<"$resp_s" 2>/dev/null || echo 0)"
+  completed_count="$(jq -r '[ .[] | select(.id=="S") | .result[] ] | length' <<<"$resp_s" 2>/dev/null || echo 0)"
 
   echo "================================================================================"
   echo "=== Aria2 Downloader Snapshot @ $(date '+%Y-%m-%d %H:%M:%S')"
@@ -848,7 +853,7 @@ aria2_show_download_snapshot() {
   if (( waiting_count == 0 )); then
     echo "  (none)"
   else
-    jq -r '
+    jq -sr '
       [ .[] | select(.id=="W") | .result[] ] |
       .[] |
       (.files[0].path? // .bittorrent.info.name? // .infoHash // "unknown") as $p |
@@ -857,7 +862,7 @@ aria2_show_download_snapshot() {
       ($parts[-1]) as $name |
       (.totalLength // "0") as $bytes |
       [$dir,$name,$bytes] | @tsv
-    ' <<<"$resp" | while IFS=$'\t' read -r dir name bytes; do
+    ' <<<"$resp_s" | while IFS=$'\t' read -r dir name bytes; do
       local size rel_dir
       size="$(helpers_human_bytes "${bytes:-0}")"
       rel_dir="$dir"
@@ -878,7 +883,7 @@ aria2_show_download_snapshot() {
   if (( active_count == 0 )); then
     echo "  (none)"
   else
-    jq -r --arg W "$ARIA2_PROGRESS_BAR_WIDTH" '
+    jq -sr --arg W "$ARIA2_PROGRESS_BAR_WIDTH" '
       def pct(done; tot):
         (tot|tonumber? // 0) as $t
         | if $t > 0
@@ -904,7 +909,7 @@ aria2_show_download_snapshot() {
       | (if ($parts|length)>1 then ($parts[0:-1] | join("/")) else "." end) as $dir
       | ($parts[-1]) as $name
       | [$p, $B, $spd, $done, $tot, $dir, $name] | @tsv
-    ' <<<"$resp" | while IFS=$'\t' read -r pct bar spd done tot dir name; do
+    ' <<<"$resp_s" | while IFS=$'\t' read -r pct bar spd done tot dir name; do
       local spdH doneH totH rel_dir
       spdH="$(helpers_human_bytes "${spd:-0}")"
       doneH="$(helpers_human_bytes "${done:-0}")"
@@ -931,7 +936,7 @@ aria2_show_download_snapshot() {
   if (( completed_count == 0 )); then
     echo "  (none)"
   else
-    jq -r '
+    jq -sr '
       [ .[] | select(.id=="S") | .result[] ] |
       .[] |
       select(
@@ -944,7 +949,7 @@ aria2_show_download_snapshot() {
       | ($parts[-1]) as $name
       | (.totalLength // .completedLength // "0") as $bytes
       | [$dir,$name,$bytes] | @tsv
-    ' <<<"$resp" | sort -u | while IFS=$'\t' read -r dir name bytes; do
+    ' <<<"$resp_s" | sort -u | while IFS=$'\t' read -r dir name bytes; do
       local size rel_dir
       size="$(helpers_human_bytes "${bytes:-0}")"
       rel_dir="$dir"
@@ -960,7 +965,7 @@ aria2_show_download_snapshot() {
   # ------------------------------------------------------------------
   local sums spd_sum done_sum tot_sum
   sums="$(
-    jq -r '
+    jq -sr '
       def arrA: [ .[] | select(.id=="A") | .result[] ];
       def arrW: [ .[] | select(.id=="W") | .result[] ];
       (arrA + arrW) as $all |
@@ -968,7 +973,7 @@ aria2_show_download_snapshot() {
       ($all | map(.completedLength| tonumber? // 0) | add) as $done |
       ($all | map(.totalLength    | tonumber? // 0) | add) as $tot  |
       [$spd,$done,$tot] | @tsv
-    ' <<<"$resp" 2>/dev/null || echo -e "0\t0\t0"
+    ' <<<"$resp_s" 2>/dev/null || echo -e "0\t0\t0"
   )"
   IFS=$'\t' read -r spd_sum done_sum tot_sum <<<"$sums"
 
