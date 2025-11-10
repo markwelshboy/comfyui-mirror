@@ -871,49 +871,58 @@ aria2_show_download_snapshot() {
     echo "  (none)"
   else
     local -a dl_rows
+    local row done tot spd path pct bar_len bar W dir name
+
+    W="${ARIA2_PROGRESS_BAR_WIDTH:-40}"
+
+    # Extract simple TSV from the active array
     mapfile -t dl_rows < <(
-      ARIA2_PROGRESS_BAR_WIDTH="$ARIA2_PROGRESS_BAR_WIDTH" \
       jq -r '
-        def hb(n):
-          if n == null or n == "" then "0 Bytes"
-          else (n|tonumber) as $x
-          | if   $x >= 1099511627776 then "\((($x/1099511627776)|floor)) TB"
-            elif $x >= 1073741824    then "\((($x/1073741824)|floor)) GB"
-            elif $x >= 1048576       then "\((($x/1048576)|floor)) MB"
-            elif $x >= 1024          then "\((($x/1024)|floor)) KB"
-            else "\($x) Bytes"
-            end
-          end;
-
-        def bar(p; w):
-          (w * (p/100.0)) as $W
-          | ($W|floor) as $full
-          | "[" + ( (range(0;$full) | "#") + (range($full;$W) | "-") ) + "]";
-
-        (env.ARIA2_PROGRESS_BAR_WIDTH|tonumber? // 40) as $W;
-
         .[]?
-        | (.completedLength // "0" | tonumber) as $done
-        | (.totalLength     // "0" | tonumber) as $tot
-        | (.downloadSpeed   // "0" | tonumber) as $spd
-        | (.files[0].path // "") as $p
-        | if $p == "" then empty else
-            ($p | capture("(?<dir>.*)/(?<name>[^/]+)$")) as $m
-            | (if $tot>0 then (100.0*$done/$tot) else 0 end) as $pct
-            | "\($pct)\t\(bar($pct; $W))\t\(hb($spd))\t\(hb($done))\t\(
-                if $tot>0 then hb($tot) else "?" end)\t\($m.dir)\t\($m.name)"
-          end
+        | [.completedLength // "0",
+           .totalLength     // "0",
+           .downloadSpeed   // "0",
+           (.files[0].path  // "")]
+        | @tsv
       ' <<<"$act" 2>/dev/null || true
     )
 
-    local B pct spdH doneH totH dir name
-    while IFS=$'\t' read -r pct B spdH doneH totH dir name; do
+    for row in "${dl_rows[@]}"; do
+      IFS=$'\t' read -r done tot spd path <<<"$row"
+      # skip if no path (shouldn’t really happen, but be safe)
+      [[ -z "$path" ]] && continue
+
+      # Cast to integers
+      done=$((done+0))
+      tot=$((tot+0))
+      spd=$((spd+0))
+
+      # Percentage (integer)
+      pct=0
+      (( tot > 0 )) && pct=$(( done * 100 / tot ))
+
+      # Build progress bar
+      bar_len=$(( W * pct / 100 ))
+      printf -v bar '%*s' "$bar_len" ''
+      bar=${bar// /#}
+      printf -v bar '%-*s' "$W" "$bar"
+
+      # Split path into dir + name
+      dir="${path%/*}"
+      name="${path##*/}"
+
+      # Trim COMFY / COMFY_HOME prefix if present
       if [[ -n "$ROOT" && "$dir" == "$ROOT/"* ]]; then
         dir="${dir#$ROOT/}"
       fi
-      printf " %6.2f%% %-*s %10s/s (%10s / %10s)  [ %-20s ] %s\n" \
-        "$pct" "$ARIA2_PROGRESS_BAR_WIDTH" "$B" "$spdH" "$doneH" "$totH" "$dir" "$name"
-    done <<<"$(printf '%s\n' "${dl_rows[@]}")"
+
+      printf " %3d%% [%-*s] %10s/s (%10s / %10s)  [ %-20s ] %s\n" \
+        "$pct" "$W" "$bar" \
+        "$(helpers_human_bytes "$spd")" \
+        "$(helpers_human_bytes "$done")" \
+        "$(helpers_human_bytes "$tot")" \
+        "$dir" "$name"
+    done
   fi
   echo
 
