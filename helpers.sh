@@ -829,11 +829,11 @@ aria2_show_download_snapshot() {
     return 0
   }
 
-  # Extract arrays (always valid JSON arrays)
+  # Extract arrays with a simpler pattern
   local act wai sto
-  act="$(jq -c -sr '[.[] | select(.id=="A").result | .[]]' <<<"$resp" 2>/dev/null || echo '[]')"
-  wai="$(jq -c -sr '[.[] | select(.id=="W").result | .[]]' <<<"$resp" 2>/dev/null || echo '[]')"
-  sto="$(jq -c -sr '[.[] | select(.id=="S").result | .[]]' <<<"$resp" 2>/dev/null || echo '[]')"
+  act="$(jq -c -sr '[ .[] | select(.id=="A") | .result[] ]' <<<"$resp" 2>/dev/null || echo '[]')"
+  wai="$(jq -c -sr '[ .[] | select(.id=="W") | .result[] ]' <<<"$resp" 2>/dev/null || echo '[]')"
+  sto="$(jq -c -sr '[ .[] | select(.id=="S") | .result[] ]' <<<"$resp" 2>/dev/null || echo '[]')"
 
   local active_count waiting_count completed_count
   active_count="$(jq -r 'length' <<<"$act" 2>/dev/null || echo 0)"
@@ -861,9 +861,13 @@ aria2_show_download_snapshot() {
       (.totalLength // "0") as $bytes |
       [$dir,$name,$bytes] | @tsv
     ' <<<"$wai" | while IFS=$'\t' read -r dir name bytes; do
-      local size
+      local size rel_dir
       size="$(helpers_human_bytes "${bytes:-0}")"
-      printf "  %-40s  %-40s (%s)\n" "$dir" "$name" "$size"
+      rel_dir="$dir"
+      if [[ -n "${COMFY:-${COMFY_HOME:-}}" && "$rel_dir" == "${COMFY:-${COMFY_HOME:-}}/"* ]]; then
+        rel_dir="${rel_dir#${COMFY:-${COMFY_HOME:-}}/}"
+      fi
+      printf "  %-40s  %-40s (%s)\n" "$rel_dir" "$name" "$size"
     done
   fi
 
@@ -887,7 +891,7 @@ aria2_show_download_snapshot() {
         | ( ($W * (p/100.0)) | floor ) as $f
         | "[" + ( (range(0;$f) | "#") + (range($f;$W) | "-") ) + "]";
 
-      .[] as $t
+      . | unique_by(.gid) | .[] as $t
       | ($t.completedLength // "0") as $done
       | ($t.totalLength     // "0") as $tot
       | ($t.downloadSpeed   // "0") as $spd
@@ -924,10 +928,9 @@ aria2_show_download_snapshot() {
   else
     jq -r '
       .[] |
-      # treat anything fully done as complete
       select(
         .status == "complete"
-        or ((.completedLength? // "0") == (.totalLength? // "0" ))
+        or ((.completedLength? // "0") == (.totalLength? // "0"))
       )
       | (.files[0].path? // .bittorrent.info.name? // .infoHash // "unknown") as $p
       | ($p | split("/") ) as $parts
