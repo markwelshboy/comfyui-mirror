@@ -829,40 +829,30 @@ aria2_show_download_snapshot() {
   echo
   echo "Pending (waiting queue)"
   echo "--------------------------------------------------------------------------------"
-  if (( waiting_count == 0 )); then
+  if (( pending_count == 0 )); then
     echo "  (none)"
   else
-    local -a pending_rows=()
     mapfile -t pending_rows < <(
       jq -r '
-        (.result // [])[]
-        | ( if (.files|type=="array" and (.files|length)>0 and (.files[0].path? // "")!="")
-            then .files[0].path
-            else .bittorrent.info.name? // .infoHash // "unknown"
-            end ) as $full
-        | ( if ($full|contains("/")) then
-              ($full | capture("(?<dir>.*)/(?<name>[^/]+)$"))
-          else
-              {dir:"", name:$full}
-          end ) as $p
-        | ( .files[0].uris[0].uri? // "" ) as $u
-        | "\($p.name)\t\($p.dir)\t\($u)"
-      ' <<<"$w_json" 2>/dev/null
+        .[]?
+        | (if (.files|type=="array" and (.files|length)>0 and (.files[0].path? // "")!="")
+          then .files[0].path else "unknown" end) as $full
+        | if ($full|contains("/"))
+          then ($full | capture("(?<dir>.*)/(?<name>[^/]+)$"))
+          else {dir:"",name:$full}
+          end
+        | "\(.dir)\t\(.name)"
+      ' <<<"$wai" 2>/dev/null
     )
 
-    local maxlen=0 row name dir url
-    for row in "${pending_rows[@]}"; do
-      IFS=$'\t' read -r name dir url <<<"$row"
-      (( ${#name} > maxlen )) && maxlen=${#name}
-    done
-
-    for row in "${pending_rows[@]}"; do
-      IFS=$'\t' read -r name dir url <<<"$row"
-      if [[ -n "${COMFY:-${COMFY_HOME:-}}" && "$dir" == "${COMFY:-${COMFY_HOME:-}}/"* ]]; then
-        dir="${dir#${COMFY:-${COMFY_HOME:-}}/}"
-      fi
-      printf "  ⏳ %-*s  %-40s  %s\n" "$maxlen" "$name" "$dir" "$url"
-    done
+    if ((${#pending_rows[@]} == 0)); then
+      echo "  (none)"
+    else
+      for row in "${pending_rows[@]}"; do
+        IFS=$'\t' read -r dir name <<<"$row"
+        printf " ⏳ %-40s  %s\n" "$dir" "$name"
+      done
+    fi
   fi
 
   ########################################################################
@@ -925,23 +915,15 @@ aria2_show_download_snapshot() {
   if (( completed_count == 0 )); then
     echo "  (none)"
   else
-    local -a completed_rows=()
-
-    # IMPORTANT: we feed the plain array JSON `sto`, not the RPC envelope
     mapfile -t completed_rows < <(
       jq -r '
-        .[]
-        | (
-            if (.files | type=="array" and (.files|length)>0 and (.files[0].path? // "") != "")
-            then .files[0].path
-            else .bittorrent.info.name? // .infoHash // "unknown"
-            end
-          ) as $full
-        | if ($full|contains("/")) then
-            ($full | capture("(?<dir>.*)/(?<name>[^/]+)$")) as $p
-            | "\($p.name)\t\($p.dir)\t\((.totalLength // "0") | tonumber)"
-          else
-            "\($full)\t\t\((.totalLength // "0") | tonumber)"
+        .[]?
+        | (if (.files|type=="array" and (.files|length)>0 and (.files[0].path? // "")!="")
+          then .files[0].path else "unknown" end) as $full
+        | if ($full|contains("/"))
+          then ($full | capture("(?<dir>.*)/(?<name>[^/]+)$")) as $p
+              | "\($p.dir)\t\($p.name)\t\((.totalLength // 0) | tonumber)"
+          else "\t\($full)\t\((.totalLength // 0) | tonumber)"
           end
       ' <<<"$sto" 2>/dev/null
     )
@@ -949,28 +931,14 @@ aria2_show_download_snapshot() {
     if ((${#completed_rows[@]} == 0)); then
       echo "  (none)"
     else
-      local maxlen=0 crow cname cdir cbytes
-      # find longest filename to align nicely
-      for crow in "${completed_rows[@]}"; do
-        IFS=$'\t' read -r cname cdir cbytes <<<"$crow"
-        (( ${#cname} > maxlen )) && maxlen=${#cname}
-      done
-
-      for crow in "${completed_rows[@]}"; do
-        IFS=$'\t' read -r cname cdir cbytes <<<"$crow"
-
-        if [[ -n "${COMFY:-${COMFY_HOME:-}}" && "$cdir" == "${COMFY:-${COMFY_HOME:-}}/"* ]]; then
-          cdir="${cdir#${COMFY:-${COMFY_HOME:-}}/}"
-        fi
-
-        local human_size
-        human_size="$(helpers_human_bytes "${cbytes:-0}")"
-        printf " ✅ %-*s  %-40s  (%s)\n" \
-               "$maxlen" "$cname" "$cdir" "$human_size"
+      for row in "${completed_rows[@]}"; do
+        IFS=$'\t' read -r dir name bytes <<<"$row"
+        size_h="$(helpers_human_bytes "${bytes:-0}")"
+        printf " ✅ %-40s  %-50s  (%s)\n" "$dir" "$name" "$size_h"
       done
     fi
   fi
-
+  
   ########################################################################
   # GROUP TOTALS
   ########################################################################
