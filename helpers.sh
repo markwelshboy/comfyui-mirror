@@ -1042,6 +1042,59 @@ aria2_show_download_snapshot() {
   printf "Group total: speed %s/s, done %s / %s\n" "$spdH" "$doneH" "$totH"
 }
 
+aria2_debug_queue_counts() {
+  : "${ARIA2_HOST:=127.0.0.1}"
+  : "${ARIA2_PORT:=6969}"
+  : "${ARIA2_SECRET:=KissMeQuick}"
+
+  local t="token:${ARIA2_SECRET}"
+  local url="http://${ARIA2_HOST}:${ARIA2_PORT}/jsonrpc"
+
+  echo "=== aria2_debug_queue_counts @ $(date '+%Y-%m-%d %H:%M:%S') ==="
+
+  # Active
+  local act_json wai_json sto_json
+  act_json="$(curl -fsS "$url" \
+    -H 'Content-Type: application/json' \
+    --data-binary "$(jq -cn --arg t "$t" '{jsonrpc:"2.0",id:"A",method:"aria2.tellActive",params:[$t]}')" \
+  )" || { echo "  ERROR: tellActive RPC failed"; return 1; }
+
+  wai_json="$(curl -fsS "$url" \
+    -H 'Content-Type: application/json' \
+    --data-binary "$(jq -cn --arg t "$t" '{jsonrpc:"2.0",id:"W",method:"aria2.tellWaiting",params:[$t,0,1000]}')" \
+  )" || { echo "  ERROR: tellWaiting RPC failed"; return 1; }
+
+  sto_json="$(curl -fsS "$url" \
+    -H 'Content-Type: application/json' \
+    --data-binary "$(jq -cn --arg t "$t" '{jsonrpc:"2.0",id:"S",method:"aria2.tellStopped",params:[$t,-1000,1000]}')" \
+  )" || { echo "  ERROR: tellStopped RPC failed"; return 1; }
+
+  # Extract counts straight from .result
+  local active_count waiting_count stopped_count
+  active_count="$(jq -r '(.result // []) | length' <<<"$act_json" 2>/dev/null || echo 0)"
+  waiting_count="$(jq -r '(.result // []) | length' <<<"$wai_json" 2>/dev/null || echo 0)"
+  stopped_count="$(jq -r '(.result // []) | length' <<<"$sto_json" 2>/dev/null || echo 0)"
+
+  echo "  active   (tellActive .result | length):  $active_count"
+  echo "  waiting  (tellWaiting .result | length): $waiting_count"
+  echo "  stopped  (tellStopped .result | length): $stopped_count"
+
+  echo
+  echo "  Sample active names:"
+  jq -r '(.result // [])[] | .files[0].path // .bittorrent.info.name // .gid // "unknown"' \
+    <<<"$act_json" 2>/dev/null | sed 's/^/    - /' | head -10
+
+  echo
+  echo "  Sample waiting names:"
+  jq -r '(.result // [])[] | .files[0].path // .bittorrent.info.name // .gid // "unknown"' \
+    <<<"$wai_json" 2>/dev/null | sed 's/^/    - /' | head -10
+
+  echo
+  echo "  Sample stopped names:"
+  jq -r '(.result // [])[] | .files[0].path // .bittorrent.info.name // .gid // "unknown"' \
+    <<<"$sto_json" 2>/dev/null | sed 's/^/    - /' | head -10
+}
+
 #-----------------------------------------------------------------------
 #--
 #-- Manifest parser helpers --

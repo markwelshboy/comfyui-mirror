@@ -7,6 +7,20 @@ touch /root/.no_auto_tmux
 # Always have a workspace
 mkdir -p /workspace && cd /workspace
 
+# ---- Sanity check base image (need Ubuntu 24.04 for python3.12) ----
+if [ -r /etc/os-release ]; then
+  . /etc/os-release
+  echo "Base image: $PRETTY_NAME"
+  if [ "$ID" != "ubuntu" ] || [ "${VERSION_ID%%.*}" -lt 24 ]; then
+    echo "ERROR: This on-start script expects Ubuntu 24.04+ (for python3.12 apt packages)." >&2
+    echo "       Please pick a CUDA image ending in -ubuntu24.04 in Vast." >&2
+    exit 1
+  fi
+else
+  echo "WARNING: /etc/os-release not found; continuing but python3.12 packages may be missing." >&2
+fi
+
+# ---- Install OS deps, pull repo, run bootstrap ----
 # OS deps we need BEFORE autorun
 # Noninteractive apt
 export DEBIAN_FRONTEND=noninteractive
