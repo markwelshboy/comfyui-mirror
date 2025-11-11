@@ -540,31 +540,32 @@ install_custom_nodes_bundle() {
 ensure_nodes_from_bundle_or_build() {
   local tag="${BUNDLE_TAG:?BUNDLE_TAG required}"
   local pins="${PINS:-$(pins_signature)}"
+  mkdir -p "$CACHE_DIR" "$CUSTOM_DIR" "$CUSTOM_LOG_DIR"
 
-  echo "[custom-nodes] PINS = $pins"
-  echo "[custom-nodes] Looking for bundle tag=$tag, pins=$pins…"
+  echo "[custom-nodes] Looking for bundle tag=${tag}, pins=${pins}…"
 
-  local bundle_tgz
-  if bundle_tgz="$(hf_fetch_latest_bundle "$tag" "$pins")" && [[ -n "$bundle_tgz" ]]; then
-    echo "[custom-nodes] Found bundle $(basename "$bundle_tgz"); extracting…"
+  # ⚠️ NEW: only keep the *last* line from hf_fetch_latest_bundle
+  local tgz
+  tgz="$(hf_fetch_latest_bundle "$tag" "$pins" | tail -n1)"
 
-    # Make sure parent exists
-    mkdir -p "$(dirname "$CUSTOM_DIR")"
+  # Optional debug while we test:
+  echo "[custom-nodes] DEBUG: bundle candidate tgz='$tgz'"
+  if [[ -n "$tgz" ]]; then
+    ls -l "$tgz" || echo "[custom-nodes] DEBUG: ls failed for '$tgz'"
+  fi
 
-    # Optional: start clean so old junk doesn’t linger
-    rm -rf "$CUSTOM_DIR"
-
-    # IMPORTANT: this matches how we *created* the tar:
-    #   tar -C "$(dirname "$CUSTOM_DIR")" -czf "$tarpath" "$(basename "$CUSTOM_DIR")"
-    # So we untar into the same parent.
-    tar -C "$(dirname "$CUSTOM_DIR")" -xzf "$bundle_tgz"
-
+  if [[ -n "$tgz" && -s "$tgz" ]]; then
+    echo "[custom-nodes] Found bundle: $(basename "$tgz") — installing"
+    install_custom_nodes_bundle "$tgz"
     echo "[custom-nodes] Restored custom nodes from bundle."
     return 0
   fi
 
-  echo "[custom-nodes] No bundle found — installing from DEFAULT_NODES…"
+  echo "[custom-nodes] No usable bundle found — installing from DEFAULT_NODES…"
+
   install_custom_nodes_set
+
+  echo "[custom-nodes] Installed custom nodes from DEFAULT_NODES."
 }
 
 # push_bundle_if_requested: convenience wrapper (respects BUNDLE_TAG/PINS)
