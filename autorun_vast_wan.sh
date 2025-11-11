@@ -89,8 +89,13 @@ ensure_dirs
 $PIP install -U pip wheel setuptools ninja packaging
 
 # ---------- torch first (CUDA 12.8 nightly channel) ----------
-( PIP_CONSTRAINT=""; $PIP install --pre torch torchvision torchaudio \
-  --index-url https://download.pytorch.org/whl/nightly/cu128 )
+#( PIP_CONSTRAINT=""; $PIP install --pre torch torchvision torchaudio \
+#  --index-url https://download.pytorch.org/whl/nightly/cu128 )
+env -u PIP_REQUIRE_HASHES -u PIP_CONSTRAINT   \
+    $PIP install --pre --no-cache-dir         \
+      torch torchvision torchaudio            \
+      --index-url https://download.pytorch.org/whl/nightly/cu128
+
 $PY - <<'PY'
 import torch; print("torch:", torch.__version__)
 PY
