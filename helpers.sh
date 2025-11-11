@@ -427,22 +427,32 @@ hf_push_files() {
 hf_fetch_latest_bundle() {
   local tag="${1:?tag}" pins="${2:?pins}"
   local tmp="${CACHE_DIR}/.hf_pull.$$"
-  mkdir -p "$CACHE_DIR"; rm -rf "$tmp"
-  git lfs install >/dev/null 2>&1
-  git clone --depth=1 "$(hf_remote_url)" "$tmp" >/dev/null 2>&1 || { rm -rf "$tmp"; return 0; }
-  local patt="bundles/$(bundle_base "$tag" "$pins")"; patt="${patt%_*}_*.tgz"
-  local matches=()
-  mapfile -t matches < <(cd "$tmp" && ls -1 $patt 2>/dev/null | sort)
-  if (( ${#matches[@]} == 0 )); then rm -rf "$tmp"; return 0; fi
-  local latest="${matches[-1]}"
-  ( cd "$tmp"
-    git lfs fetch --include="$latest" >/dev/null 2>&1 || true
-    git lfs pull  --include="$latest" >/dev/null 2>&1 || true
-    cp -f "$latest" "$CACHE_DIR/$(basename "$latest")"
-  )
-  local out="${CACHE_DIR}/$(basename "$latest")"
+
+  mkdir -p "$CACHE_DIR"
   rm -rf "$tmp"
-  echo "$out"
+
+  # Quiet git lfs + clone
+  git lfs install >/dev/null 2>&1
+  if ! git clone --depth=1 "$(hf_remote_url)" "$tmp" >/dev/null 2>&1; then
+    rm -rf "$tmp"
+    return 1
+  fi
+
+  # Our manual test showed the files live in tmp/bundles/
+  local patt="custom_nodes_bundle_${tag}_${pins}_*.tgz"
+  local latest
+  latest="$(cd "$tmp/bundles" && ls -1 $patt 2>/dev/null | sort | tail -n1)"
+
+  if [[ -z "$latest" ]]; then
+    rm -rf "$tmp"
+    return 1
+  fi
+
+  cp "$tmp/bundles/$latest" "$CACHE_DIR/"
+  rm -rf "$tmp"
+
+  # Only print the final local path, nothing else
+  echo "${CACHE_DIR}/${latest}"
 }
 
 # build_nodes_manifest: create JSON manifest of installed nodes
@@ -540,32 +550,32 @@ install_custom_nodes_bundle() {
 ensure_nodes_from_bundle_or_build() {
   local tag="${BUNDLE_TAG:?BUNDLE_TAG required}"
   local pins="${PINS:-$(pins_signature)}"
-  mkdir -p "$CACHE_DIR" "$CUSTOM_DIR" "$CUSTOM_LOG_DIR"
 
+  mkdir -p "$CACHE_DIR" "$CUSTOM_LOG_DIR"
+  mkdir -p "$(dirname "$CUSTOM_DIR")"
+
+  echo "[custom-nodes] PINS = $pins"
   echo "[custom-nodes] Looking for bundle tag=${tag}, pins=${pins}…"
 
-  # ⚠️ NEW: only keep the *last* line from hf_fetch_latest_bundle
-  local tgz
+  local pattern="${CACHE_DIR}/custom_nodes_bundle_${tag}_${pins}_*.tgz"
+  local tgz=""
+
   tgz="$(hf_fetch_latest_bundle "$tag" "$pins" | tail -n1)"
 
-  # Optional debug while we test:
-  echo "[custom-nodes] DEBUG: bundle candidate tgz='$tgz'"
-  if [[ -n "$tgz" ]]; then
-    ls -l "$tgz" || echo "[custom-nodes] DEBUG: ls failed for '$tgz'"
-  fi
-
-  if [[ -n "$tgz" && -s "$tgz" ]]; then
-    echo "[custom-nodes] Found bundle: $(basename "$tgz") — installing"
-    install_custom_nodes_bundle "$tgz"
+  if [[ -n "$tgz" && -f "$tgz" ]]; then
+    echo "[custom-nodes] Using bundle: $(basename "$tgz")"
+    # Clean out any partial installs
+    rm -rf "$CUSTOM_DIR"
+    mkdir -p "$(dirname "$CUSTOM_DIR")"
+    # This matches exactly what you did manually:
+    # tar -xzf ... -C ComfyUI
+    tar -xzf "$tgz" -C "$(dirname "$CUSTOM_DIR")"
     echo "[custom-nodes] Restored custom nodes from bundle."
     return 0
   fi
 
-  echo "[custom-nodes] No usable bundle found — installing from DEFAULT_NODES…"
-
+  echo "[custom-nodes] No bundle available — installing from DEFAULT_NODES…"
   install_custom_nodes_set
-
-  echo "[custom-nodes] Installed custom nodes from DEFAULT_NODES."
 }
 
 # push_bundle_if_requested: convenience wrapper (respects BUNDLE_TAG/PINS)
