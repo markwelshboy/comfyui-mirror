@@ -428,7 +428,7 @@ hf_fetch_latest_bundle() {
   local tag="${1:?tag}" pins="${2:?pins}"
   local tmp="${CACHE_DIR}/.hf_pull.$$"
   mkdir -p "$CACHE_DIR"; rm -rf "$tmp"
-  git lfs install
+  git lfs install >/dev/null 2>&1
   git clone --depth=1 "$(hf_remote_url)" "$tmp" >/dev/null 2>&1 || { rm -rf "$tmp"; return 0; }
   local patt="bundles/$(bundle_base "$tag" "$pins")"; patt="${patt%_*}_*.tgz"
   local matches=()
