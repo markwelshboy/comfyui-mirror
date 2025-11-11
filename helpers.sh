@@ -448,28 +448,44 @@ hf_fetch_latest_bundle() {
 # build_nodes_manifest: create JSON manifest of installed nodes
 build_nodes_manifest() {
   local tag="${1:?tag}" out="${2:?out_json}"
-  "$PY_BIN" - <<PY
-import json, os, subprocess, sys
+
+  # Make sure the Python side sees where to write + which tag to use
+  CUSTOM_DIR="${CUSTOM_DIR:?}" \
+  BUNDLE_TAG="$tag" \
+  out_json="$out" \
+  "$PY_BIN" - <<'PY'
+import json, os, subprocess
+
 d = os.environ["CUSTOM_DIR"]
 items = []
+
 for name in sorted(os.listdir(d)):
     p = os.path.join(d, name)
+    # only include git-tracked custom nodes
     if not os.path.isdir(p) or not os.path.isdir(os.path.join(p, ".git")):
         continue
+
     def run(*args):
-        return subprocess.check_output(["git"," -C", p, *args], text=True).strip()
+        return subprocess.check_output(["git", "-C", p, *args], text=True).strip()
+
     try:
-        url = subprocess.check_output(["git","-C",p,"config","--get","remote.origin.url"], text=True).strip()
-    except Exception: url = ""
+        url = run("config", "--get", "remote.origin.url")
+    except Exception:
+        url = ""
     try:
-        ref = subprocess.check_output(["git","-C",p,"rev-parse","HEAD"], text=True).strip()
-    except Exception: ref = ""
+        ref = run("rev-parse", "HEAD")
+    except Exception:
+        ref = ""
     try:
-        br = subprocess.check_output(["git","-C",p,"rev-parse","--abbrev-ref","HEAD"], text=True).strip()
-    except Exception: br = ""
+        br = run("rev-parse", "--abbrev-ref", "HEAD")
+    except Exception:
+        br = ""
+
     items.append({"name": name, "path": p, "origin": url, "branch": br, "commit": ref})
-with open(sys.argv[1], "w") as f:
-    json.dump({"tag": os.environ.get("BUNDLE_TAG",""), "nodes": items}, f, indent=2)
+
+out = os.environ["out_json"]
+with open(out, "w", encoding="utf-8") as f:
+    json.dump({"tag": os.environ.get("BUNDLE_TAG", ""), "nodes": items}, f, indent=2)
 PY
 }
 
