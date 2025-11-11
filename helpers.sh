@@ -859,7 +859,7 @@ aria2_show_download_snapshot() {
 
     for row in "${pending_rows2[@]}"; do
       IFS=$'\t' read -r name dir <<<"$row"
-      printf "  - %-*s [%s]\n" "$maxw" "$name" "$dir"
+      printf "  ⏳  - %-*s [%s]\n" "$maxw" "$name" "$dir"
     done
   fi
   echo
@@ -1005,7 +1005,7 @@ helpers_print_completed_block() {
   echo "--------------------------------------------------------------------------------"
   for row in "${lines[@]}"; do
     IFS=$'\t' read -r name relpath size <<<"$row"
-    printf "✅ %-*s  %s  (%s)\n" "$maxlen" "$name" "$relpath" "$(helpers_human_bytes $size)"
+    printf "  ✅ %-*s  %s  (%s)\n" "$maxlen" "$name" "$relpath" "$(helpers_human_bytes $size)"
   done
 }
 

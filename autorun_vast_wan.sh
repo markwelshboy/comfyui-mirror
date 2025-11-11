@@ -255,7 +255,11 @@ mkdir -p "$DIFFUSION_MODELS_DIR" "$TEXT_ENCODERS_DIR" "$CLIP_VISION_DIR" "$VAE_D
 #  6.1) Huggingface Model downloader from manifest (uses helpers.sh)
 #===============================================================================================
 
-aria2_enqueue_and_wait_from_manifest
+if aria2_enqueue_and_wait_from_manifest ; then
+  echo "✅ All Huggingface models from manifest downloaded."
+else
+  echo "⚠️ Some Huggingface model downloads had issues. Check ${COMFY_LOGS}/aria2_manifest.log"
+fi
 
 echo "✅ All Huggingface models from manifest downloaded."
 
@@ -285,9 +289,11 @@ echo "✅ All Huggingface models from manifest downloaded."
 
 echo "Downloading CivitAI assets using environment-defined lists..."
 
-aria2_enqueue_and_wait_from_civitai
-
-echo "✅ All CivitAI models downloaded successfully!"
+if aria2_enqueue_and_wait_from_civitai ; then
+  echo "✅ All CivitAI models downloaded successfully!"
+else
+  echo "⚠️ No CivitAI Lora/Checkpoint models downloaded. Check ${CIVITAI_LOG_DIR}/aria2_civitai.log if this is unexpected."
+fi
 
 #===============================================================================================
 #  6.2.1) Rename any .zip loras to .safetensors
@@ -324,8 +330,10 @@ fi
 echo "Cloning Hearmeman24's ComfyUI-WAN repository for latest workflows..."
 cd /workspace
 if [ -d comfyui-wan/.git ]; then
+  echo "Updating existing comfyui-wan repository..."
   (cd comfyui-wan && git pull --rebase --autostash || true)
 else
+  echo "Cloning fresh copy of comfyui-wan..."
   git clone https://github.com/Hearmeman24/comfyui-wan.git
 fi
 cd comfyui-wan
@@ -387,10 +395,8 @@ INI
     echo "config.ini already exists. Updating preview_method..."
     sed -i 's/^preview_method = .*/preview_method = auto/' "$CONFIG_FILE"
   fi
-  
   echo "Config file setup complete!"
   echo "Default preview method updated to 'auto'"
-
 else
   echo "Skipping preview method update (change_preview_method is not 'true')."
 fi
