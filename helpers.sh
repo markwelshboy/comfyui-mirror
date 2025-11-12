@@ -437,20 +437,25 @@ hf_push_files() {
 
 torch_sage_key() {
   "$PY" - << 'PY'
-import sys, os, torch, torch.version
+import sys, os, torch
 
-# Python ABI: cp312
-py_abi = f"cp{sys.version_info.major}{sys.version_info.minor}"
+# Python ABI: cp312 etc.
+abi  = f"cp{sys.version_info.major}{sys.version_info.minor}"
 
-# Torch version: 2.6.0.dev2025xxxx etc.
-torch_ver = torch.__version__.replace('+', '_')
+# Torch version: normalize '+' to '_' to keep filenames safe
+tver = torch.__version__.replace('+','_')
 
-# CUDA as seen by torch
-cuda_ver = (torch.version.cuda or "unknown").replace('.', '')
+# Use *only* Torch's CUDA tag, and only once
+cu_raw = (torch.version.cuda or "").replace('.','')
+cu = f"cu{cu_raw}" if cu_raw else "cu_unknown"
 
-arch = os.environ.get("GPU_ARCH", "sm_unknown")
+# Normalize GPU_ARCH (expect "sm_89", "sm_120", etc.)
+arch = (os.environ.get("GPU_ARCH") or "").strip().lower()
+if arch.startswith("sm"):
+    arch = arch.replace("sm", "").lstrip("_- ")
+arch = f"sm_{arch}" if arch else "sm_unknown"
 
-print(f"py{py_abi}_torch{torch_ver}_cu{cuda_ver}_{arch}")
+print(f"py{abi}_torch{tver}_{cu}_{arch}")
 PY
 }
 
