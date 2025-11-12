@@ -1,9 +1,36 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd /workspace/comfyui-mirror || { echo "[rebase] repo missing"; exit 1; }
+
+REPO="/workspace/comfyui-mirror"
+
+source_if_exists() {
+  local f="$1"
+  [[ -f "$f" ]] || return 0
+  # shellcheck disable=SC1090
+  source "$f"
+}
+
+if [[ ! -d "${REPO}/.git" ]]; then
+  echo "[rebase] No git repo at ${REPO}"
+  exit 1
+fi
+
+cd "${REPO}"
+
+branch="$(git rev-parse --abbrev-ref HEAD || echo main)"
+echo "[rebase] Updating branch ${branch}…"
 git fetch --all --prune
-git pull --rebase --autostash || { git rebase --abort || true; exit 1; }
-[[ -f .env       ]] && source .env
-[[ -f helpers.sh ]] && source helpers.sh
-type -t show_env_summary >/dev/null 2>&1 && show_env_summary || true
+if ! git pull --rebase --autostash; then
+  echo "[rebase] Pull/rebase failed, attempting rebase --abort"
+  git rebase --abort || true
+  exit 1
+fi
+
+# Reload env and helpers
+source_if_exists "${REPO}/.env"
+source_if_exists "${REPO}/helpers.sh"
+
+type -t auto_channel_detect >/dev/null 2>&1 && auto_channel_detect  || true
+type -t show_env            >/dev/null 2>&1 && show_env             || true
+
 echo "[rebase] done."

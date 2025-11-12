@@ -117,15 +117,34 @@ fi
 # Load functions after aliases (so functions win)
 [ -r "$HOME/.bash_functions" ] && source "$HOME/.bash_functions"
 
-# --- End of personal aliases/functions ---
+# === tiny safe helper: source_if_exists ===
+source_if_exists() {
+  local f="$1"
+  [[ -f "$f" ]] || return 0
+  # shellcheck disable=SC1090
+  source "$f"
+}
 
-# auto-load provider tokens and project env if present
-[[ -f /root/.secrets/env.current ]] && source /root/.secrets/env.current
-[[ -f /workspace/comfyui-mirror/.env       ]] && source /workspace/comfyui-mirror/.env
-[[ -f /workspace/comfyui-mirror/helpers.sh ]] && source /workspace/comfyui-mirror/helpers.sh
-# quick access
-alias mirror='/workspace/mirror'
-alias rebase='/workspace/rebase'
+# === unified runtime loader for interactive shells ===
+load_runtime_env() {
+  # 1) provider/session env persisted by autorun
+  source_if_exists "/root/.secrets/env.current"
+
+  # 2) project env + helpers (if not already loaded)
+  source_if_exists "/workspace/comfyui-mirror/.env"
+  source_if_exists "/workspace/comfyui-mirror/helpers.sh"
+
+  # 3) sane defaults
+  export COMFY_HOME="${COMFY_HOME:-/workspace/ComfyUI}"
+
+  if [[ "${1:-}" == "--summary" ]]; then
+    echo "--- runtime environment ---"
+    printf '%-20s = %s\n' "COMFY_HOME" "$COMFY_HOME"
+    [[ -n "${GPU_ARCH:-}" ]] && printf '%-20s = %s\n' "GPU_ARCH" "$GPU_ARCH"
+    [[ -n "${GPU_NAME:-}" ]] && printf '%-20s = %s\n' "GPU_NAME" "$GPU_NAME"
+    echo "---------------------------"
+  fi
+}
 
 save_session_env() {
   local SECRET_DIR="/root/.secrets"
@@ -143,5 +162,19 @@ use_session_env() {
   source "$f"
   echo "[use_session_env] Loaded env from $f"
 }
+
+# --- End of personal aliases/functions ---
+
+# Make sure mouse wheel behaves
+
+bind -r "\e[A"
+bind -r "\e[B"
+
+# Try to line up this shell with the running job
+load_runtime_env --summary 2>/dev/null || true
+
+# handy aliases
+alias mirror='/workspace/mirror'
+alias rebase='/workspace/rebase'
 
 export PATH="/workspace:$PATH"

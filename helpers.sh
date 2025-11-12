@@ -743,7 +743,7 @@ PY
 # ================================================================
 # Utility: print quick Torch/Sage environment summary
 # ================================================================
-show_env_summary() {
+show_torch_sage_env_summary() {
   echo "=================================================="
   echo "Torch Channel  : ${TORCH_CHANNEL}"
   echo "Torch CUDA     : ${TORCH_CUDA}"
@@ -2223,4 +2223,40 @@ aria2_enqueue_and_wait_from_civitai() {
   aria2_clear_results >/dev/null 2>&1 || true
   trap - INT TERM
   return 0
+}
+
+show_env () {
+  # ----- Convenience environment echo -----
+  echo "======================================="
+  echo "🧠 Environment Summary"
+  echo "======================================="
+  echo ""
+  echo "COMFY_HOME:           $COMFY_HOME"
+  echo ""
+  show_torch_sage_env_summary
+  echo ""
+  echo "Custom nodes dir:     $CUSTOM_DIR"
+  echo "Cache dir:            $COMFY_CACHE_DIR"
+  echo "Logs dir:             $COMFY_LOGS"
+  echo "Bundles dir:          $BUNDLES_DIR"
+  echo "Bundle tag:           $BUNDLE_TAG"
+  echo "Workflow dir:         $WORKFLOW_DIR"
+  echo "Model manifest URL:   $MODEL_MANIFEST_URL"
+  echo ""
+  echo "DIFFUSION_MODELS_DIR: $DIFFUSION_MODELS_DIR"
+  echo "TEXT_ENCODERS_DIR:    $TEXT_ENCODERS_DIR"
+  echo "CLIP_VISION_DIR:      $CLIP_VISION_DIR"
+  echo "VAE_DIR:              $VAE_DIR"
+  echo "LORAS_DIR:            $LORAS_DIR"
+  echo "DETECTION_DIR:        $DETECTION_DIR"
+  echo "CTRL_DIR:             $CTRL_DIR"
+  echo "UPSCALE_DIR:          $UPSCALE_DIR"
+  echo ""
+  echo "HF_TOKEN:             $(if [ -n "$HF_TOKEN" ]; then echo "Set"; else echo "Not set"; fi)"
+  echo "HF Repo (Type):       $HF_REPO_ID ($HF_REPO_TYPE)"
+  echo ""
+  echo "CIVITAI_TOKEN:        $(if [ -n "$CIVITAI_TOKEN" ]; then echo "Set"; else echo "Not set"; fi)"
+  echo "CHECKPOINT_IDS:       ${CHECKPOINT_IDS_TO_DOWNLOAD:-Empty}"
+  echo "LORAS_IDS:            ${LORAS_IDS_TO_DOWNLOAD:-Empty}"
+  echo "======================================="  
 }
