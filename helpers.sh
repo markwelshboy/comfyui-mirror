@@ -457,67 +457,57 @@ PY
 }
 
 install_sage_from_source() {
-  # Detect CC via torch
-  local GPU_CC
-  GPU_CC="$("$PY" - << 'PY'
+  # Compute capability via torch
+  local CC_TORCH
+  CC_TORCH="$("$PY" - << 'PY'
 import torch
-if not torch.cuda.is_available():
-    print("0.0"); raise SystemExit
-maj, minr = torch.cuda.get_device_capability(0)
+maj, minr = torch.cuda.get_device_capability(0) if torch.cuda.is_available() else (0,0)
 print(f"{maj}.{minr}")
 PY
   )"
+  echo "Detected GPU compute capability: ${CC_TORCH}"
 
-  echo "Detected GPU compute capability: ${GPU_CC}"
+  # Good host toolchain for CUDA 12.x
+  unset CC CXX
+  if ! command -v g++-12 >/dev/null 2>&1; then
+    apt-get update && apt-get install -y gcc-12 g++-12
+  fi
+  export CC=/usr/bin/gcc-12
+  export CXX=/usr/bin/g++-12
 
-  # Map CC → arch list + commits
-  case "$GPU_CC" in
-    9.0)  # Hopper
-      export TORCH_CUDA_ARCH_LIST="9.0;8.9;8.6;8.0"
-      SAGE_GENCODE="-gencode arch=compute_90,code=sm_90"
-      SAGE_COMMITS=("main" "68de379")
-      ;;
-    8.9)  # Ada
-      export TORCH_CUDA_ARCH_LIST="8.9;8.6;8.0"
-      SAGE_GENCODE="-gencode arch=compute_89,code=sm_89"
-      SAGE_COMMITS=("68de379" "main")
-      ;;
-    8.*)  # Ampere
-      export TORCH_CUDA_ARCH_LIST="8.6;8.0"
-      SAGE_GENCODE="-gencode arch=compute_86,code=sm_86 -gencode arch=compute_80,code=sm_80"
-      SAGE_COMMITS=("main" "68de379")
-      ;;
-    *)
-      export TORCH_CUDA_ARCH_LIST="8.0"
-      SAGE_GENCODE="-gencode arch=compute_80,code=sm_80"
-      SAGE_COMMITS=("main" "68de379")
-      ;;
+  # Clear any conflicting arch envs
+  unset SAGE_CUDA_ARCH_LIST SAGE_GENCODE CUDA_ARCH_LIST
+
+  # Choose arch list based on CC (include back-compat so fatbin/PTX works)
+  case "$CC_TORCH" in
+    12.*)  export TORCH_CUDA_ARCH_LIST="12.0;8.9;8.6;8.0" ;;
+    9.*)   export TORCH_CUDA_ARCH_LIST="9.0;8.9;8.6;8.0"  ;;
+    8.9)   export TORCH_CUDA_ARCH_LIST="8.9;8.6;8.0"      ;;
+    8.*)   export TORCH_CUDA_ARCH_LIST="8.6;8.0"          ;;
+    *)     export TORCH_CUDA_ARCH_LIST="8.0"              ;;
   esac
 
   echo "TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}"
-  echo "NVCC extra: ${SAGE_GENCODE}"
+  # Do NOT pass custom -gencode flags; torch cpp_extension honors TORCH_CUDA_ARCH_LIST
 
-  echo "Building SageAttention from source..."
+  export USE_NINJA=1
+  export MAX_JOBS=$(nproc)
+
+  echo "Building SageAttention from source…"
   rm -rf /tmp/SageAttention
   git clone https://github.com/thu-ml/SageAttention.git /tmp/SageAttention
 
-  local SAGE_OK=0 c
-  for c in "${SAGE_COMMITS[@]}"; do
-    if build_sage "$c" 2>&1 | tee "/workspace/logs/sage_build_${c}.log"; then
-      echo "SageAttention built successfully at commit ${c}"
-      SAGE_OK=1
-      break
-    else
-      echo "SageAttention build failed at commit ${c} — trying next (if any)…"
-    fi
-  done
+  # Optional: pin to a known-good commit if you want
+  # (leave on default main for Blackwell support)
+  # (cd /tmp/SageAttention && git checkout 68de379)
 
-  if [ "$SAGE_OK" -ne 1 ]; then
-    echo "FATAL: SageAttention failed to build for CC=${GPU_CC}. See logs in /workspace/logs/sage_build_*.log" >&2
+  if $PIP install -e /tmp/SageAttention 2>&1 | tee /workspace/logs/sage_build.log; then
+    echo "SageAttention build OK"
+    return 0
+  else
+    echo "SageAttention build failed — see /workspace/logs/sage_build.log" >&2
     return 1
   fi
-
-  return 0
 }
 
 build_sage_bundle() {
