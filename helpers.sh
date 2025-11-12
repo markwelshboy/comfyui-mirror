@@ -82,6 +82,25 @@ die(){ echo "FATAL: $*" >&2; exit 1; }
 need(){ command -v "$1" >/dev/null 2>&1 || die "Missing tool: $1"; }
 
 # -------------------------- #
+#  System package helpers    #
+# -------------------------- #
+
+ensure_base_deps() {
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  apt-get install -y --no-install-recommends              \
+    aria2 ffmpeg                                          \
+    ninja-build build-essential cmake gcc g++             \
+    libgl1 libglib2.0-0 pkg-config                        \
+    python3.12 python3.12-venv python3.12-dev python3-pip \
+    jq git-lfs                                            \
+    ca-certificates unzip tmux gawk nano coreutils        \
+    net-tools ncurses-base bash-completion
+  git lfs install --system || true
+
+}
+
+# -------------------------- #
 #  Path + directory helpers  #
 # -------------------------- #
 
