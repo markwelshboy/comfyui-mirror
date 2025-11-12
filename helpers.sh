@@ -574,19 +574,24 @@ hf_fetch_sage_bundle() {
   local key="${1:?SAGE_KEY}"
   local tmp="${CACHE_DIR}/.hf_sage.$$"
 
+  echo "[sage-bundle] Installing git lfs."
   git lfs install >/dev/null 2>&1
+  echo "[sage-bundle] Attempting to fetch Sage bundle from HF repo $(hf_remote_url)…"
   if ! git clone --depth=1 "$(hf_remote_url)" "$tmp" >/dev/null 2>&1; then
     rm -rf "$tmp"
+    echo "[sage-bundle] ❌ Failed to clone HF repo. Please check your HF_TOKEN, network and URL:$(hf_remote_url)."
     return 1
   fi
 
   local patt="torch_sage_bundle_${key}.tgz"
   if [[ ! -f "$tmp/bundles/$patt" ]]; then
+    echo "[sage-bundle] ❌ No matching Sage bundle found in repo for key=${key}."
     rm -rf "$tmp"
     return 1
   fi
 
   mkdir -p "$CACHE_DIR"
+  echo "[sage-bundle] Found Sage bundle for key=${key}, copying to cache for extraction."
   cp "$tmp/bundles/$patt" "$CACHE_DIR/"
   rm -rf "$tmp"
 
