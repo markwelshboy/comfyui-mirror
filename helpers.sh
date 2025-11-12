@@ -102,7 +102,7 @@ ensure_dirs(){
     "${TEXT_ENCODERS_DIR:?}" \
     "${CLIP_VISION_DIR:?}" \
     "${VAE_DIR:?}" \
-    "${LORA_DIR:?}" \
+    "${LORAS_DIR:?}" \
     "${DETECTION_DIR:?}" \
     "${CTRL_DIR:?}" \
     "${UPSCALE_DIR:?}"
