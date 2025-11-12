@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+REPO="/workspace/comfyui-mirror"
+[[ -f /root/.secrets/env.current ]] && source /root/.secrets/env.current
+[[ -f "$REPO/.env"            ]] && source "$REPO/.env"
+[[ -f "$REPO/helpers.sh"      ]] && source "$REPO/helpers.sh"
+type -t auto_channel_detect >/dev/null 2>&1 && auto_channel_detect || true
+type -t show_env_summary   >/dev/null 2>&1 && show_env_summary   || true
+echo "[mirror] environment ready."

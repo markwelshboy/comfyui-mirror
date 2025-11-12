@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd /workspace/comfyui-mirror || { echo "[rebase] repo missing"; exit 1; }
+git fetch --all --prune
+git pull --rebase --autostash || { git rebase --abort || true; exit 1; }
+[[ -f .env       ]] && source .env
+[[ -f helpers.sh ]] && source helpers.sh
+type -t show_env_summary >/dev/null 2>&1 && show_env_summary || true
+echo "[rebase] done."
