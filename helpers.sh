@@ -439,23 +439,20 @@ torch_sage_key() {
   "$PY" - << 'PY'
 import sys, os, torch
 
-# Python ABI: cp312 etc.
 abi  = f"cp{sys.version_info.major}{sys.version_info.minor}"
 
-# Torch version: normalize '+' to '_' to keep filenames safe
-tver = torch.__version__.replace('+','_')
+# Keep ONLY the base version before '+'
+base_ver = torch.__version__.split('+', 1)[0].replace('+','_')
 
-# Use *only* Torch's CUDA tag, and only once
-cu_raw = (torch.version.cuda or "").replace('.','')
+cu_raw = (torch.version.cuda or "").replace('.', '')
 cu = f"cu{cu_raw}" if cu_raw else "cu_unknown"
 
-# Normalize GPU_ARCH (expect "sm_89", "sm_120", etc.)
 arch = (os.environ.get("GPU_ARCH") or "").strip().lower()
 if arch.startswith("sm"):
     arch = arch.replace("sm", "").lstrip("_- ")
 arch = f"sm_{arch}" if arch else "sm_unknown"
 
-print(f"py{abi}_torch{tver}_{cu}_{arch}")
+print(f"py{abi}_torch{base_ver}_{cu}_{arch}")
 PY
 }
 
