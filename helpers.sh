@@ -221,29 +221,6 @@ ensure_comfy() {
   [ -f "$COMFY_HOME/requirements.txt" ] && "$PIP_BIN" install -r "$COMFY_HOME/requirements.txt" || true
   ln -sfn "$COMFY_HOME" /ComfyUI
 }
-
-# build_sage: Build SageAttention at a specific commit (expects torch dev env ready)
-#   $1 commit (e.g. 68de379)
-build_sage() {
-  local commit="${1:?commit}"
-  ( set -e
-    cd /tmp
-    rm -rf SageAttention
-    git clone https://github.com/thu-ml/SageAttention.git
-    cd SageAttention
-    git reset --hard "$commit"
-
-    export MAX_JOBS="${MAX_JOBS:-32}"
-    export EXT_PARALLEL="${EXT_PARALLEL:-4}"
-    export NVCC_APPEND_FLAGS="${NVCC_APPEND_FLAGS:---threads 8}"
-    export FORCE_CUDA=1
-    export CXX="${CXX:-g++}" CC="${CC:-gcc}"
-    export EXTRA_NVCCFLAGS="${SAGE_GENCODE:-}"
-
-    "$PIP_BIN" install --no-build-isolation -e .
-  )
-}
-
 # ======================================================================
 # Section 3: Custom node installation (parallel)
 # ======================================================================
@@ -435,24 +412,354 @@ hf_push_files() {
   rm -rf "$tmp"
 }
 
+#---------------------------------------------------------------
+#
+#
+# Torch and SageAttention helpers
+#
+#
+#---------------------------------------------------------------
+
+# ================================================================
+# Hugging Face dataset name helpers
+# ================================================================
+# Expect HF_REPO like: markwelshboyx/hearmemanAI-comfyUI-workflows
+# or can fall back to parsing HF_REMOTE_URL if defined
+
+hf_dataset_namespace() {
+  if [[ -n "${HF_REPO:-}" ]]; then
+    echo "${HF_REPO%%/*}"
+  elif [[ -n "${HF_REMOTE_URL:-}" ]]; then
+    basename "$(dirname "${HF_REMOTE_URL}")"
+  else
+    echo "unknown_ns"
+  fi
+}
+
+hf_dataset_name() {
+  if [[ -n "${HF_REPO:-}" ]]; then
+    echo "${HF_REPO##*/}"
+  elif [[ -n "${HF_REMOTE_URL:-}" ]]; then
+    basename "${HF_REMOTE_URL%.git}"
+  else
+    echo "unknown_name"
+  fi
+}
+
+# ================================================================
+# Hugging Face bundles summary via API (uses jq)
+# ================================================================
+_hf_api_base() {
+  local ns name type
+  ns="$(hf_dataset_namespace)"
+  name="$(hf_dataset_name)"
+  type="${HF_REPO_TYPE:-dataset}"
+  echo "https://huggingface.co/api/${type}s/${ns}/${name}"
+}
+
+hf_bundles_summary() {
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "Bundles        : (install jq to see counts/details)"
+    return 0
+  fi
+  if [[ -z "${HF_TOKEN:-}" ]]; then
+    echo "Bundles        : (set HF_TOKEN to query)"
+    return 0
+  fi
+
+  local base; base="$(_hf_api_base)"
+  # dataset info (last modified)
+  local info tree count latest latest_sz
+
+  info="$(curl -fsSL -H "Authorization: Bearer ${HF_TOKEN}" "${base}" 2>/dev/null || true)"
+  tree="$(curl -fsSL -H "Authorization: Bearer ${HF_TOKEN}" "${base}/tree/main?recursive=1" 2>/dev/null || true)"
+
+  # last-modified (API uses lastModified or last_modified depending on entity)
+  local last_mod
+  last_mod="$(printf '%s' "$info" | jq -r '.lastModified // .last_modified // empty')"
+
+  # count items under bundles/
+  count="$(printf '%s' "$tree" | jq '[.[] | select(.path|startswith("bundles/"))] | length')"
+
+  # latest bundle path (by lexical order; good enough for timestamped filenames)
+  latest="$(printf '%s' "$tree" | jq -r '[.[] | select(.path|startswith("bundles/") and (.path|endswith(".tgz")))] | sort_by(.path) | (last?.path // empty)')"
+
+  # try to get size quickly if exposed; fall back to blank
+  latest_sz="$(printf '%s' "$tree" | jq -r --arg p "$latest" '.[] | select(.path==$p) | (.size // empty)')"
+
+  [[ -n "$last_mod" ]] && echo "Last modified  : ${last_mod}"
+  printf "Bundles (count): %s\n" "${count:-0}"
+  if [[ -n "$latest" ]]; then
+    if [[ -n "$latest_sz" && "$latest_sz" != "null" ]]; then
+      # humanize bytes (jq may not provide; keep raw if unknown)
+      echo "Latest bundle  : ${latest}  (${latest_sz} bytes)"
+    else
+      echo "Latest bundle  : ${latest}"
+    fi
+  else
+    echo "Latest bundle  : (none found)"
+  fi
+}
+
+# ================================================================
+# Quick Hugging Face repo connection summary
+# ================================================================
+
+hf_repo_info() {
+  local ns name type url
+  ns="$(hf_dataset_namespace)"
+  name="$(hf_dataset_name)"
+  type="${HF_REPO_TYPE:-dataset}" # dataset|model (future-proof)
+  url="https://huggingface.co/${type}s/${ns}/${name}"
+  echo "=================================================="
+  echo "🤖 Hugging Face Repo Info"
+  echo "Repo handle : ${ns}/${name}"
+  echo "Repo type   : ${type}"
+  echo "Repo URL    : ${url}"
+  echo -n "Auth check  : "
+  if [[ -n "${HF_TOKEN:-}" ]]; then
+    if curl -fsSL -H "Authorization: Bearer ${HF_TOKEN}" \
+      "https://huggingface.co/api/${type}s/${ns}/${name}" >/dev/null; then
+      echo "✅ OK (token accepted)"
+    else
+      echo "⚠️  Token present, but repo access not verified"
+    fi
+  else
+    echo "❌ No HF_TOKEN defined"
+  fi
+
+  # ▼ NEW: bundles summary
+  hf_bundles_summary
+
+  echo "=================================================="
+}
+
+# Return 0 if a LOCAL file exists for given basename in $CACHE_DIR
+_have_local() {
+  local base="$1"
+  [[ -f "${CACHE_DIR}/${base}" ]]
+}
+
+# Return 0 if the HF repo contains the path (lightweight index scan)
+_have_remote() {
+  local relpath="$1"  # e.g. bundles/torch_sage_bundle_<KEY>.tgz
+  local ns="$(hf_dataset_namespace)"
+  local name="$(hf_dataset_name)"
+  curl -fsSL -H "Authorization: Bearer ${HF_TOKEN}" \
+    "https://huggingface.co/api/datasets/${ns}/${name}/tree/main?recursive=1" \
+    | grep -q "\"path\":\"${relpath}\""
+}
+
+# Derive current keys/basenames
+_sage_bundle_basename() {
+  local key; key="$(torch_sage_key)"
+  echo "torch_sage_bundle_${key}.tgz"
+}
+
+_custom_nodes_bundle_basename() {
+  local tag pins
+  tag="${BUNDLE_TAG:?missing BUNDLE_TAG}"     # e.g. Wan2_1__Wan2_2__CUDA_12_8
+  pins="$(pins_signature)"                    # your existing helper
+  echo "custom_nodes_bundle_${tag}_${pins}_*.tgz"
+}
+
+# Show a concise yes/no with optional detail
+__yn() { [[ "$1" -eq 0 ]] && echo "YES" || echo "no"; }
+
+env_status() {
+  echo "=================================================="
+  echo "GPU Name       : ${GPU_NAME:-unknown} (${GPU_COUNT:-?} GPU[s])"
+  echo "GPU Arch       : ${GPU_ARCH:-unknown}"
+  echo "Torch Channel  : ${TORCH_CHANNEL:-auto}"
+  echo "Torch CUDA Tag : ${TORCH_CUDA:-cu128}"
+  echo "Torch Stable   : ${TORCH_STABLE_VER:-?}"
+  echo "Torch Nightly  : ${TORCH_NIGHTLY_VER:-auto}"
+  echo -n "Torch Version  : "
+  $PY - <<'PY'
+import torch
+print(f"{torch.__version__}  (CUDA {torch.version.cuda})")
+PY
+
+  local sage_key; sage_key="$(torch_sage_key)"
+  local sage_base; sage_base="$(_sage_bundle_basename)"
+  local nodes_glob; nodes_glob="$(_custom_nodes_bundle_basename)"
+
+  echo "Sage Key       : ${sage_key}"
+  echo "Cache Dir      : ${CACHE_DIR}"
+
+  # Local checks
+  local have_sage_local=1 have_nodes_local=1
+  if compgen -G "${CACHE_DIR}/${sage_base}" > /dev/null; then have_sage_local=0; fi
+  if compgen -G "${CACHE_DIR}/${nodes_glob}" > /dev/null; then have_nodes_local=0; fi
+
+  # Remote checks (skip if no HF token)
+  local have_sage_remote=1 have_nodes_remote=1
+  if [[ -n "${HF_TOKEN:-}" ]]; then
+    _have_remote "bundles/${sage_base}"; have_sage_remote=$?
+    # We don’t know the exact timestamped filename for nodes, so match by prefix via API list:
+    # quick and dirty: if any path starts with that tag+pins (ignoring timestamp), call it present
+    local ns name; ns="$(hf_dataset_namespace)"; name="$(hf_dataset_name)"
+    local prefix="bundles/${nodes_glob%\*}"  # strip *.tgz
+    if curl -fsSL -H "Authorization: Bearer ${HF_TOKEN}" \
+         "https://huggingface.co/api/datasets/${ns}/${name}/tree/main?recursive=1" \
+         | grep -q "\"path\":\"${prefix}"; then
+      have_nodes_remote=0
+    fi
+  fi
+
+  printf "Sage bundle (local)  : %s\n" "$(__yn $have_sage_local)"
+  printf "Sage bundle (remote) : %s   %s\n" "$(__yn $have_sage_remote)" \
+         "$( [[ $have_sage_remote -eq 0 ]] && echo "(bundles/${sage_base})" )"
+  printf "Nodes bundle (local) : %s\n" "$(__yn $have_nodes_local)"
+  printf "Nodes bundle (remote): %s   %s\n" "$(__yn $have_nodes_remote)" \
+         "$( [[ $have_nodes_remote -eq 0 ]] && echo "(bundles/${nodes_glob})" )"
+
+  # Quick import sanity
+  echo -n "Import torch/sage     : "
+  $PY - <<'PY'
+ok = True
+try:
+  import torch
+except Exception as e:
+  ok = False
+try:
+  import sageattention as sa
+except Exception as e:
+  ok = False
+print("OK" if ok else "issues")
+PY
+  echo "=================================================="
+}
+
+# ================================================================
+# Torch channel auto-detect + latest nightly discovery
+# ================================================================
+
+# Fetch latest nightly version for the selected CUDA stream (e.g. 2.10.0.dev20251112)
+# Falls back gracefully if network/index format changes.
+get_latest_torch_nightly_ver() {
+  local path="nightly/${TORCH_CUDA}"
+  local url="https://download.pytorch.org/whl/${path}/"
+  local ver
+
+  ver="$(
+    curl -fsSL "$url" \
+      | grep -oE 'torch-[0-9]+\.[0-9]+\.[0-9]+\.dev[0-9]{8}\+cu[0-9]+' \
+      | sed -E 's/^torch-([0-9]+\.[0-9]+\.[0-9]+\.dev[0-9]{8})\+.*$/\1/' \
+      | sort -V | tail -1
+  )" || true
+
+  # final sanity
+  if [[ -n "$ver" ]]; then
+    echo "$ver"
+  else
+    # conservative fallback: keep your existing default or a safe marker
+    echo "2.10.0.dev20251111"
+  fi
+}
+
+# Return 0 if the stable wheel for this CUDA stream seems present on the PyTorch index
+stable_torch_available() {
+  local url="https://download.pytorch.org/whl/${TORCH_CUDA}/"
+  # We only need to know if *any* wheel for the requested stable version exists on that index
+  # (exact cp tag/abi filename varies; index page is enough to decide)
+  curl -fsSL "$url" | grep -q "torch-${TORCH_STABLE_VER}\+${TORCH_CUDA}"
+}
+
+# Auto-select channel:
+# - If TORCH_CHANNEL already set -> respect it.
+# - Else try stable; if index shows no stable wheel for this CUDA stream, switch to nightly and set TORCH_NIGHTLY_VER dynamically.
+auto_channel_detect() {
+  if [[ -n "${TORCH_CHANNEL:-}" ]]; then
+    echo "[torch] Channel preset via env: ${TORCH_CHANNEL}"
+    # Populate nightly ver if user asked for nightly but didn’t set it
+    if [[ "$TORCH_CHANNEL" == "nightly" && -z "${TORCH_NIGHTLY_VER:-}" ]]; then
+      export TORCH_NIGHTLY_VER="$(get_latest_torch_nightly_ver)"
+      echo "[torch] Using latest nightly: ${TORCH_NIGHTLY_VER} (+${TORCH_CUDA})"
+    fi
+    return 0
+  fi
+
+  echo "[torch] Auto-detecting channel for CUDA=${TORCH_CUDA}, stable=${TORCH_STABLE_VER}…"
+  if stable_torch_available; then
+    export TORCH_CHANNEL="stable"
+    echo "[torch] ✅ Stable is available on index — selecting stable"
+  else
+    export TORCH_CHANNEL="nightly"
+    export TORCH_NIGHTLY_VER="$(get_latest_torch_nightly_ver)"
+    echo "[torch] ⚠️ Stable wheel not found on index — selecting nightly ${TORCH_NIGHTLY_VER}"
+  fi
+}
+
+install_torch() {
+  echo "[torch] Installing Torch (${TORCH_CHANNEL})..." >&2
+
+  case "${TORCH_CHANNEL}" in
+    stable)
+      local url="https://download.pytorch.org/whl/${TORCH_CUDA}"
+      local ver="${TORCH_STABLE_VER}+${TORCH_CUDA}"
+      env -u PIP_REQUIRE_HASHES -u PIP_CONSTRAINT \
+        $PIP install --no-cache-dir \
+          "torch==${ver}" torchvision torchaudio \
+          --index-url "$url"
+      ;;
+    nightly)
+      local url="https://download.pytorch.org/whl/nightly/${TORCH_CUDA}"
+      local ver="${TORCH_NIGHTLY_VER}+${TORCH_CUDA}"
+      env -u PIP_REQUIRE_HASHES -u PIP_CONSTRAINT \
+        $PIP install --pre --no-cache-dir \
+          "torch==${ver}" torchvision torchaudio \
+          --index-url "$url"
+      ;;
+    *)
+      echo "[install-torch] FATAL: Unknown TORCH_CHANNEL=${TORCH_CHANNEL}"; return 1;;
+  esac
+
+  $PY - <<'PY'
+import torch
+print(f"[install-torch] Installed: {torch.__version__} | CUDA {torch.version.cuda}")
+PY
+}
+
+# ================================================================
+# Utility: print quick Torch/Sage environment summary
+# ================================================================
+show_env_summary() {
+  echo "=================================================="
+  echo "Torch Channel  : ${TORCH_CHANNEL}"
+  echo "Torch CUDA     : ${TORCH_CUDA}"
+  echo "Torch Version  : $($PY -c 'import torch;print(torch.__version__)')"
+  echo "GPU Arch       : ${GPU_ARCH}"
+  echo "Sage Key       : $(torch_sage_key)"
+  echo "=================================================="
+}
+
+# ================================================================
+# Smarter Sage key generation (weekly-bucketed nightly builds)
+# ================================================================
 torch_sage_key() {
   "$PY" - << 'PY'
-import sys, os, torch
+import sys, os, torch, re, datetime
 
 abi  = f"cp{sys.version_info.major}{sys.version_info.minor}"
-
-# Keep ONLY the base version before '+'
-base_ver = torch.__version__.split('+', 1)[0].replace('+','_')
-
+ver  = torch.__version__
+base, _, _plus = ver.partition('+')  # strip "+cu128"
 cu_raw = (torch.version.cuda or "").replace('.', '')
 cu = f"cu{cu_raw}" if cu_raw else "cu_unknown"
+
+# Bucket nightly by ISO week to avoid daily churn
+m = re.match(r"(\d+\.\d+\.\d+)\.dev(\d{8})", base)
+if m:
+    y, mth, d = int(m.group(2)[:4]), int(m.group(2)[4:6]), int(m.group(2)[6:])
+    iso = datetime.date(y, mth, d).isocalendar()
+    base = f"{m.group(1)}.dev{iso[0]}w{iso[1]:02d}"
 
 arch = (os.environ.get("GPU_ARCH") or "").strip().lower()
 if arch.startswith("sm"):
     arch = arch.replace("sm", "").lstrip("_- ")
 arch = f"sm_{arch}" if arch else "sm_unknown"
 
-print(f"py{abi}_torch{base_ver}_{cu}_{arch}")
+print(f"py{abi}_torch{base}_{cu}_{arch}")
 PY
 }
 
@@ -571,30 +878,17 @@ push_sage_bundle_if_requested() {
 }
 
 hf_fetch_sage_bundle() {
-  local key="${1:?SAGE_KEY}"
-  local tmp="${CACHE_DIR}/.hf_sage.$$"
-
-  echo "[sage-bundle] Installing git lfs."
+  local key="${1:?SAGE_KEY}" tmp="${CACHE_DIR}/.hf_sage.$$"
   git lfs install >/dev/null 2>&1
-  echo "[sage-bundle] Attempting to fetch Sage bundle from HF repo $(hf_remote_url)…"
-  if ! git clone --depth=1 "$(hf_remote_url)" "$tmp" >/dev/null 2>&1; then
-    rm -rf "$tmp"
-    echo "[sage-bundle] ❌ Failed to clone HF repo. Please check your HF_TOKEN, network and URL:$(hf_remote_url)."
-    return 1
-  fi
-
+  GIT_CURL_VERBOSE=${GIT_CURL_VERBOSE:-0} GIT_TRACE=${GIT_TRACE:-0} \
+  git clone --depth=1 \
+    --config http.lowSpeedLimit=1000 \
+    --config http.lowSpeedTime=90 \
+    "$(hf_remote_url)" "$tmp" >/dev/null 2>&1 || { echo "[sage-bundle] ❌ Could not clone HF repo" >&2; rm -rf "$tmp"; return 1; }
   local patt="torch_sage_bundle_${key}.tgz"
-  if [[ ! -f "$tmp/bundles/$patt" ]]; then
-    echo "[sage-bundle] ❌ No matching Sage bundle found in repo for key=${key}."
-    rm -rf "$tmp"
-    return 1
-  fi
-
-  mkdir -p "$CACHE_DIR"
-  echo "[sage-bundle] Found Sage bundle for key=${key}, copying to cache for extraction."
-  cp "$tmp/bundles/$patt" "$CACHE_DIR/"
-  rm -rf "$tmp"
-
+  [[ -f "$tmp/bundles/$patt" ]] || { echo "[sage-bundle] ❌ Bundle ($patt) not available in HF repo." >&2; rm -rf "$tmp"; return 1; }
+  echo "[sage-bundle] ✅ found bundle $patt" >&2
+  mkdir -p "$CACHE_DIR"; cp "$tmp/bundles/$patt" "$CACHE_DIR/"; rm -rf "$tmp"
   echo "${CACHE_DIR}/${patt}"
 }
 
@@ -614,7 +908,7 @@ ensure_sage_from_bundle_or_build() {
   local key tarpath
   key="$(torch_sage_key)"
 
-  echo "[sage-bundle] Looking for Sage bundle key=${key}…"
+  echo "[sage-bundle] Looking for Sage bundle key=${key}…" >&2
 
   local pattern="${CACHE_DIR}/torch_sage_bundle_${key}.tgz"
   if [[ -f "$pattern" ]]; then
@@ -624,16 +918,19 @@ ensure_sage_from_bundle_or_build() {
   fi
 
   if [[ -n "$tarpath" && -f "$tarpath" ]]; then
-    echo "[sage-bundle] Using Sage bundle: $(basename "$tarpath")"
+    echo "[sage-bundle] Using Sage bundle: $(basename "$tarpath")" >&2
     SAGE_TARPATH="$tarpath" restore_sage_from_tar
     return 0
   fi
 
-  echo "[sage-bundle] No bundle found — building Sage from source…"
+  echo "[sage-bundle] No bundle found — building Sage from source…" >&2
   install_sage_from_source || return 1
   return 0
 }
 
+#----------------------------------------------------------------------
+# Custom nodes bundle fetch/build/push/pull
+#----------------------------------------------------------------------
 # hf_fetch_latest_custom_nodes_bundle: pull newest matching bundle for tag+pins into CACHE_DIR
 #   echoes local tgz path or empty
 hf_fetch_latest_custom_nodes_bundle() {

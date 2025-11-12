@@ -62,6 +62,11 @@ fi
 # shellcheck source=/dev/null
 source "$HELPERS"
 
+#-----------------------------
+# 2.1) Fetch/Show HF repo info early (for later use)
+#----------------------------- 
+hf_repo_info
+
 # -----------------------------
 # 3) Sanity checks from .env
 # -----------------------------
@@ -82,20 +87,17 @@ fi
 ensure_dirs
 
 # -----------------------------
-# 5) Base tooling in venv
+# 5) Base and PyTorch tooling in venv
 # -----------------------------
 
 $PIP install -U pip wheel setuptools ninja packaging
 
-# ---------- torch first (CUDA 12.8 nightly channel) ----------
-env -u PIP_REQUIRE_HASHES -u PIP_CONSTRAINT \
-    $PIP install --pre --no-cache-dir     \
-      torch torchvision torchaudio        \
-      --index-url https://download.pytorch.org/whl/nightly/cu128
+# Decide stable vs nightly (fills TORCH_NIGHTLY_VER automatically if nightly)
+auto_channel_detect
 
-$PY - <<'PY'
-import torch; print("torch:", torch.__version__)
-PY
+install_torch
+
+show_env_summary
 
 # -----------------------------
 # 6) Pull/build SageAttention: prefer pre-compiled HF bundle, fallback to source ----------
