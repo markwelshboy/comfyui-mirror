@@ -446,34 +446,65 @@ hf_push_files() {
 # or can fall back to parsing HF_REMOTE_URL if defined
 
 hf_dataset_namespace() {
+  # Primary: HF_REPO_ID="namespace/name"
+  if [[ -n "${HF_REPO_ID:-}" ]]; then
+    echo "${HF_REPO_ID%%/*}"
+    return 0
+  fi
+
+  # Fallback: if you ever add HF_REPO as an alias
   if [[ -n "${HF_REPO:-}" ]]; then
     echo "${HF_REPO%%/*}"
-  elif [[ -n "${HF_REMOTE_URL:-}" ]]; then
-    basename "$(dirname "${HF_REMOTE_URL}")"
-  else
-    echo "unknown_ns"
+    return 0
   fi
+
+  # Fallback: try parsing HF_REMOTE_URL if it exists
+  if [[ -n "${HF_REMOTE_URL:-}" ]]; then
+    local url ns
+    url="${HF_REMOTE_URL%.git}"
+    url="${url#https://}"
+    ns="$(printf '%s\n' "$url" | awk -F/ '{print $(NF-1)}')"
+    [[ -n "$ns" ]] && { echo "$ns"; return 0; }
+  fi
+
+  echo "unknown_ns"
 }
 
 hf_dataset_name() {
+  if [[ -n "${HF_REPO_ID:-}" ]]; then
+    echo "${HF_REPO_ID##*/}"
+    return 0
+  fi
+
   if [[ -n "${HF_REPO:-}" ]]; then
     echo "${HF_REPO##*/}"
-  elif [[ -n "${HF_REMOTE_URL:-}" ]]; then
-    basename "${HF_REMOTE_URL%.git}"
-  else
-    echo "unknown_name"
+    return 0
   fi
+
+  if [[ -n "${HF_REMOTE_URL:-}" ]]; then
+    local url name
+    url="${HF_REMOTE_URL%.git}"
+    name="$(printf '%s\n' "$url" | awk -F/ '{print $NF}')"
+    [[ -n "$name" ]] && { echo "$name"; return 0; }
+  fi
+
+  echo "unknown_name"
 }
 
 # ================================================================
 # Hugging Face bundles summary via API (uses jq)
 # ================================================================
 _hf_api_base() {
-  local ns name type
-  ns="$(hf_dataset_namespace)"
-  name="$(hf_dataset_name)"
-  type="${HF_REPO_TYPE:-dataset}"
-  echo "https://huggingface.co/api/${type}s/${ns}/${name}"
+  local base="${HF_API_BASE:-https://huggingface.co}"
+  local type="${HF_REPO_TYPE:-dataset}"   # datasets or models
+  local id="${HF_REPO_ID:-}"
+
+  if [[ -z "$id" ]]; then
+    # last resort, reconstruct from namespace+name
+    id="$(hf_dataset_namespace)/$(hf_dataset_name)"
+  fi
+
+  echo "${base}/api/${type}s/${id}"
 }
 
 hf_bundles_summary() {
@@ -486,31 +517,47 @@ hf_bundles_summary() {
     return 0
   fi
 
-  local base; base="$(_hf_api_base)"
-  # dataset info (last modified)
-  local info tree count latest latest_sz
-
+  local base info tree
+  base="$(_hf_api_base)"
   info="$(curl -fsSL -H "Authorization: Bearer ${HF_TOKEN}" "${base}" 2>/dev/null || true)"
   tree="$(curl -fsSL -H "Authorization: Bearer ${HF_TOKEN}" "${base}/tree/main?recursive=1" 2>/dev/null || true)"
 
-  # last-modified (API uses lastModified or last_modified depending on entity)
-  local last_mod
-  last_mod="$(printf '%s' "$info" | jq -r '.lastModified // .last_modified // empty')"
+  # Check info JSON
+  if [[ -z "$info" ]] || ! printf '%s' "$info" | jq empty >/dev/null 2>&1; then
+    echo "Last modified  : (repo info unavailable)"
+    echo "Bundles (count): ?"
+    echo "Latest bundle  : (API not reachable / repo not found)"
+    return 0
+  fi
 
-  # count items under bundles/
+  # Try to parse lastModified
+  local last_mod
+  last_mod="$(printf '%s' "$info" | jq -r '.lastModified // .last_modified // "unknown"')"
+  echo "Last modified  : ${last_mod}"
+
+  # If tree is bad, bail gracefully
+  if [[ -z "$tree" ]] || ! printf '%s' "$tree" | jq empty >/dev/null 2>&1; then
+    echo "Bundles (count): 0"
+    echo "Latest bundle  : (no bundle tree data)"
+    return 0
+  fi
+
+  local count latest latest_sz
   count="$(printf '%s' "$tree" | jq '[.[] | select(.path|startswith("bundles/"))] | length')"
 
-  # latest bundle path (by lexical order; good enough for timestamped filenames)
-  latest="$(printf '%s' "$tree" | jq -r '[.[] | select(.path|startswith("bundles/") and (.path|endswith(".tgz")))] | sort_by(.path) | (last?.path // empty)')"
+  latest="$(printf '%s' "$tree" | jq -r '
+    [.[] | select(.path|startswith("bundles/") and (.path|endswith(".tgz")))]
+    | sort_by(.path)
+    | (last?.path // empty)
+  ')"
 
-  # try to get size quickly if exposed; fall back to blank
-  latest_sz="$(printf '%s' "$tree" | jq -r --arg p "$latest" '.[] | select(.path==$p) | (.size // empty)')"
-
-  [[ -n "$last_mod" ]] && echo "Last modified  : ${last_mod}"
   printf "Bundles (count): %s\n" "${count:-0}"
+
   if [[ -n "$latest" ]]; then
+    latest_sz="$(printf '%s' "$tree" | jq -r --arg p "$latest" '
+      .[] | select(.path == $p) | (.size // empty)
+    ')"
     if [[ -n "$latest_sz" && "$latest_sz" != "null" ]]; then
-      # humanize bytes (jq may not provide; keep raw if unknown)
       echo "Latest bundle  : ${latest}  (${latest_sz} bytes)"
     else
       echo "Latest bundle  : ${latest}"
@@ -525,31 +572,32 @@ hf_bundles_summary() {
 # ================================================================
 
 hf_repo_info() {
-  local ns name type url
+  local ns name type url api_base
   ns="$(hf_dataset_namespace)"
   name="$(hf_dataset_name)"
-  type="${HF_REPO_TYPE:-dataset}" # dataset|model (future-proof)
-  url="https://huggingface.co/${type}s/${ns}/${name}"
+  type="${HF_REPO_TYPE:-dataset}"
+  api_base="${HF_API_BASE:-https://huggingface.co}"
+  url="${api_base}/${type}s/${ns}/${name}"
+
   echo "=================================================="
   echo "🤖 Hugging Face Repo Info"
   echo "Repo handle : ${ns}/${name}"
   echo "Repo type   : ${type}"
   echo "Repo URL    : ${url}"
   echo -n "Auth check  : "
+
   if [[ -n "${HF_TOKEN:-}" ]]; then
     if curl -fsSL -H "Authorization: Bearer ${HF_TOKEN}" \
-      "https://huggingface.co/api/${type}s/${ns}/${name}" >/dev/null; then
+         "${api_base}/api/${type}s/${ns}/${name}" >/dev/null 2>&1; then
       echo "✅ OK (token accepted)"
     else
-      echo "⚠️  Token present, but repo access not verified"
+      echo "⚠️ Token present, but repo not reachable / 404"
     fi
   else
     echo "❌ No HF_TOKEN defined"
   fi
 
-  # ▼ NEW: bundles summary
   hf_bundles_summary
-
   echo "=================================================="
 }
 
@@ -2233,8 +2281,6 @@ show_env () {
   echo ""
   echo "COMFY_HOME:           $COMFY_HOME"
   echo ""
-  show_torch_sage_env_summary
-  echo ""
   echo "Custom nodes dir:     $CUSTOM_DIR"
   echo "Cache dir:            $CACHE_DIR"
   echo "Logs dir:             $COMFY_LOGS"
@@ -2254,7 +2300,9 @@ show_env () {
   echo "UPSCALE_DIR:          $UPSCALE_DIR"
   echo ""
   echo "HF_TOKEN:             $(if [ -n "$HF_TOKEN" ]; then echo "Set"; else echo "Not set"; fi)"
+  echo ""
   hf_repo_info
+  echo ""
   echo ""
   echo "CIVITAI_TOKEN:        $(if [ -n "$CIVITAI_TOKEN" ]; then echo "Set"; else echo "Not set"; fi)"
   echo "CHECKPOINT_IDS:       ${CHECKPOINT_IDS_TO_DOWNLOAD:-Empty}"

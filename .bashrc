@@ -171,7 +171,7 @@ bind -r "\e[A"
 bind -r "\e[B"
 
 # Try to line up this shell with the running job
-load_runtime_env --summary 2>/dev/null || true
+load_runtime_env 2>/dev/null || true
 
 # handy aliases
 alias mirror='/workspace/mirror'
