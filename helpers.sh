@@ -816,7 +816,7 @@ PY
   git clone https://github.com/thu-ml/SageAttention.git /tmp/SageAttention
 
   if $PIP install --no-build-isolation -e /tmp/SageAttention 2>&1 | tee /workspace/logs/sage_build.log; then
-    echo "SageAttention build OK"
+    echo "SageAttention built OK"
     return 0
   else
     echo "SageAttention build FAILED — see /workspace/logs/sage_build.log" >&2
@@ -2253,7 +2253,7 @@ show_env () {
   echo "UPSCALE_DIR:          $UPSCALE_DIR"
   echo ""
   echo "HF_TOKEN:             $(if [ -n "$HF_TOKEN" ]; then echo "Set"; else echo "Not set"; fi)"
-  echo "HF Repo (Type):       $HF_REPO_ID ($HF_REPO_TYPE)"
+  hf_repo_info
   echo ""
   echo "CIVITAI_TOKEN:        $(if [ -n "$CIVITAI_TOKEN" ]; then echo "Set"; else echo "Not set"; fi)"
   echo "CHECKPOINT_IDS:       ${CHECKPOINT_IDS_TO_DOWNLOAD:-Empty}"

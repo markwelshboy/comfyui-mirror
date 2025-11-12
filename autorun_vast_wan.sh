@@ -64,20 +64,7 @@ else
 fi
 
 # -----------------------------
-# 0) OS prereqs & workspace
-# -----------------------------
-
-ensure_base_deps
-
-# -----------------------------
-# 1) Ensure venv exists FIRST
-# -----------------------------
-if [ ! -x /opt/venv/bin/python ]; then
-  python3.12 -m venv /opt/venv
-fi
-
-# -----------------------------
-# 2) Require .env and helpers
+# 0) Require .env and helpers
 #    (.env defines PATH, PY, PIP, pip flags, etc.)
 # -----------------------------
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -98,14 +85,31 @@ fi
 # shellcheck source=/dev/null
 source "$HELPERS"
 
-#-----------------------------
-# 2.1) Fetch/Show HF repo info early (for later use)
-#----------------------------- 
+#------------------------------
+# 0.1) Derive any environment variables and summarize
+#------------------------------
 
-hf_repo_info
+# Decide stable vs. nightly 
+#   - (fills TORCH_NIGHTLY_VER automatically if nightly, uses curl installed in on start script)
+auto_channel_detect
+
+show_env
 
 # -----------------------------
-# 3) Sanity checks from .env
+# 1) OS prereqs & workspace
+# -----------------------------
+
+ensure_base_deps
+
+# -----------------------------
+# 2) Ensure venv exists FIRST
+# -----------------------------
+if [ ! -x /opt/venv/bin/python ]; then
+  python3.12 -m venv /opt/venv
+fi
+
+# -----------------------------
+# 2.1) Sanity checks from .env
 # -----------------------------
 : "${PY:?PY must be set by .env}"
 : "${PIP:?PIP must be set by .env}"
@@ -118,7 +122,7 @@ if [ ! -x "$PY" ] || [ ! -x "$PIP" ]; then
 fi
 
 # -----------------------------
-# 4) Set up required directories
+# 3) Set up required system-wide directories
 # -----------------------------
 
 ensure_dirs
@@ -128,9 +132,6 @@ ensure_dirs
 # -----------------------------
 
 $PIP install -U pip wheel setuptools ninja packaging
-
-# Decide stable vs nightly (fills TORCH_NIGHTLY_VER automatically if nightly)
-auto_channel_detect
 
 install_torch
 
