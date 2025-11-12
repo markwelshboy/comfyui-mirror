@@ -2236,8 +2236,9 @@ show_env () {
   show_torch_sage_env_summary
   echo ""
   echo "Custom nodes dir:     $CUSTOM_DIR"
-  echo "Cache dir:            $COMFY_CACHE_DIR"
+  echo "Cache dir:            $CACHE_DIR"
   echo "Logs dir:             $COMFY_LOGS"
+  echo "Output dir:           $OUTPUT_DIR"
   echo "Bundles dir:          $BUNDLES_DIR"
   echo "Bundle tag:           $BUNDLE_TAG"
   echo "Workflow dir:         $WORKFLOW_DIR"
