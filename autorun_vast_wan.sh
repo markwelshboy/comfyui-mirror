@@ -49,7 +49,6 @@ HELPERS="${HELPERS:-$SCRIPT_DIR/helpers.sh}"
 
 if [ ! -f "$ENVIRONMENT" ]; then
   echo "[fatal] Required .env not found at: $ENVIRONMENT"
-  echo "        Create it (see sample below) and re-run."
   exit 1
 fi
 
@@ -76,94 +75,38 @@ if [ ! -x "$PY" ] || [ ! -x "$PIP" ]; then
   exit 1
 fi
 
-# ==============================================================================================
-#  Main entrypoint logic
-# ==============================================================================================
+# -----------------------------
+# 4) Set up required directories
+# -----------------------------
 
-# =========================
-#  Directories
-# =========================
 ensure_dirs
 
-# Base tooling in venv
+# -----------------------------
+# 5) Base tooling in venv
+# -----------------------------
+
 $PIP install -U pip wheel setuptools ninja packaging
 
 # ---------- torch first (CUDA 12.8 nightly channel) ----------
-#( PIP_CONSTRAINT=""; $PIP install --pre torch torchvision torchaudio \
-#  --index-url https://download.pytorch.org/whl/nightly/cu128 )
-env -u PIP_REQUIRE_HASHES -u PIP_CONSTRAINT   \
-    $PIP install --pre --no-cache-dir         \
-      torch torchvision torchaudio            \
+env -u PIP_REQUIRE_HASHES -u PIP_CONSTRAINT \
+    $PIP install --pre --no-cache-dir     \
+      torch torchvision torchaudio        \
       --index-url https://download.pytorch.org/whl/nightly/cu128
 
 $PY - <<'PY'
 import torch; print("torch:", torch.__version__)
 PY
 
-# ---------- GPU arch detect + SageAttention build (arch-aware) ----------
-# Pre-reqs (Python.h, nvcc toolchain, ninja) should already be installed earlier.
-GPU_CC="$($PY - <<'PY'
-import torch, json
-if not torch.cuda.is_available():
-    print("0.0"); raise SystemExit
-d= torch.cuda.get_device_capability(0)  # (major, minor)
-print(f"{d[0]}.{d[1]}")
-PY
-)"
+# -----------------------------
+# 6) Pull/build SageAttention: prefer pre-compiled HF bundle, fallback to source ----------
+# -----------------------------
 
-echo "Detected GPU compute capability: ${GPU_CC}"
+ensure_sage_from_bundle_or_build
 
-# Map CC → sensible arch lists
-case "$GPU_CC" in
-  9.0)  # Hopper (H100)
-    export TORCH_CUDA_ARCH_LIST="9.0;8.9;8.6;8.0"
-    SAGE_GENCODE="-gencode arch=compute_90,code=sm_90"
-    # Try newer first (main), then the Ada commit as fallback
-    SAGE_COMMITS=("main" "68de379")
-    ;;
-  8.9)  # Ada (L40S, RTX 6000 Ada)
-    export TORCH_CUDA_ARCH_LIST="8.9;8.6;8.0"
-    SAGE_GENCODE="-gencode arch=compute_89,code=sm_89"
-    SAGE_COMMITS=("68de379" "main")
-    ;;
-  8.*)  # Ampere (A100=8.0, 3090=8.6, etc.)
-    export TORCH_CUDA_ARCH_LIST="8.6;8.0"
-    SAGE_GENCODE="-gencode arch=compute_86,code=sm_86 -gencode arch=compute_80,code=sm_80"
-    SAGE_COMMITS=("main" "68de379")
-    ;;
-  *)    # Fallback
-    export TORCH_CUDA_ARCH_LIST="8.0"
-    SAGE_GENCODE="-gencode arch=compute_80,code=sm_80"
-    SAGE_COMMITS=("main" "68de379")
-    ;;
-esac
+#  Optional: push a new Sage bundle if requested (export PUSH_SAGE_BUNDLE=1, requires HF_* env set)
+push_sage_bundle_if_requested
 
-echo "TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}"
-echo "NVCC extra: ${SAGE_GENCODE}"
-
-# Build SageAttention (sequential, with fallbacks)
-echo "Building SageAttention..."
-rm -rf /tmp/SageAttention
-git clone https://github.com/thu-ml/SageAttention.git /tmp/SageAttention
-
-SAGE_OK=0
-for c in "${SAGE_COMMITS[@]}"; do
-  if build_sage "$c" 2>&1 | tee /workspace/logs/sage_build_${c}.log; then
-    echo "SageAttention built successfully at commit ${c}"
-    SAGE_OK=1
-    break
-  else
-    echo "SageAttention build failed at commit ${c} — will try next (if any)…"
-  fi
-done
-
-if [ "$SAGE_OK" -ne 1 ]; then
-  echo "FATAL: SageAttention failed to build for CC=${GPU_CC}. See logs in /workspace/logs/sage_build_*.log"
-  # You can choose to exit 1 here, or continue without --use-sage-attention
-  # exit 1
-fi
-
-# ---------- OpenCV cleanup (avoid 'cv2' namespace collisions) ----------
+# 6.1) ---------- OpenCV cleanup (avoid 'cv2' namespace collisions) ----------
 $PIP uninstall -y opencv-python opencv-python-headless opencv-contrib-python opencv-contrib-python-headless >/dev/null 2>&1 || true
 $PY - <<'PY'
 import sys, os, glob, shutil
@@ -179,8 +122,7 @@ if site:
             print("Skip:", p, e)
 PY
 
-# ---------- pin numeric stack (single source of truth) ----------
-
+# 6.2) ---------- pin numeric stack (single source of truth) ----------
 $PIP install -U numpy cupy-cuda12x opencv-contrib-python
 $PY - <<'PY'
 import numpy, importlib
@@ -201,26 +143,23 @@ except Exception as e:
 PY
 
 #====================================================================================
-# Ensure ComfyUI present and up-to-date
+# 7.) Ensure ComfyUI present and up-to-date
 #
 #====================================================================================
 
 ensure_comfy
 
 # =============================================================================================
-#  Hearmeman WAN templates/other (special case)
+#  8.) Hearmeman WAN templates/other (special case)
 # =============================================================================================
 
 copy_hearmeman_assets_if_any
 
 # =============================================================================================
-#  Custom nodes management
+#  9) Custom nodes management
 # =============================================================================================
 
-# 0) Prepare dirs
-mkdir -p "$COMFY_LOGS" "$OUTPUT_DIR" "$CACHE_DIR" "$BUNDLES_DIR" "$CUSTOM_DIR" "$CUSTOM_LOG_DIR"
-
-# 0.5) Try to fetch remote node list (optional). If HF isn't configured, this will no-op.
+# 9.0) Try to fetch remote node list (optional). If HF isn't configured, this will no-op.
 #      If we get a list, write it to a temp file and let the installer use it.
 REMOTE_LIST="$(hf_fetch_nodes_list || true)"
 if [[ -n "$REMOTE_LIST" ]]; then
@@ -234,30 +173,26 @@ fi
 
 # ------------- DEFAULT_NODES in .env
 
-# 1) Compute pins once (helpers read $PY inside pins_signature)
+# 9.1) Compute pins once (helpers read $PY inside pins_signature)
 export PINS="$(pins_signature)"
 echo "[custom-nodes] PINS = $PINS"
 
-# 2) Prefer HF bundle for (BUNDLE_TAG + PINS); else build from list (CUSTOM_NODE_LIST_FILE → CUSTOM_NODE_LIST → DEFAULT_NODES)
+# 9.2) Prefer HF bundle for (BUNDLE_TAG + PINS); else build from list (CUSTOM_NODE_LIST_FILE → CUSTOM_NODE_LIST → DEFAULT_NODES)
 ensure_nodes_from_bundle_or_build
 
-# 3) Optional: push a new bundle if requested (requires HF_* env set)
+# 9.3) Optional: push a new bundle if requested (requires HF_* env set)
 push_bundle_if_requested
 
 # =============================================================================================
 #
 #
-#  6 ) Download all requested models, from HuggingFace manifests, CivitAI, etc.
+#  10 ) Download all requested models, from HuggingFace manifests, CivitAI, etc.
 #
 #
 # =============================================================================================
 
-echo "Ensuring model directories exist..."
-mkdir -p "$DIFFUSION_MODELS_DIR" "$TEXT_ENCODERS_DIR" "$CLIP_VISION_DIR" "$VAE_DIR" \
-  "$LORAS_DIR" "$DETECTION_DIR" "$CTRL_DIR" "$UPSCALE_DIR"
-
 #===============================================================================================
-#  6.1) Huggingface Model downloader from manifest (uses helpers.sh)
+#  10.1) Huggingface Model downloader from manifest (uses helpers.sh)
 #===============================================================================================
 
 if aria2_enqueue_and_wait_from_manifest ; then
@@ -266,31 +201,9 @@ else
   echo "⚠️ Some Huggingface model downloads had issues. Check ${COMFY_LOGS}/aria2_manifest.log"
 fi
 
-echo "✅ All Huggingface models from manifest downloaded."
-
 #===============================================================================================
-#  6.2) CivitAI model downloader
+#  10.2) CivitAI model downloader
 #===============================================================================================
-
-#----------- Download CivitAI downloader script ----------
-#echo "Downloading CivitAI download script to /usr/local/bin"
-#git clone "https://github.com/Hearmeman24/CivitAI_Downloader.git" || { echo "Git clone failed"; exit 1; }
-#mv CivitAI_Downloader/download_with_aria.py "/usr/local/bin/" || { echo "Move failed"; exit 1; }
-#chmod +x "/usr/local/bin/download_with_aria.py" || { echo "Chmod failed"; exit 1; }
-#rm -rf CivitAI_Downloader  # Clean up the cloned repo
-
-#mkdir -p "${CIVITAI_LOG_DIR}"
-#echo "Downloading models from CivitAI..."
-
-# Using env-defined lists (checkpoints + loras):
-#download_civitai_ids
-
-# Optional: wait until aria2 RPC daemon is idle
-#echo "⏳ Waiting for background aria2 downloads to finish..."
-#while pgrep -x "aria2c" >/dev/null; do
-#  echo "🔽 Downloads still running..."
-#  sleep 5
-#done
 
 echo "Downloading CivitAI assets using environment-defined lists..."
 
@@ -301,7 +214,7 @@ else
 fi
 
 #===============================================================================================
-#  6.2.1) Rename any .zip loras to .safetensors
+#  10.2.1) Rename any .zip loras to .safetensors
 #===============================================================================================
 #echo "Renaming loras downloaded as zip files to safetensors files...."
 #cd $LORAS_DIR
@@ -313,7 +226,7 @@ fi
 #cd /workspace
 
 #===============================================================================================
-#  6.3) Relocate upscaling models from comfyui-mirror git dir to proper upscale dir
+#  11) Relocate upscaling models from comfyui-mirror git dir to proper upscale dir
 #===============================================================================================
 
 echo "Relocate upscaling model(s) to the correct directory..."
@@ -329,7 +242,7 @@ else
 fi
 
 #===============================================================================================
-#  6.4) Copy Hearmeman24's WAN workflows into ComfyUI workflows dir
+#  12) Copy Hearmeman24's WAN workflows into ComfyUI workflows dir
 #===============================================================================================
 
 echo "Cloning Hearmeman24's ComfyUI-WAN repository for latest workflows..."
@@ -367,7 +280,7 @@ for dir in "$SOURCE_DIR"/*/; do
 done
 
 #===============================================================================================
-#  6.5) Change default preview method to 'auto' in VHS Latent Preview node
+#  13) Change default preview method to 'auto' in VHS Latent Preview node
 #===============================================================================================
 
 if [ "${change_preview_method:-true}" = "true" ]; then
@@ -408,7 +321,7 @@ fi
 
 #===============================================================================================
 #
-#  7 ) Launch ComfyUI instances (8188 main, 8288 GPU0, 8388 GPU1)
+#  14 ) Launch ComfyUI instances (8188 main, 8288 GPU0, 8388 GPU1)
 #
 #===============================================================================================
 

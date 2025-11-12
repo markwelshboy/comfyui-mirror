@@ -94,6 +94,19 @@ ensure_dirs(){
     "${CACHE_DIR:?}" \
     "${BUNDLES_DIR:?}" \
     "${COMFY_LOGS:?}"
+
+  mkdir -p \
+    "${MODELS_DIR:-${COMFY_HOME}/models}" \
+    "${CHECKPOINTS_DIR:?}" \
+    "${DIFFUSION_MODELS_DIR:?}" \
+    "${TEXT_ENCODERS_DIR:?}" \
+    "${CLIP_VISION_DIR:?}" \
+    "${VAE_DIR:?}" \
+    "${LORA_DIR:?}" \
+    "${DETECTION_DIR:?}" \
+    "${CTRL_DIR:?}" \
+    "${UPSCALE_DIR:?}"
+
 }
 
 # ------------------------- #
@@ -422,9 +435,223 @@ hf_push_files() {
   rm -rf "$tmp"
 }
 
-# hf_fetch_latest_bundle: pull newest matching bundle for tag+pins into CACHE_DIR
+torch_sage_key() {
+  "$PY" - << 'PY'
+import sys, os, torch, torch.version
+
+# Python ABI: cp312
+py_abi = f"cp{sys.version_info.major}{sys.version_info.minor}"
+
+# Torch version: 2.6.0.dev2025xxxx etc.
+torch_ver = torch.__version__.replace('+', '_')
+
+# CUDA as seen by torch
+cuda_ver = (torch.version.cuda or "unknown").replace('.', '')
+
+arch = os.environ.get("GPU_ARCH", "sm_unknown")
+
+print(f"py{py_abi}_torch{torch_ver}_cu{cuda_ver}_{arch}")
+PY
+}
+
+install_sage_from_source() {
+  # Detect CC via torch
+  local GPU_CC
+  GPU_CC="$("$PY" - << 'PY'
+import torch
+if not torch.cuda.is_available():
+    print("0.0"); raise SystemExit
+maj, minr = torch.cuda.get_device_capability(0)
+print(f"{maj}.{minr}")
+PY
+  )"
+
+  echo "Detected GPU compute capability: ${GPU_CC}"
+
+  # Map CC → arch list + commits
+  case "$GPU_CC" in
+    9.0)  # Hopper
+      export TORCH_CUDA_ARCH_LIST="9.0;8.9;8.6;8.0"
+      SAGE_GENCODE="-gencode arch=compute_90,code=sm_90"
+      SAGE_COMMITS=("main" "68de379")
+      ;;
+    8.9)  # Ada
+      export TORCH_CUDA_ARCH_LIST="8.9;8.6;8.0"
+      SAGE_GENCODE="-gencode arch=compute_89,code=sm_89"
+      SAGE_COMMITS=("68de379" "main")
+      ;;
+    8.*)  # Ampere
+      export TORCH_CUDA_ARCH_LIST="8.6;8.0"
+      SAGE_GENCODE="-gencode arch=compute_86,code=sm_86 -gencode arch=compute_80,code=sm_80"
+      SAGE_COMMITS=("main" "68de379")
+      ;;
+    *)
+      export TORCH_CUDA_ARCH_LIST="8.0"
+      SAGE_GENCODE="-gencode arch=compute_80,code=sm_80"
+      SAGE_COMMITS=("main" "68de379")
+      ;;
+  esac
+
+  echo "TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}"
+  echo "NVCC extra: ${SAGE_GENCODE}"
+
+  echo "Building SageAttention from source..."
+  rm -rf /tmp/SageAttention
+  git clone https://github.com/thu-ml/SageAttention.git /tmp/SageAttention
+
+  local SAGE_OK=0 c
+  for c in "${SAGE_COMMITS[@]}"; do
+    if build_sage "$c" 2>&1 | tee "/workspace/logs/sage_build_${c}.log"; then
+      echo "SageAttention built successfully at commit ${c}"
+      SAGE_OK=1
+      break
+    else
+      echo "SageAttention build failed at commit ${c} — trying next (if any)…"
+    fi
+  done
+
+  if [ "$SAGE_OK" -ne 1 ]; then
+    echo "FATAL: SageAttention failed to build for CC=${GPU_CC}. See logs in /workspace/logs/sage_build_*.log" >&2
+    return 1
+  fi
+
+  return 0
+}
+
+build_sage_bundle() {
+  local key="${1:?SAGE_KEY required}"
+  mkdir -p "$CACHE_DIR"
+  local tarpath="${CACHE_DIR}/torch_sage_bundle_${key}.tgz"
+
+  SAGE_TARPATH="$tarpath" "$PY" - << 'PY'
+import importlib, os, sysconfig, tarfile
+
+site_dir = sysconfig.get_paths()["purelib"]
+
+# Try candidate module names
+candidates = ["sageattention", "SageAttention", "sage_attention"]
+mod = None
+pkg_name = None
+
+for name in candidates:
+    try:
+        mod = importlib.import_module(name)
+        pkg_name = name
+        break
+    except Exception:
+        continue
+
+if mod is None:
+    raise SystemExit("Could not import any SageAttention module (tried: sageattention, SageAttention, sage_attention)")
+
+pkg_path = os.path.dirname(mod.__file__)
+
+base = pkg_name.replace('_', '').lower()
+dist_dir = None
+for entry in os.listdir(site_dir):
+    if entry.lower().startswith(base) and entry.endswith(".dist-info"):
+        dist_dir = os.path.join(site_dir, entry)
+        break
+
+tarpath = os.environ["SAGE_TARPATH"]
+
+with tarfile.open(tarpath, "w:gz") as tf:
+    tf.add(pkg_path, arcname=os.path.relpath(pkg_path, site_dir))
+    if dist_dir and os.path.isdir(dist_dir):
+        tf.add(dist_dir, arcname=os.path.relpath(dist_dir, site_dir))
+PY
+
+  echo "$tarpath"
+}
+
+build_sage_bundle_wrapper() {
+  local key="${1:?}"
+  local tarpath="${CACHE_DIR}/torch_sage_bundle_${key}.tgz"
+  SAGE_TARPATH="$tarpath" "$PY_BIN" -m pip show torch >/dev/null 2>&1 || {
+    echo "[sage-bundle] Torch not installed; cannot build Sage bundle."
+    return 1
+  }
+  SAGE_TARPATH="$tarpath" build_sage_bundle "$key"
+  echo "$tarpath"
+}
+
+push_sage_bundle_if_requested() {
+  [[ "${PUSH_SAGE_BUNDLE:-0}" = "1" ]] || return 0
+
+  local key tarpath
+  key="$(torch_sage_key)"
+  echo "[sage-bundle] Building Sage bundle for key=${key}…"
+  tarpath="$(build_sage_bundle "$key")" || {
+    echo "[sage-bundle] Failed to build Sage bundle."
+    return 1
+  }
+
+  hf_push_files "torch_sage bundle ${key}" "$tarpath"
+  echo "[sage-bundle] Uploaded torch_sage_bundle_${key}.tgz"
+}
+
+hf_fetch_sage_bundle() {
+  local key="${1:?SAGE_KEY}"
+  local tmp="${CACHE_DIR}/.hf_sage.$$"
+
+  git lfs install >/dev/null 2>&1
+  if ! git clone --depth=1 "$(hf_remote_url)" "$tmp" >/dev/null 2>&1; then
+    rm -rf "$tmp"
+    return 1
+  fi
+
+  local patt="torch_sage_bundle_${key}.tgz"
+  if [[ ! -f "$tmp/bundles/$patt" ]]; then
+    rm -rf "$tmp"
+    return 1
+  fi
+
+  mkdir -p "$CACHE_DIR"
+  cp "$tmp/bundles/$patt" "$CACHE_DIR/"
+  rm -rf "$tmp"
+
+  echo "${CACHE_DIR}/${patt}"
+}
+
+restore_sage_from_tar() {
+  "$PY" - << 'PY'
+import os, sysconfig, tarfile
+
+site_dir = sysconfig.get_paths()["purelib"]
+tarpath = os.environ["SAGE_TARPATH"]
+
+with tarfile.open(tarpath, "r:gz") as tf:
+    tf.extractall(site_dir)
+PY
+}
+
+ensure_sage_from_bundle_or_build() {
+  local key tarpath
+  key="$(torch_sage_key)"
+
+  echo "[sage-bundle] Looking for Sage bundle key=${key}…"
+
+  local pattern="${CACHE_DIR}/torch_sage_bundle_${key}.tgz"
+  if [[ -f "$pattern" ]]; then
+    tarpath="$pattern"
+  else
+    tarpath="$(hf_fetch_sage_bundle "$key" | tail -n1)"
+  fi
+
+  if [[ -n "$tarpath" && -f "$tarpath" ]]; then
+    echo "[sage-bundle] Using Sage bundle: $(basename "$tarpath")"
+    SAGE_TARPATH="$tarpath" restore_sage_from_tar
+    return 0
+  fi
+
+  echo "[sage-bundle] No bundle found — building Sage from source…"
+  install_sage_from_source || return 1
+  return 0
+}
+
+# hf_fetch_latest_custom_nodes_bundle: pull newest matching bundle for tag+pins into CACHE_DIR
 #   echoes local tgz path or empty
-hf_fetch_latest_bundle() {
+hf_fetch_latest_custom_nodes_bundle() {
   local tag="${1:?tag}" pins="${2:?pins}"
   local tmp="${CACHE_DIR}/.hf_pull.$$"
 
@@ -455,8 +682,8 @@ hf_fetch_latest_bundle() {
   echo "${CACHE_DIR}/${latest}"
 }
 
-# build_nodes_manifest: create JSON manifest of installed nodes
-build_nodes_manifest() {
+# build_custom_nodes_manifest: create JSON manifest of installed nodes
+build_custom_nodes_manifest() {
   local tag="${1:?tag}" out="${2:?out_json}"
 
   # Make sure the Python side sees where to write + which tag to use
@@ -525,7 +752,7 @@ build_custom_nodes_bundle() {
   local reqs="${CACHE_DIR}/$(reqs_name "$tag")"
   local sha="${CACHE_DIR}/$(sha_name "$base")"
 
-  build_nodes_manifest "$tag" "$manifest"
+  build_custom_nodes_manifest "$tag" "$manifest"
   build_consolidated_reqs "$tag" "$reqs"
   tar -C "$(dirname "$CUSTOM_DIR")" -czf "$tarpath" "$(basename "$CUSTOM_DIR")"
   sha256sum "$tarpath" > "$sha"
@@ -560,7 +787,7 @@ ensure_nodes_from_bundle_or_build() {
   local pattern="${CACHE_DIR}/custom_nodes_bundle_${tag}_${pins}_*.tgz"
   local tgz=""
 
-  tgz="$(hf_fetch_latest_bundle "$tag" "$pins" | tail -n1)"
+  tgz="$(hf_fetch_latest_custom_nodes_bundle "$tag" "$pins" | tail -n1)"
 
   if [[ -n "$tgz" && -f "$tgz" ]]; then
     echo "[custom-nodes] Using bundle: $(basename "$tgz")"
