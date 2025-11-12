@@ -807,7 +807,7 @@ ensure_nodes_from_bundle_or_build() {
 
 # push_bundle_if_requested: convenience wrapper (respects BUNDLE_TAG/PINS)
 push_bundle_if_requested() {
-  [[ "${PUSH_BUNDLE:-0}" = "1" ]] || return 0
+  [[ "${PUSH_CUSTOM_BUNDLE:-0}" = "1" ]] || return 0
   local tag="${BUNDLE_TAG:?BUNDLE_TAG required}"
   local pins="${PINS:-$(pins_signature)}"
   local base tarpath manifest reqs sha
