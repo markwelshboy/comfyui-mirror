@@ -85,16 +85,6 @@ fi
 # shellcheck source=/dev/null
 source "$HELPERS"
 
-#------------------------------
-# 0.1) Derive any environment variables and summarize
-#------------------------------
-
-# Decide stable vs. nightly 
-#   - (fills TORCH_NIGHTLY_VER automatically if nightly, uses curl installed in on start script)
-auto_channel_detect
-
-show_env
-
 # -----------------------------
 # 1) OS prereqs & workspace
 # -----------------------------
@@ -121,6 +111,16 @@ if [ ! -x "$PY" ] || [ ! -x "$PIP" ]; then
   exit 1
 fi
 
+#------------------------------
+# 2.2) Derive any environment variables and summarize
+#------------------------------
+
+# Decide stable vs. nightly 
+#   - (fills TORCH_NIGHTLY_VER automatically if nightly, uses curl installed in on start script)
+auto_channel_detect
+
+show_env
+
 # -----------------------------
 # 3) Set up required system-wide directories
 # -----------------------------
@@ -135,7 +135,7 @@ $PIP install -U pip wheel setuptools ninja packaging
 
 install_torch
 
-show_env_summary
+show_env
 
 # -----------------------------
 # 6) Pull/build SageAttention: prefer pre-compiled HF bundle, fallback to source ----------
