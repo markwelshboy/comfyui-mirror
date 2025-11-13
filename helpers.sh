@@ -1267,12 +1267,12 @@ PY
 }
 
 ensure_sage_from_bundle_or_build() {
-  local key tarpath
+  local key tarpath out
   key="$(torch_sage_key)"
 
   echo "[sage-bundle] Looking for Sage bundle key=${key}…" >&2
 
-  # If the user wants a fresh build, skip bundle lookup entirely
+  # If the user wants a fresh build, skip bundle restore entirely
   if [[ "${SAGE_FORCE_REBUILD:-0}" == "1" ]]; then
     echo "[sage-bundle] SAGE_FORCE_REBUILD=1 — skipping bundle restore and rebuilding from source." >&2
   else
@@ -1280,10 +1280,23 @@ ensure_sage_from_bundle_or_build() {
     if [[ -f "$pattern" ]]; then
       tarpath="$pattern"
     else
-      tarpath="$(hf_fetch_sage_bundle "$key" | tail -n1)"
+      # Call hf_fetch_sage_bundle and store *all* stdout safely
+      if out="$(hf_fetch_sage_bundle "$key")"; then
+        # Last non-empty line = path returned by the function
+        tarpath="$(printf "%s\n" "$out" | { 
+          local last="" line
+          while IFS= read -r line; do
+            [[ -n "$line" ]] && last="$line"
+          done
+          printf "%s" "$last"
+        })"
+      else
+        tarpath=""
+      fi
     fi
   fi
 
+  # If tarpath is valid, restore from bundle
   if [[ -n "${tarpath:-}" && -f "$tarpath" ]]; then
     echo "[sage-bundle] Using Sage bundle: $(basename "$tarpath")" >&2
     SAGE_TARPATH="$tarpath" restore_sage_from_tar
