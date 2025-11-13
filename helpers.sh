@@ -542,13 +542,14 @@ hf_bundles_summary() {
     return 0
   fi
 
-  local count latest latest_sz
+  local count
   count="$(printf '%s' "$tree" | jq '[.[] | select(.path|startswith("bundles/"))] | length')"
 
+  local latest latest_sz
   latest="$(printf '%s' "$tree" | jq -r '
-    [.[] | select(.path|startswith("bundles/") and (.path|endswith(".tgz")))]
+    [ .[] | select(.path|startswith("bundles/") and (.path|endswith(".tgz"))) ]
     | sort_by(.path)
-    | (last?.path // empty)
+    | (.[-1] | .path) // empty
   ')"
 
   printf "Bundles (count): %s\n" "${count:-0}"
