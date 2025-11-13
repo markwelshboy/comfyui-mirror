@@ -756,6 +756,23 @@ PY
   fi
 }
 
+get_latest_torch_stable_ver() {
+  local cuda="${TORCH_CUDA:-cu128}"
+  local url="https://download.pytorch.org/whl/${cuda}/torch/"
+  local py_abi
+  py_abi="$("$PY" - << 'PY'
+import sys
+print(f"cp{sys.version_info.major}{sys.version_info.minor}")
+PY
+  )" || py_abi="cp312"
+
+  # Extract all torch-X+cuYYY-cpZZZ wheels and pick the highest X
+  curl -fsSL "$url" 2>/dev/null \
+    | grep -oE "torch-[0-9]+\.[0-9]+\.[0-9]+\+${cuda}-${py_abi}" \
+    | sed -E "s/^torch-([0-9]+\.[0-9]+\.[0-9]+)\+${cuda}-${py_abi}$/\1/" \
+    | sort -V | tail -1
+}
+
 # Return 0 if a stable torch wheel for this CUDA stream seems present on the PyTorch index.
 # Uses the torch sub-index: .../whl/<cuda>/torch/
 stable_torch_available() {
@@ -820,206 +837,164 @@ auto_channel_detect() {
 }
 
 print_bundle_matrix() {
+  local key channel channel_src channel_label
   local cache="${CACHE_DIR:-/workspace/ComfyUI/cache}"
-  local tmp="${cache}/.hf_inspect.$$"
-  mkdir -p "$cache"
 
-  # Ensure we have a channel decision
-  if [[ -z "${TORCH_CHANNEL_EFFECTIVE:-}" ]]; then
-    if [[ -n "${TORCH_CHANNEL:-}" ]]; then
-      export TORCH_CHANNEL_EFFECTIVE="$TORCH_CHANNEL"
-      export TORCH_CHANNEL_SOURCE="user"
-    elif command -v auto_channel_detect >/dev/null 2>&1; then
-      auto_channel_detect
-    fi
-  fi
+  key="$(torch_sage_key)"
 
-  local chan="${TORCH_CHANNEL_EFFECTIVE:-unknown}"
-  local src="${TORCH_CHANNEL_SOURCE:-auto}"
-
-  local chan_label="$chan"
-  if [[ "$chan_label" == "unknown" ]]; then
-    :
-  elif [[ "$src" == "user" ]]; then
-    chan_label+=" (user)"
+  # Channel + provenance (auto vs user)
+  if [[ -n "${TORCH_CHANNEL:-}" ]]; then
+    channel="${TORCH_CHANNEL}"
+    channel_src="user"
   else
-    chan_label+=" (auto)"
-  fi
-  echo "Torch Channel: ${chan_label}"
-
-  # Torch key from canonical helper
-  local key=""
-  if command -v torch_sage_key >/dev/null 2>&1; then
-    key="$(torch_sage_key 2>/dev/null || true)"
-  fi
-  [[ -n "$key" ]] && echo "Torch Key:    ${key}"
-
-  # If no HF token or git, we stop after torch info
-  if [[ -z "${HF_TOKEN:-}" ]]; then
-    echo "Sage bundles: (HF_TOKEN not set; cannot inspect)"
-    echo "Custom Node bundles: (HF_TOKEN not set; cannot inspect)"
-    return 0
-  fi
-  if ! command -v git >/dev/null 2>&1; then
-    echo "Sage bundles: (git not installed; cannot inspect)"
-    echo "Custom Node bundles: (git not installed; cannot inspect)"
-    return 0
+    channel="auto"
+    channel_src="auto"
   fi
 
-  # ---- Clone the HF repo once ----
+  printf "Torch Channel: %s (%s)\n" "$channel" "$channel_src"
+  printf "Torch Key:     %s\n" "$key"
+
+  # Parse the current key into ABI / VER / CU / ARCH
+  local cur_abi cur_ver cur_cu cur_arch tmp1 tmp2
+  IFS=_ read -r cur_abi cur_ver cur_cu tmp1 tmp2 <<< "$key"
+  cur_arch="${tmp1}_${tmp2}"
+
+  # HF repo scan
+  local tmp_repo="${cache}/.hf_scan.$$"
   git lfs install >/dev/null 2>&1 || true
-  if ! git clone --depth=1 "$(hf_remote_url)" "$tmp" >/dev/null 2>&1; then
-    echo "Sage bundles: (clone failed; cannot inspect)"
-    echo "Custom Node bundles: (clone failed; cannot inspect)"
-    rm -rf "$tmp"
+
+  if ! git clone --depth=1 "$(hf_remote_url)" "$tmp_repo" >/dev/null 2>&1; then
+    echo "Sage bundles: (unable to scan HF repo)"
+    echo "Custom Node bundles: (unable to scan HF repo)"
+    echo "Sage Path: Build from source (repo not accessible)"
+    echo "Custom Node Path: Install via git clone (per-node)"
+    rm -rf "$tmp_repo" 2>/dev/null || true
     return 0
   fi
 
-  local bundle_dir="${tmp}/bundles"
-  if [[ ! -d "$bundle_dir" ]]; then
-    echo "Sage bundles: 0 (total), 0 (Compatible)"
-    echo "Custom Node bundles: 0 (total), 0 (Compatible)"
-    rm -rf "$tmp"
-    return 0
+  # -------------------------
+  # Scan Sage bundles
+  # -------------------------
+  local sage_total=0
+  local sage_compat=0
+  local sage_list=""
+  local sage_have_current=0
+  local sage_have_compat_remote=0
+  local sage_have_compat_cache=0
+
+  local f k abi ver cu a1 a2 arch ver_core kind mark
+
+  # Cache path for the exact current key
+  local cache_sage="${cache}/torch_sage_bundle_${key}.tgz"
+  if [[ -f "$cache_sage" ]]; then
+    sage_have_compat_cache=1
   fi
 
-  # ------------------------------------------------
-  #  SAGE BUNDLES
-  # ------------------------------------------------
-  local -a sage_all sage_compat
-  mapfile -t sage_all < <(find "$bundle_dir" -maxdepth 1 -type f -name 'torch_sage_bundle_*.tgz' -printf '%f\n' | sort)
+  shopt -s nullglob
+  for f in "${tmp_repo}/bundles"/torch_sage_bundle_*.tgz; do
+    [[ -e "$f" ]] || break
+    ((sage_total++))
+    local fname="${f##*/}"
+    k="${fname#torch_sage_bundle_}"
+    k="${k%.tgz}"
 
-  local compat_suffix=""
-  if [[ -n "$key" ]]; then
-    # key = pycp312_torch2.10.0.dev20251112_cu128_sm_120
-    # we want suffix like "_cu128_sm_120"
-    local tail tmp2
-    tail="${key#*_torch}"        # 2.10.0.dev20251112_cu128_sm_120
-    tmp2="${tail#*_}"            # cu128_sm_120
-    compat_suffix="_${tmp2}"     # _cu128_sm_120
-  fi
+    # Parse into ABI / VER / CU / ARCH to check compatibility
+    IFS=_ read -r abi ver cu a1 a2 <<< "$k"
+    arch="${a1}_${a2}"
 
-  local f base ver_part label
-  for f in "${sage_all[@]}"; do
-    base="${f#torch_sage_bundle_}"    # pycp312_torchXXX_cuYYY_sm_ZZZ.tgz
-    base="${base%.tgz}"
-
-    # If we have a compat suffix (cu+arch), enforce it
-    if [[ -n "$compat_suffix" && "$base" != *"${compat_suffix}" ]]; then
-      continue
+    local compat=0
+    if [[ "$abi" == "$cur_abi" && "$cu" == "$cur_cu" && "$arch" == "$cur_arch" ]]; then
+      compat=1
+      ((sage_compat++))
+      sage_have_compat_remote=1
+    fi
+    if [[ "$k" == "$key" ]]; then
+      sage_have_current=1
     fi
 
-    # Extract version part for label: remove leading "py..._torch" and trailing "_cu..._sm_..."
-    local abi ver_and_rest cu_arch
-    abi="${base%%_torch*}"                 # pycp312
-    ver_and_rest="${base#${abi}_torch}"    # 2.10.0.dev20251112_cu128_sm_120
-    cu_arch="${ver_and_rest##*_}"          # 120 (unused)
-    cu_arch="${ver_and_rest##*_cu}"        # not strictly needed here
-    # Strip trailing "_cu..._sm_..."
-    ver_part="${ver_and_rest%_cu*}"
-
-    if [[ "$ver_part" == *dev* ]]; then
-      label="(Nightly)"
+    # Classify type by version string
+    ver_core="${ver#torch}"  # e.g. 2.10.0.dev20251110 or 2.10.0.dev2025w46
+    if [[ "$ver_core" == *w[0-9]* ]]; then
+      kind="Weekly"
+    elif [[ "$ver_core" == *dev* ]]; then
+      kind="Nightly"
     else
-      label="(Stable)"
+      kind="Stable"
     fi
 
-    sage_compat+=("${label} ${base}")
-  done
+    # Mark current key
+    mark=""
+    if [[ "$k" == "$key" ]]; then
+      mark=" (Selected)"
+    elif [[ "$compat" -eq 1 ]]; then
+      mark=" (Compat)"
+    fi
 
-  local total_sage="${#sage_all[@]}"
-  local compat_sage="${#sage_compat[@]}"
-  local exact_match=0
-  echo "Sage bundles: ${total_sage} (total), ${compat_sage} (Compatible)"
-  if (( compat_sage > 0 )); then
-    for entry in "${sage_compat[@]}"; do
-      # Mark the exact match as Selected, if present
-      local b="${entry#* }"   # strip "(Nightly) " or "(Stable) "
-      local mark=""
-      if [[ -n "$key" && "$b" == "$key" ]]; then
-        mark=" (Selected)"
-        exact_match=1
-      fi
-      echo "  ${entry}${mark}"
-    done
+    sage_list+=$(printf "  (%-7s) %s%s\n" "$kind" "$k" "$mark")
+  done
+  shopt -u nullglob
+
+  printf "Sage bundles: %d (total), %d (Compatible)\n" "$sage_total" "$sage_compat"
+  if [[ -n "$sage_list" ]]; then
+    printf "%s\n" "$sage_list"
   fi
 
-  # ------------------------------------------------
-  #  CUSTOM NODE BUNDLES
-  # ------------------------------------------------
-  local -a cn_all cn_compat
-  mapfile -t cn_all < <(find "$bundle_dir" -maxdepth 1 -type f -name 'custom_nodes_bundle_*.tgz' -printf '%f\n' | sort)
+  # Decide Sage Path
+  local sage_path
+  if [[ "$sage_have_current" -eq 1 || "$sage_have_compat_cache" -eq 1 || "$sage_have_compat_remote" -eq 1 ]]; then
+    sage_path="Pull from HF (bundle restore available)"
+  else
+    sage_path="Build from source"
+  fi
 
-  # Current pins & tag
-  local pins tag
-  if command -v pins_signature >/dev/null 2>&1; then
+  # -------------------------
+  # Scan Custom Node bundles
+  # -------------------------
+  local cn_total=0
+  local cn_compat=0
+  local cn_list=""
+
+  local tag="${BUNDLE_TAG:-unknown}"
+  local pins=""
+  if type -t pins_signature >/dev/null 2>&1; then
     pins="$(pins_signature)"
-  else
-    pins=""
   fi
 
-  if [[ -n "${BUNDLE_TAG:-}" ]]; then
-    tag="${BUNDLE_TAG}"
-  elif command -v bundle_tag >/dev/null 2>&1; then
-    tag="$(bundle_tag)"
-  else
-    tag=""
-  fi
+  shopt -s nullglob
+  for f in "${tmp_repo}/bundles"/custom_nodes_bundle_*.tgz; do
+    [[ -e "$f" ]] || break
+    ((cn_total++))
+    local fname="${f##*/}"
+    local base="${fname%.tgz}"
 
-  local cn fbase body tag_part
-  for f in "${cn_all[@]}"; do
-    fbase="${f#custom_nodes_bundle_}"
-    fbase="${fbase%.tgz}"
-
-    # If pins are known, consider "compatible" = shares the same pins_signature
-    if [[ -n "$pins" ]]; then
-      # Expect pattern: <TAG>_<pins>_TIMESTAMP or <TAG>_<pins>
-      if [[ "$fbase" != *"_${pins}" && "$fbase" != *"_${pins}_"* ]]; then
-        continue
-      fi
-      # Strip pins + optional timestamp to get the "tag"
-      tag_part="${fbase%_${pins}*}"
+    # Compatibility: filename contains "<tag>_<pins>"
+    local compat=0
+    if [[ -n "$tag" && -n "$pins" && "$base" == *"${tag}_${pins}"* ]]; then
+      compat=1
+      ((cn_compat++))
+      cn_list+=$(printf "  %s (Selected)\n" "$tag")
     else
-      tag_part="$fbase"
+      cn_list+=$(printf "  %s\n" "$base")
     fi
-
-    cn_compat+=("${tag_part}")
   done
+  shopt -u nullglob
 
-  local total_cn="${#cn_all[@]}"
-  local compat_cn="${#cn_compat[@]}"
-  echo "Custom Node bundles: ${total_cn} (total), ${compat_cn} (Compatible)"
-  if (( compat_cn > 0 )); then
-    # de-dupe tags for printout
-    local seen line
-    declare -A seen_tags=()
-    for line in "${cn_compat[@]}"; do
-      [[ -n "${seen_tags[$line]:-}" ]] && continue
-      seen_tags["$line"]=1
-      if [[ -n "$tag" && "$line" == "$tag" ]]; then
-        echo "  ${line} (Selected)"
-      else
-        echo "  ${line}"
-      fi
-    done
-  fi
+  printf "Custom Node Tag:   %s\n" "$tag"
+  printf "Pins:              %s\n" "${pins:-<none>}"
+  printf "Custom Node bundles: %d (total), %d (Compatible)\n" "$cn_total" "$cn_compat"
+  [[ -n "$cn_list" ]] && printf "%s\n" "$cn_list"
 
-  # Path hints
-  if (( exact_match == 1 )); then
-    echo "Sage Path: Pull from HF (bundle restore)"
-  elif (( compat_sage > 0 )); then
-    echo "Sage Path: uses HF bundle when key matches; build from source otherwise"
+  local cn_path
+  if [[ "$cn_compat" -gt 0 ]]; then
+    cn_path="Pull from HF (bundle restore)"
   else
-    echo "Sage Path: Build from source (no compatible HF bundle yet)"
+    cn_path="Install via git clone (per-node)"
   fi
 
-  if (( compat_cn > 0 )); then
-    echo "Custom Node Path: Pull from HF (bundle restore)"
-  else
-    echo "Custom Node Path: Full git clone/install for custom nodes"
-  fi
+  printf "Sage Path:         %s\n" "$sage_path"
+  printf "Custom Node Path:  %s\n" "$cn_path"
 
-  rm -rf "$tmp"
+  rm -rf "$tmp_repo" 2>/dev/null || true
 }
 
 install_torch() {
