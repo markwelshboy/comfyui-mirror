@@ -709,52 +709,40 @@ PY
 # ================================================================
 
 # Fetch latest nightly version for the selected CUDA stream (e.g. 2.10.0.dev20251112)
-# Falls back gracefully if network/index format changes.
+# Handles both "+cu128" and URL-encoded "%2Bcu128" forms in the index.
 get_latest_torch_nightly_ver() {
   local path="nightly/${TORCH_CUDA}"
   local url="https://download.pytorch.org/whl/${path}/"
-  local ver=""
+  local html ver
 
   echo "[torch] [nightly] Probing index: ${url}" >&2
 
-  # Try to scrape the latest 'torch-X.Y.Z.devYYYYMMDD+cuNNN' from the index
-  if ver="$(
-    curl -fsSL "$url" \
-      | grep -oE 'torch-[0-9]+\.[0-9]+\.[0-9]+\.dev[0-9]{8}\+cu[0-9]+' \
-      | sed -E 's/^torch-([0-9]+\.[0-9]+\.[0-9]+\.dev[0-9]{8})\+.*$/\1/' \
-      | sort -V | tail -1
-  )"; then
-    :
-  else
-    echo "[torch] [nightly] WARNING: curl/grep pipeline failed when probing ${url}" >&2
+  # Try to fetch the directory index; don't hard-fail if curl breaks.
+  html="$(curl -fsSL "$url" 2>/dev/null || true)"
+
+  if [[ -z "$html" ]]; then
+    echo "[torch] [nightly] ERROR: could not fetch index HTML for ${url}" >&2
+    # fall back to stable as a conservative choice
+    echo "${TORCH_STABLE_VER}"
+    return 0
   fi
+
+  # Examples this needs to match:
+  #   torch-2.10.0.dev20251111%2Bcu128-cp312-...
+  #   torch-2.10.0.dev20251111+cu128-cp312-...
+  ver="$(
+    printf '%s\n' "$html" \
+      | grep -oE 'torch-[0-9]+\.[0-9]+\.[0-9]+\.dev[0-9]{8}(%2B|\+)[^\"< ]*' \
+      | sed -E 's/^torch-([0-9]+\.[0-9]+\.[0-9]+\.dev[0-9]{8})(%2B|\+).*/\1/' \
+      | sort -V | tail -1
+  )"
 
   if [[ -n "$ver" ]]; then
-    echo "[torch] [nightly] Latest nightly from index: ${ver} (+${TORCH_CUDA})" >&2
     echo "$ver"
-    return 0
+  else
+    echo "[torch] [nightly] WARNING: no dev build found on index; falling back to TORCH_STABLE_VER=${TORCH_STABLE_VER}" >&2
+    echo "${TORCH_STABLE_VER}"
   fi
-
-  # --------- Fallback path (NO hard-coded date!) ----------
-  echo "[torch] [nightly] WARNING: could not determine latest nightly from index." >&2
-
-  # 1) If user provided an explicit fallback, use that
-  if [[ -n "${TORCH_NIGHTLY_FALLBACK:-}" ]]; then
-    echo "[torch] [nightly] Using TORCH_NIGHTLY_FALLBACK=${TORCH_NIGHTLY_FALLBACK}" >&2
-    echo "$TORCH_NIGHTLY_FALLBACK"
-    return 0
-  fi
-
-  # 2) Otherwise fall back to stable version as a safety net
-  if [[ -n "${TORCH_STABLE_VER:-}" ]]; then
-    echo "[torch] [nightly] Falling back to stable TORCH_STABLE_VER=${TORCH_STABLE_VER}" >&2
-    echo "$TORCH_STABLE_VER"
-    return 0
-  fi
-
-  # 3) Absolute last resort: hard 'unknown' marker
-  echo "[torch] [nightly] ERROR: no nightly fallback and no stable version; returning 'unknown'" >&2
-  echo "unknown"
 }
 
 # Return 0 if the stable wheel for this CUDA stream seems present on the PyTorch index
@@ -782,58 +770,28 @@ stable_torch_available() {
 #   TORCH_CHANNEL_SOURCE       ("user"|"auto")
 #   TORCH_VERSION_EFFECTIVE    (the actual version string we’ll install)
 auto_channel_detect() {
-  local requested="${TORCH_CHANNEL:-}"  # user override or empty
-  local chosen src
-
-  if [[ -n "$requested" ]]; then
-    # --------------------------
-    # User override path
-    # --------------------------
-    chosen="$requested"
-    src="user"
-    echo "[torch] Channel preset via env: ${requested}"
-
-    if [[ "$chosen" == "nightly" ]]; then
-      if [[ -z "${TORCH_NIGHTLY_VER:-}" ]]; then
-        export TORCH_NIGHTLY_VER="$(get_latest_torch_nightly_ver)"
+  if [[ -n "${TORCH_CHANNEL:-}" ]]; then
+    echo "[torch] Channel preset via env: ${TORCH_CHANNEL}"
+    if [[ "$TORCH_CHANNEL" == "nightly" && -z "${TORCH_NIGHTLY_VER:-}" ]]; then
+      export TORCH_NIGHTLY_VER="$(get_latest_torch_nightly_ver)"
+      # If we somehow got a non-dev string, call that out.
+      if [[ "$TORCH_NIGHTLY_VER" == *".dev"* ]]; then
         echo "[torch] [user] Using latest nightly: ${TORCH_NIGHTLY_VER} (+${TORCH_CUDA})"
       else
-        echo "[torch] [user] Using nightly: ${TORCH_NIGHTLY_VER} (+${TORCH_CUDA})"
+        echo "[torch] [nightly] WARNING: resolved '${TORCH_NIGHTLY_VER}' which looks non-nightly; treating as effective version." >&2
       fi
-    else  # stable
-      echo "[torch] [user] Using stable: ${TORCH_STABLE_VER} (+${TORCH_CUDA})"
     fi
-
-  else
-    # --------------------------
-    # Auto-detect path
-    # --------------------------
-    echo "[torch] Auto-detecting channel for CUDA=${TORCH_CUDA}, stable=${TORCH_STABLE_VER}…"
-    if stable_torch_available; then
-      chosen="stable"
-      src="auto"
-      echo "[torch] ✅ Stable is available on index — selecting stable ${TORCH_STABLE_VER}"
-    else
-      chosen="nightly"
-      src="auto"
-      if [[ -z "${TORCH_NIGHTLY_VER:-}" ]]; then
-        export TORCH_NIGHTLY_VER="$(get_latest_torch_nightly_ver)"
-      fi
-      echo "[torch] ⚠️ Stable wheel not found on index — selecting nightly ${TORCH_NIGHTLY_VER}"
-    fi
+    return 0
   fi
 
-  # --------------------------
-  # Record effective choice
-  # --------------------------
-  export TORCH_CHANNEL="$chosen"
-  export TORCH_CHANNEL_EFFECTIVE="$chosen"     # for reporting
-  export TORCH_CHANNEL_SOURCE="$src"           # user|auto
-
-  if [[ "$chosen" == "stable" ]]; then
-    export TORCH_VERSION_EFFECTIVE="$TORCH_STABLE_VER"
+  echo "[torch] Auto-detecting channel for CUDA=${TORCH_CUDA}, stable=${TORCH_STABLE_VER}…" >&2
+  if stable_torch_available; then
+    export TORCH_CHANNEL="stable"
+    echo "[torch] ✅ Stable is available on index — selecting stable"
   else
-    export TORCH_VERSION_EFFECTIVE="$TORCH_NIGHTLY_VER"
+    export TORCH_CHANNEL="nightly"
+    export TORCH_NIGHTLY_VER="$(get_latest_torch_nightly_ver)"
+    echo "[torch] ⚠️ Stable wheel not found on index — selecting nightly ${TORCH_NIGHTLY_VER}"
   fi
 }
 
