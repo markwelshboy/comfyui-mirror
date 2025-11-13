@@ -586,10 +586,10 @@ hf_repo_info() {
 
   echo "=================================================="
   echo "🤖 Hugging Face Repo Info"
-  echo "Repo handle : ${ns}/${name}"
-  echo "Repo type   : ${type}"
-  echo "Repo URL    : ${url}"
-  echo -n "Auth check  : "
+  echo "Repo handle   : ${ns}/${name}"
+  echo "Repo type     : ${type}"
+  echo "Repo URL      : ${url}"
+  echo -n "Auth check    : "
 
   if [[ -n "${HF_TOKEN:-}" ]]; then
     if curl -fsSL -H "Authorization: Bearer ${HF_TOKEN}" \
