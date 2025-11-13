@@ -713,22 +713,48 @@ PY
 get_latest_torch_nightly_ver() {
   local path="nightly/${TORCH_CUDA}"
   local url="https://download.pytorch.org/whl/${path}/"
-  local ver
+  local ver=""
 
-  ver="$(
+  echo "[torch] [nightly] Probing index: ${url}" >&2
+
+  # Try to scrape the latest 'torch-X.Y.Z.devYYYYMMDD+cuNNN' from the index
+  if ver="$(
     curl -fsSL "$url" \
       | grep -oE 'torch-[0-9]+\.[0-9]+\.[0-9]+\.dev[0-9]{8}\+cu[0-9]+' \
       | sed -E 's/^torch-([0-9]+\.[0-9]+\.[0-9]+\.dev[0-9]{8})\+.*$/\1/' \
       | sort -V | tail -1
-  )" || true
-
-  # final sanity
-  if [[ -n "$ver" ]]; then
-    echo "$ver"
+  )"; then
+    :
   else
-    # conservative fallback: keep your existing default or a safe marker
-    echo "2.10.0.dev20251111"
+    echo "[torch] [nightly] WARNING: curl/grep pipeline failed when probing ${url}" >&2
   fi
+
+  if [[ -n "$ver" ]]; then
+    echo "[torch] [nightly] Latest nightly from index: ${ver} (+${TORCH_CUDA})" >&2
+    echo "$ver"
+    return 0
+  fi
+
+  # --------- Fallback path (NO hard-coded date!) ----------
+  echo "[torch] [nightly] WARNING: could not determine latest nightly from index." >&2
+
+  # 1) If user provided an explicit fallback, use that
+  if [[ -n "${TORCH_NIGHTLY_FALLBACK:-}" ]]; then
+    echo "[torch] [nightly] Using TORCH_NIGHTLY_FALLBACK=${TORCH_NIGHTLY_FALLBACK}" >&2
+    echo "$TORCH_NIGHTLY_FALLBACK"
+    return 0
+  fi
+
+  # 2) Otherwise fall back to stable version as a safety net
+  if [[ -n "${TORCH_STABLE_VER:-}" ]]; then
+    echo "[torch] [nightly] Falling back to stable TORCH_STABLE_VER=${TORCH_STABLE_VER}" >&2
+    echo "$TORCH_STABLE_VER"
+    return 0
+  fi
+
+  # 3) Absolute last resort: hard 'unknown' marker
+  echo "[torch] [nightly] ERROR: no nightly fallback and no stable version; returning 'unknown'" >&2
+  echo "unknown"
 }
 
 # Return 0 if the stable wheel for this CUDA stream seems present on the PyTorch index
