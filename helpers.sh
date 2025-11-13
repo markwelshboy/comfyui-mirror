@@ -5,7 +5,7 @@
 #   - Minimal, consistent Hugging Face vars (HF_REPO_ID, HF_REPO_TYPE, HF_TOKEN, CN_BRANCH)
 #   - Clear function groups with docs
 #   - Safe, idempotent, parallel node installation
-#   - Bundle pull-or-build logic keyed by BUNDLE_TAG + PINS
+#   - Bundle pull-or-build logic keyed by CUSTOM_BUNDLE_TAG + PINS
 # ======================================================================
 
 # ----------------------------------------------------------------------
@@ -32,15 +32,13 @@ shopt -s extglob
 #   REPO_URL             - ComfyUI repo URL (default comfyanonymous/ComfyUI)
 #   GIT_DEPTH            - default 1
 #   MAX_NODE_JOBS        - default 6..8
-# Optional (SageAttention build):
-#   SAGE_COMMIT, SAGE_GENCODE, TORCH_CUDA_ARCH_LIST, NVCC_APPEND_FLAGS, EXT_PARALLEL, MAX_JOBS
 # Hugging Face:
 #   HF_REPO_ID           - e.g. user/comfyui-bundles
 #   HF_REPO_TYPE         - dataset | model (default dataset)
 #   HF_TOKEN             - auth token
 #   CN_BRANCH            - default main
 #   HF_API_BASE          - default https://huggingface.co
-#   BUNDLE_TAG           - logical “set” name (e.g. WAN2122_Baseline)
+#   CUSTOM_BUNDLE_TAG           - logical “set” name (e.g. WAN2122_Baseline)
 # Pins/signature:
 #   PINS                 - computed by pins_signature() if not set
 
@@ -522,7 +520,7 @@ hf_bundles_summary() {
   info="$(curl -fsSL -H "Authorization: Bearer ${HF_TOKEN}" "${base}" 2>/dev/null || true)"
   tree="$(curl -fsSL -H "Authorization: Bearer ${HF_TOKEN}" "${base}/tree/main?recursive=1" 2>/dev/null || true)"
 
-  # Check info JSON
+  # Validate info JSON
   if [[ -z "$info" ]] || ! printf '%s' "$info" | jq empty >/dev/null 2>&1; then
     echo "Last modified  : (repo info unavailable)"
     echo "Bundles (count): ?"
@@ -530,39 +528,45 @@ hf_bundles_summary() {
     return 0
   fi
 
-  # Try to parse lastModified
   local last_mod
   last_mod="$(printf '%s' "$info" | jq -r '.lastModified // .last_modified // "unknown"')"
   echo "Last modified  : ${last_mod}"
 
-  # If tree is bad, bail gracefully
+  # Validate tree JSON
   if [[ -z "$tree" ]] || ! printf '%s' "$tree" | jq empty >/dev/null 2>&1; then
     echo "Bundles (count): 0"
     echo "Latest bundle  : (no bundle tree data)"
     return 0
   fi
 
-  local count
-  count="$(printf '%s' "$tree" | jq '[.[] | select(.path|startswith("bundles/"))] | length')"
+  # Build a list of *paths as strings*, handling both:
+  #  - ["bundles/foo.tgz", ...]
+  #  - [{ "path": "bundles/foo.tgz", "size": 123, ... }, ...]
+  local count latest
+  read -r count latest < <(
+    printf '%s' "$tree" | jq -r '
+      def path_string:
+        if type == "object" and has("path") then .path
+        elif type == "string" then .
+        else empty end;
 
-  local latest latest_sz
-  latest="$(printf '%s' "$tree" | jq -r '
-    [ .[] | select(.path|startswith("bundles/") and (.path|endswith(".tgz"))) ]
-    | sort_by(.path)
-    | (.[-1] | .path) // empty
-  ')"
+      [ .[] | path_string
+        | select(startswith("bundles/"))
+      ] as $paths
+      | ($paths | length) as $count
+      | ($paths
+          | map(select(endswith(".tgz")))
+          | sort
+          | (.[-1] // ""))
+      | @tsv
+      # This produces: "<count>\t<latest>"
+      ' 2>/dev/null || echo -e "0\t"
+  )
 
   printf "Bundles (count): %s\n" "${count:-0}"
 
   if [[ -n "$latest" ]]; then
-    latest_sz="$(printf '%s' "$tree" | jq -r --arg p "$latest" '
-      .[] | select(.path == $p) | (.size // empty)
-    ')"
-    if [[ -n "$latest_sz" && "$latest_sz" != "null" ]]; then
-      echo "Latest bundle  : ${latest}  (${latest_sz} bytes)"
-    else
-      echo "Latest bundle  : ${latest}"
-    fi
+    echo "Latest bundle  : ${latest}"
   else
     echo "Latest bundle  : (none found)"
   fi
@@ -626,7 +630,7 @@ _sage_bundle_basename() {
 
 _custom_nodes_bundle_basename() {
   local tag pins
-  tag="${BUNDLE_TAG:?missing BUNDLE_TAG}"     # e.g. Wan2_1__Wan2_2__CUDA_12_8
+  tag="${CUSTOM_BUNDLE_TAG:?missing CUSTOM_BUNDLE_TAG}"     # e.g. Wan2_1__Wan2_2__CUDA_12_8
   pins="$(pins_signature)"                    # your existing helper
   echo "custom_nodes_bundle_${tag}_${pins}_*.tgz"
 }
@@ -1038,7 +1042,7 @@ build_custom_nodes_manifest() {
 
   # Make sure the Python side sees where to write + which tag to use
   CUSTOM_DIR="${CUSTOM_DIR:?}" \
-  BUNDLE_TAG="$tag" \
+  CUSTOM_BUNDLE_TAG="$tag" \
   out_json="$out" \
   "$PY_BIN" - <<'PY'
 import json, os, subprocess
@@ -1072,7 +1076,7 @@ for name in sorted(os.listdir(d)):
 
 out = os.environ["out_json"]
 with open(out, "w", encoding="utf-8") as f:
-    json.dump({"tag": os.environ.get("BUNDLE_TAG", ""), "nodes": items}, f, indent=2)
+    json.dump({"tag": os.environ.get("CUSTOM_BUNDLE_TAG", ""), "nodes": items}, f, indent=2)
 PY
 }
 
@@ -1122,10 +1126,10 @@ install_custom_nodes_bundle() {
 }
 
 # ensure_nodes_from_bundle_or_build:
-#   If HF has a bundle matching BUNDLE_TAG + PINS → install it
+#   If HF has a bundle matching CUSTOM_BUNDLE_TAG + PINS → install it
 #   Else build from NODES and optionally push a fresh bundle
 ensure_nodes_from_bundle_or_build() {
-  local tag="${BUNDLE_TAG:?BUNDLE_TAG required}"
+  local tag="${CUSTOM_BUNDLE_TAG:?CUSTOM_BUNDLE_TAG required}"
   local pins="${PINS:-$(pins_signature)}"
 
   mkdir -p "$CACHE_DIR" "$CUSTOM_LOG_DIR"
@@ -1155,10 +1159,10 @@ ensure_nodes_from_bundle_or_build() {
   install_custom_nodes_set
 }
 
-# push_bundle_if_requested: convenience wrapper (respects BUNDLE_TAG/PINS)
+# push_bundle_if_requested: convenience wrapper (respects CUSTOM_BUNDLE_TAG/PINS)
 push_bundle_if_requested() {
   [[ "${PUSH_CUSTOM_BUNDLE:-0}" = "1" ]] || return 0
-  local tag="${BUNDLE_TAG:?BUNDLE_TAG required}"
+  local tag="${CUSTOM_BUNDLE_TAG:?CUSTOM_BUNDLE_TAG required}"
   local pins="${PINS:-$(pins_signature)}"
   local base tarpath manifest reqs sha
   base="$(bundle_base "$tag" "$pins")"
@@ -2287,7 +2291,7 @@ show_env () {
   echo "Logs dir:             $COMFY_LOGS"
   echo "Output dir:           $OUTPUT_DIR"
   echo "Bundles dir:          $BUNDLES_DIR"
-  echo "Bundle tag:           $BUNDLE_TAG"
+  echo "Bundle tag:           $CUSTOM_BUNDLE_TAG"
   echo "Workflow dir:         $WORKFLOW_DIR"
   echo "Model manifest URL:   $MODEL_MANIFEST_URL"
   echo ""
