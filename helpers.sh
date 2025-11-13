@@ -384,9 +384,10 @@ install_custom_nodes_set() {
 # hf_remote_url: builds authenticated HTTPS remote for model/dataset repos
 hf_remote_url() {
   : "${HF_TOKEN:?missing HF_TOKEN}" "${HF_REPO_ID:?missing HF_REPO_ID}"
-  local host="huggingface.co"
-  [ "${HF_REPO_TYPE:-dataset}" = "dataset" ] && host="${host}/datasets"
-  echo "https://oauth2:${HF_TOKEN}@${host}/${HF_REPO_ID}.git"
+  local base="${HF_API_BASE:-https://huggingface.co}"
+  local type="${HF_REPO_TYPE:-dataset}"   # dataset or model
+  local id="${HF_REPO_ID}"
+  echo "https://oauth2:${HF_TOKEN}@${base#https://}/${type}s/${id}.git"
 }
 
 # hf_fetch_nodes_list: optionally fetch a custom_nodes.txt index from HF
@@ -506,70 +507,59 @@ _hf_api_base() {
 }
 
 hf_bundles_summary() {
-  if ! command -v jq >/dev/null 2>&1; then
-    echo "Bundles        : (install jq to see counts/details)"
+  local key="${1:-}"               # optional: current torch_sage_key
+  local cache="${CACHE_DIR:-/workspace/ComfyUI/cache}"
+  local tmp="${cache}/.hf_inspect.$$"
+
+  mkdir -p "$cache"
+
+  if ! command -v git >/dev/null 2>&1; then
+    echo "Bundles (git) : git not installed"
     return 0
   fi
   if [[ -z "${HF_TOKEN:-}" ]]; then
-    echo "Bundles        : (set HF_TOKEN to query)"
+    echo "Bundles (git) : HF_TOKEN not set"
     return 0
   fi
 
-  local base info tree
-  base="$(_hf_api_base)"
-  info="$(curl -fsSL -H "Authorization: Bearer ${HF_TOKEN}" "${base}" 2>/dev/null || true)"
-  tree="$(curl -fsSL -H "Authorization: Bearer ${HF_TOKEN}" "${base}/tree/main?recursive=1" 2>/dev/null || true)"
-
-  # Validate info JSON
-  if [[ -z "$info" ]] || ! printf '%s' "$info" | jq empty >/dev/null 2>&1; then
-    echo "Last modified  : (repo info unavailable)"
-    echo "Bundles (count): ?"
-    echo "Latest bundle  : (API not reachable / repo not found)"
+  echo "Bundles (repo) : inspecting via git clone…"
+  git lfs install >/dev/null 2>&1 || true
+  if ! git clone --depth=1 "$(hf_remote_url)" "$tmp" >/dev/null 2>&1; then
+    echo "  ❌ clone failed; cannot inspect bundles"
+    rm -rf "$tmp"
     return 0
   fi
 
-  local last_mod
-  last_mod="$(printf '%s' "$info" | jq -r '.lastModified // .last_modified // "unknown"')"
-  echo "Last modified  : ${last_mod}"
-
-  # Validate tree JSON
-  if [[ -z "$tree" ]] || ! printf '%s' "$tree" | jq empty >/dev/null 2>&1; then
-    echo "Bundles (count): 0"
-    echo "Latest bundle  : (no bundle tree data)"
+  local bundle_dir="${tmp}/bundles"
+  if [[ ! -d "$bundle_dir" ]]; then
+    echo "  Bundles dir  : (none)"
+    rm -rf "$tmp"
     return 0
   fi
 
-  # Build a list of *paths as strings*, handling both:
-  #  - ["bundles/foo.tgz", ...]
-  #  - [{ "path": "bundles/foo.tgz", "size": 123, ... }, ...]
-  local count latest
-  read -r count latest < <(
-    printf '%s' "$tree" | jq -r '
-      def path_string:
-        if type == "object" and has("path") then .path
-        elif type == "string" then .
-        else empty end;
+  # Count all .tgz bundles
+  local total
+  total="$(find "$bundle_dir" -maxdepth 1 -type f -name '*.tgz' | wc -l | tr -d ' ')"
+  echo "  Total .tgz   : ${total}"
 
-      [ .[] | path_string
-        | select(startswith("bundles/"))
-      ] as $paths
-      | ($paths | length) as $count
-      | ($paths
-          | map(select(endswith(".tgz")))
-          | sort
-          | (.[-1] // ""))
-      | @tsv
-      # This produces: "<count>\t<latest>"
-      ' 2>/dev/null || echo -e "0\t"
-  )
+  # Count custom_nodes vs torch_sage
+  local cn_count sage_count
+  cn_count="$(find "$bundle_dir" -maxdepth 1 -type f -name 'custom_nodes_bundle_*.tgz' | wc -l | tr -d ' ')"
+  sage_count="$(find "$bundle_dir" -maxdepth 1 -type f -name 'torch_sage_bundle_*.tgz'   | wc -l | tr -d ' ')"
+  echo "  custom_nodes : ${cn_count}"
+  echo "  torch_sage   : ${sage_count}"
 
-  printf "Bundles (count): %s\n" "${count:-0}"
-
-  if [[ -n "$latest" ]]; then
-    echo "Latest bundle  : ${latest}"
-  else
-    echo "Latest bundle  : (none found)"
+  # If a key was provided, check for that specific bundle
+  if [[ -n "$key" ]]; then
+    local patt="torch_sage_bundle_${key}.tgz"
+    if [[ -f "${bundle_dir}/${patt}" ]]; then
+      echo "  This key     : ✅ ${patt}"
+    else
+      echo "  This key     : ❌ no torch_sage bundle for ${key}"
+    fi
   fi
+
+  rm -rf "$tmp"
 }
 
 # ================================================================
@@ -577,12 +567,11 @@ hf_bundles_summary() {
 # ================================================================
 
 hf_repo_info() {
-  local ns name type url api_base
+  local ns name type url
   ns="$(hf_dataset_namespace)"
   name="$(hf_dataset_name)"
   type="${HF_REPO_TYPE:-dataset}"
-  api_base="${HF_API_BASE:-https://huggingface.co}"
-  url="${api_base}/${type}s/${ns}/${name}"
+  url="https://huggingface.co/${type}s/${ns}/${name}"
 
   echo "=================================================="
   echo "🤖 Hugging Face Repo Info"
@@ -593,16 +582,47 @@ hf_repo_info() {
 
   if [[ -n "${HF_TOKEN:-}" ]]; then
     if curl -fsSL -H "Authorization: Bearer ${HF_TOKEN}" \
-         "${api_base}/api/${type}s/${ns}/${name}" >/dev/null 2>&1; then
+         "https://huggingface.co/api/${type}s/${ns}/${name}" \
+         >/dev/null 2>&1; then
       echo "✅ OK (token accepted)"
     else
-      echo "⚠️ Token present, but repo not reachable / 404"
+      echo "⚠️ token present, but repo not reachable / 404"
     fi
   else
-    echo "❌ No HF_TOKEN defined"
+    echo "❌ no HF_TOKEN defined"
   fi
 
-  hf_bundles_summary
+  # If torch is importable, show basic torch info + current key
+  local key=""
+  if command -v "$PY" >/dev/null 2>&1; then
+    key="$(
+      "$PY" - << 'PY'
+import sys, os
+try:
+    import torch
+except Exception:
+    print("")
+    raise SystemExit
+
+abi  = f"cp{sys.version_info.major}{sys.version_info.minor}"
+base_ver = torch.__version__.split('+', 1)[0].replace('+','_')
+cu_raw = (torch.version.cuda or "").replace('.', '')
+cu = f"cu{cu_raw}" if cu_raw else "cu_unknown"
+arch = (os.environ.get("GPU_ARCH") or "").strip().lower()
+if arch.startswith("sm"):
+    arch = arch.replace("sm", "").lstrip("_- ")
+arch = f"sm_{arch}" if arch else "sm_unknown"
+print(f"py{abi}_torch{base_ver}_{cu}_{arch}")
+PY
+    )"
+    if [[ -n "$key" ]]; then
+      echo "Torch key      : ${key}"
+    fi
+  fi
+
+  # Summarize bundles in the repo, and whether this key is present
+  hf_bundles_summary "$key"
+
   echo "=================================================="
 }
 
@@ -738,29 +758,270 @@ stable_torch_available() {
   curl -fsSL "$url" | grep -q "torch-${TORCH_STABLE_VER}\+${TORCH_CUDA}"
 }
 
-# Auto-select channel:
-# - If TORCH_CHANNEL already set -> respect it.
-# - Else try stable; if index shows no stable wheel for this CUDA stream, switch to nightly and set TORCH_NIGHTLY_VER dynamically.
+# Decide which Torch channel to use and record *how* we got there.
+# Inputs (same as before):
+#   TORCH_CUDA        e.g. cu128
+#   TORCH_STABLE_VER  e.g. 2.10.0
+#   TORCH_NIGHTLY_VER optional; auto-filled if needed
+#   TORCH_CHANNEL     optional; user override: stable|nightly
+#
+# Uses helpers you already have:
+#   stable_torch_available
+#   get_latest_torch_nightly_ver
+#
+# Sets:
+#   TORCH_CHANNEL              ("stable"|"nightly")
+#   TORCH_CHANNEL_EFFECTIVE    (same as above)
+#   TORCH_CHANNEL_SOURCE       ("user"|"auto")
+#   TORCH_VERSION_EFFECTIVE    (the actual version string we’ll install)
 auto_channel_detect() {
-  if [[ -n "${TORCH_CHANNEL:-}" ]]; then
-    echo "[torch] Channel preset via env: ${TORCH_CHANNEL}"
-    # Populate nightly ver if user asked for nightly but didn’t set it
-    if [[ "$TORCH_CHANNEL" == "nightly" && -z "${TORCH_NIGHTLY_VER:-}" ]]; then
-      export TORCH_NIGHTLY_VER="$(get_latest_torch_nightly_ver)"
-      echo "[torch] Using latest nightly: ${TORCH_NIGHTLY_VER} (+${TORCH_CUDA})"
+  local requested="${TORCH_CHANNEL:-}"  # user override or empty
+  local chosen src
+
+  if [[ -n "$requested" ]]; then
+    # --------------------------
+    # User override path
+    # --------------------------
+    chosen="$requested"
+    src="user"
+    echo "[torch] Channel preset via env: ${requested}"
+
+    if [[ "$chosen" == "nightly" ]]; then
+      if [[ -z "${TORCH_NIGHTLY_VER:-}" ]]; then
+        export TORCH_NIGHTLY_VER="$(get_latest_torch_nightly_ver)"
+        echo "[torch] [user] Using latest nightly: ${TORCH_NIGHTLY_VER} (+${TORCH_CUDA})"
+      else
+        echo "[torch] [user] Using nightly: ${TORCH_NIGHTLY_VER} (+${TORCH_CUDA})"
+      fi
+    else  # stable
+      echo "[torch] [user] Using stable: ${TORCH_STABLE_VER} (+${TORCH_CUDA})"
     fi
+
+  else
+    # --------------------------
+    # Auto-detect path
+    # --------------------------
+    echo "[torch] Auto-detecting channel for CUDA=${TORCH_CUDA}, stable=${TORCH_STABLE_VER}…"
+    if stable_torch_available; then
+      chosen="stable"
+      src="auto"
+      echo "[torch] ✅ Stable is available on index — selecting stable ${TORCH_STABLE_VER}"
+    else
+      chosen="nightly"
+      src="auto"
+      if [[ -z "${TORCH_NIGHTLY_VER:-}" ]]; then
+        export TORCH_NIGHTLY_VER="$(get_latest_torch_nightly_ver)"
+      fi
+      echo "[torch] ⚠️ Stable wheel not found on index — selecting nightly ${TORCH_NIGHTLY_VER}"
+    fi
+  fi
+
+  # --------------------------
+  # Record effective choice
+  # --------------------------
+  export TORCH_CHANNEL="$chosen"
+  export TORCH_CHANNEL_EFFECTIVE="$chosen"     # for reporting
+  export TORCH_CHANNEL_SOURCE="$src"           # user|auto
+
+  if [[ "$chosen" == "stable" ]]; then
+    export TORCH_VERSION_EFFECTIVE="$TORCH_STABLE_VER"
+  else
+    export TORCH_VERSION_EFFECTIVE="$TORCH_NIGHTLY_VER"
+  fi
+}
+
+print_bundle_matrix() {
+  local cache="${CACHE_DIR:-/workspace/ComfyUI/cache}"
+  local tmp="${cache}/.hf_inspect.$$"
+  mkdir -p "$cache"
+
+  # ---- Torch channel + key ----
+  local chan="${TORCH_CHANNEL_EFFECTIVE:-unknown}"
+  local src="${TORCH_CHANNEL_SOURCE:-auto}"
+
+  local chan_label="$chan"
+  if [[ "$chan_label" == "unknown" ]]; then
+    chan_label="unknown"
+  fi
+  if [[ "$src" != "auto" && "$chan" != "unknown" ]]; then
+    chan_label+=" (${src})"
+  elif [[ "$chan" != "unknown" ]]; then
+    chan_label+=" (auto)"
+  fi
+
+  # Current Torch Sage key (py+torch+cu+arch)
+  local key
+  if command -v torch_sage_key >/dev/null 2>&1; then
+    key="$(torch_sage_key)"
+  else
+    key=""
+  fi
+
+  echo "Torch Channel: ${chan_label}"
+  [[ -n "$key" ]] && echo "Torch Key:    ${key}"
+
+  # If no HF token or git, we stop after torch info
+  if [[ -z "${HF_TOKEN:-}" ]]; then
+    echo "Sage bundles: (HF_TOKEN not set; cannot inspect)"
+    echo "Custom Node bundles: (HF_TOKEN not set; cannot inspect)"
+    return 0
+  fi
+  if ! command -v git >/dev/null 2>&1; then
+    echo "Sage bundles: (git not installed; cannot inspect)"
+    echo "Custom Node bundles: (git not installed; cannot inspect)"
     return 0
   fi
 
-  echo "[torch] Auto-detecting channel for CUDA=${TORCH_CUDA}, stable=${TORCH_STABLE_VER}…"
-  if stable_torch_available; then
-    export TORCH_CHANNEL="stable"
-    echo "[torch] ✅ Stable is available on index — selecting stable"
-  else
-    export TORCH_CHANNEL="nightly"
-    export TORCH_NIGHTLY_VER="$(get_latest_torch_nightly_ver)"
-    echo "[torch] ⚠️ Stable wheel not found on index — selecting nightly ${TORCH_NIGHTLY_VER}"
+  # ---- Clone the HF repo once ----
+  git lfs install >/dev/null 2>&1 || true
+  if ! git clone --depth=1 "$(hf_remote_url)" "$tmp" >/dev/null 2>&1; then
+    echo "Sage bundles: (clone failed; cannot inspect)"
+    echo "Custom Node bundles: (clone failed; cannot inspect)"
+    rm -rf "$tmp"
+    return 0
   fi
+
+  local bundle_dir="${tmp}/bundles"
+  if [[ ! -d "$bundle_dir" ]]; then
+    echo "Sage bundles: 0 (total), 0 (Compatible)"
+    echo "Custom Node bundles: 0 (total), 0 (Compatible)"
+    rm -rf "$tmp"
+    return 0
+  fi
+
+  # ------------------------------------------------
+  #  SAGE BUNDLES
+  # ------------------------------------------------
+  local -a sage_all sage_compat
+  mapfile -t sage_all < <(find "$bundle_dir" -maxdepth 1 -type f -name 'torch_sage_bundle_*.tgz' -printf '%f\n' | sort)
+
+  local compat_suffix=""
+  if [[ -n "$key" ]]; then
+    # key = pycp312_torch2.10.0.dev20251112_cu128_sm_120
+    # we want suffix like "_cu128_sm_120"
+    local tail tmp2
+    tail="${key#*_torch}"        # 2.10.0.dev20251112_cu128_sm_120
+    tmp2="${tail#*_}"            # cu128_sm_120
+    compat_suffix="_${tmp2}"     # _cu128_sm_120
+  fi
+
+  local f base ver_part label
+  for f in "${sage_all[@]}"; do
+    base="${f#torch_sage_bundle_}"    # pycp312_torchXXX_cuYYY_sm_ZZZ.tgz
+    base="${base%.tgz}"
+
+    # If we have a compat suffix (cu+arch), enforce it
+    if [[ -n "$compat_suffix" && "$base" != *"${compat_suffix}" ]]; then
+      continue
+    fi
+
+    # Extract version part for label: remove leading "py..._torch" and trailing "_cu..._sm_..."
+    local abi ver_and_rest cu_arch
+    abi="${base%%_torch*}"                 # pycp312
+    ver_and_rest="${base#${abi}_torch}"    # 2.10.0.dev20251112_cu128_sm_120
+    cu_arch="${ver_and_rest##*_}"         # 120 (unused)
+    cu_arch="${ver_and_rest##*_cu}"       # not strictly needed here
+    # Strip trailing "_cu..._sm_..."
+    ver_part="${ver_and_rest%_cu*}"
+
+    if [[ "$ver_part" == *dev* ]]; then
+      label="(Nightly)"
+    else
+      label="(Stable)"
+    fi
+
+    sage_compat+=("${label} ${base}")
+  done
+
+  local total_sage="${#sage_all[@]}"
+  local compat_sage="${#sage_compat[@]}"
+  echo "Sage bundles: ${total_sage} (total), ${compat_sage} (Compatible)"
+  if (( compat_sage > 0 )); then
+    for entry in "${sage_compat[@]}"; do
+      # Mark the exact match as Selected, if present
+      local b="${entry#* }"   # strip "(Nightly) " or "(Stable) "
+      local mark=""
+      if [[ -n "$key" && "$b" == "$key" ]]; then
+        mark=" (Selected)"
+      fi
+      echo "  ${entry}${mark}"
+    done
+  fi
+
+  # ------------------------------------------------
+  #  CUSTOM NODE BUNDLES
+  # ------------------------------------------------
+  local -a cn_all cn_compat
+  mapfile -t cn_all < <(find "$bundle_dir" -maxdepth 1 -type f -name 'custom_nodes_bundle_*.tgz' -printf '%f\n' | sort)
+
+  # Current pins & tag
+  local pins tag
+  if command -v pins_signature >/dev/null 2>&1; then
+    pins="$(pins_signature)"
+  else
+    pins=""
+  fi
+
+  if [[ -n "${BUNDLE_TAG:-}" ]]; then
+    tag="${BUNDLE_TAG}"
+  elif command -v bundle_tag >/dev/null 2>&1; then
+    tag="$(bundle_tag)"
+  else
+    tag=""
+  fi
+
+  local cn fbase body tag_part
+  for f in "${cn_all[@]}"; do
+    fbase="${f#custom_nodes_bundle_}"
+    fbase="${fbase%.tgz}"
+
+    # If pins are known, consider "compatible" = shares the same pins_signature
+    if [[ -n "$pins" ]]; then
+      # Expect pattern: <TAG>_<pins>_TIMESTAMP or <TAG>_<pins>
+      if [[ "$fbase" != *"_${pins}" && "$fbase" != *"_${pins}_"* ]]; then
+        continue
+      fi
+      # Strip pins + optional timestamp to get the "tag"
+      tag_part="${fbase%_${pins}*}"
+    else
+      tag_part="$fbase"
+    fi
+
+    cn_compat+=("${tag_part}")
+  done
+
+  local total_cn="${#cn_all[@]}"
+  local compat_cn="${#cn_compat[@]}"
+  echo "Custom Node bundles: ${total_cn} (total), ${compat_cn} (Compatible)"
+  if (( compat_cn > 0 )); then
+    # de-dupe tags for printout
+    local seen line
+    declare -A seen_tags=()
+    for line in "${cn_compat[@]}"; do
+      [[ -n "${seen_tags[$line]:-}" ]] && continue
+      seen_tags["$line"]=1
+      if [[ -n "$tag" && "$line" == "$tag" ]]; then
+        echo "  ${line} (Selected)"
+      else
+        echo "  ${line}"
+      fi
+    done
+  fi
+
+  # Path hints
+  if (( compat_sage > 0 )); then
+    echo "Sage Path: uses HF bundle when key matches; build from source otherwise"
+  else
+    echo "Sage Path: Build from source (no compatible HF bundle yet)"
+  fi
+
+  if (( compat_cn > 0 )); then
+    echo "Custom Node Path: Pull from HF (bundle restore)"
+  else
+    echo "Custom Node Path: Full git clone/install for custom nodes"
+  fi
+
+  rm -rf "$tmp"
 }
 
 install_torch() {
