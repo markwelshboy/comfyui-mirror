@@ -350,7 +350,7 @@ db_mode = cache
 INI
   else
     echo "config.ini already exists. Updating preview_method..."
-    sed -i 's/^preview_method = .*/preview_method = auto/' "$CONFIG_FILE"
+    sed -i 's/^preview_method = .*/preview_method = auto/' "$CFG"
   fi
   echo "Config file setup complete!"
   echo "Default preview method updated to 'auto'"
