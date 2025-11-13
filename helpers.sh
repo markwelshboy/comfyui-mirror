@@ -1062,27 +1062,33 @@ show_torch_sage_env_summary() {
 # ================================================================
 torch_sage_key() {
   "$PY" - << 'PY'
-import sys, os, torch, re, datetime
+import sys, os, torch
 
-abi  = f"cp{sys.version_info.major}{sys.version_info.minor}"
-ver  = torch.__version__
-base, _, _plus = ver.partition('+')  # strip "+cu128"
-cu_raw = (torch.version.cuda or "").replace('.', '')
+abi = f"cp{sys.version_info.major}{sys.version_info.minor}"
+
+channel     = (os.environ.get("TORCH_CHANNEL") or "").strip().lower()
+stable_ver  = (os.environ.get("TORCH_STABLE_VER") or "").strip()
+nightly_ver = (os.environ.get("TORCH_NIGHTLY_VER") or "").strip()
+
+if channel == "stable" and stable_ver:
+    base_ver = stable_ver
+elif channel == "nightly" and nightly_ver:
+    base_ver = nightly_ver
+else:
+    # Fall back to the *actual* installed torch version (minus the "+cu128" suffix)
+    base_ver = torch.__version__.split("+", 1)[0]
+
+base_ver = base_ver.replace("+", "_")
+
+cu_raw = (torch.version.cuda or "").replace(".", "")
 cu = f"cu{cu_raw}" if cu_raw else "cu_unknown"
-
-# Bucket nightly by ISO week to avoid daily churn
-m = re.match(r"(\d+\.\d+\.\d+)\.dev(\d{8})", base)
-if m:
-    y, mth, d = int(m.group(2)[:4]), int(m.group(2)[4:6]), int(m.group(2)[6:])
-    iso = datetime.date(y, mth, d).isocalendar()
-    base = f"{m.group(1)}.dev{iso[0]}w{iso[1]:02d}"
 
 arch = (os.environ.get("GPU_ARCH") or "").strip().lower()
 if arch.startswith("sm"):
     arch = arch.replace("sm", "").lstrip("_- ")
 arch = f"sm_{arch}" if arch else "sm_unknown"
 
-print(f"py{abi}_torch{base}_{cu}_{arch}")
+print(f"py{abi}_torch{base_ver}_{cu}_{arch}")
 PY
 }
 
@@ -1186,11 +1192,33 @@ build_sage_bundle_wrapper() {
 }
 
 push_sage_bundle_if_requested() {
-  [[ "${PUSH_SAGE_BUNDLE:-0}" = "1" ]] || return 0
+  if [[ "${PUSH_SAGE_BUNDLE:-0}" != "1" ]]; then
+    return 0
+  fi
 
   local key tarpath
   key="$(torch_sage_key)"
-  echo "[sage-bundle] Building Sage bundle for key=${key}…"
+  echo "[sage-bundle] Building Sage bundle for key=${key}…" >&2
+
+  # Hard gate: if we can't import, do NOT push a broken bundle
+  if ! "$PY" - << 'PY'
+import importlib, sys
+mods = ["sageattention", "SageAttention", "sage_attention"]
+for m in mods:
+    try:
+        importlib.import_module(m)
+        print(m)
+        raise SystemExit(0)
+    except Exception:
+        pass
+print("Could not import any SageAttention module (tried: sageattention, SageAttention, sage_attention)", file=sys.stderr)
+raise SystemExit(1)
+PY
+  then
+    echo "[sage-bundle] ❌ Not pushing Sage bundle — SageAttention is not importable." >&2
+    return 1
+  fi
+
   tarpath="$(build_sage_bundle "$key")" || {
     echo "[sage-bundle] Failed to build Sage bundle."
     return 1
@@ -1198,6 +1226,7 @@ push_sage_bundle_if_requested() {
 
   hf_push_files "torch_sage bundle ${key}" "$tarpath"
   echo "[sage-bundle] Uploaded torch_sage_bundle_${key}.tgz"
+
 }
 
 hf_fetch_sage_bundle() {
@@ -1243,17 +1272,19 @@ ensure_sage_from_bundle_or_build() {
 
   echo "[sage-bundle] Looking for Sage bundle key=${key}…" >&2
 
-  local pattern="${CACHE_DIR}/torch_sage_bundle_${key}.tgz"
-  if [[ -f "$pattern" ]]; then
-    tarpath="$pattern"
+  # If the user wants a fresh build, skip bundle lookup entirely
+  if [[ "${SAGE_FORCE_REBUILD:-0}" == "1" ]]; then
+    echo "[sage-bundle] SAGE_FORCE_REBUILD=1 — skipping bundle restore and rebuilding from source." >&2
   else
-    # Do NOT pipe or rely on pipefail; catch failure explicitly
-    if ! tarpath="$(hf_fetch_sage_bundle "$key")"; then
-      tarpath=""
+    local pattern="${CACHE_DIR}/torch_sage_bundle_${key}.tgz"
+    if [[ -f "$pattern" ]]; then
+      tarpath="$pattern"
+    else
+      tarpath="$(hf_fetch_sage_bundle "$key" | tail -n1)"
     fi
   fi
 
-  if [[ -n "$tarpath" && -f "$tarpath" ]]; then
+  if [[ -n "${tarpath:-}" && -f "$tarpath" ]]; then
     echo "[sage-bundle] Using Sage bundle: $(basename "$tarpath")" >&2
     SAGE_TARPATH="$tarpath" restore_sage_from_tar
     return 0
