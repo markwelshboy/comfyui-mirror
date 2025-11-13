@@ -15,7 +15,7 @@ source_if_exists "/root/.secrets/env.current"
 source_if_exists "${REPO}/.env"
 source_if_exists "${REPO}/helpers.sh"
 
-# Optional: auto summaries if functions exist
+# Optional: auto summaries/details if functions exist
 type -t auto_channel_detect >/dev/null 2>&1 && auto_channel_detect  || true
 type -t show_env            >/dev/null 2>&1 && show_env             || true
 

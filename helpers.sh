@@ -592,35 +592,16 @@ hf_repo_info() {
     echo "❌ no HF_TOKEN defined"
   fi
 
-  # If torch is importable, show basic torch info + current key
+  # Use canonical shell helper for the key
   local key=""
-  if command -v "$PY" >/dev/null 2>&1; then
-    key="$(
-      "$PY" - << 'PY'
-import sys, os
-try:
-    import torch
-except Exception:
-    print("")
-    raise SystemExit
-
-abi  = f"cp{sys.version_info.major}{sys.version_info.minor}"
-base_ver = torch.__version__.split('+', 1)[0].replace('+','_')
-cu_raw = (torch.version.cuda or "").replace('.', '')
-cu = f"cu{cu_raw}" if cu_raw else "cu_unknown"
-arch = (os.environ.get("GPU_ARCH") or "").strip().lower()
-if arch.startswith("sm"):
-    arch = arch.replace("sm", "").lstrip("_- ")
-arch = f"sm_{arch}" if arch else "sm_unknown"
-print(f"py{abi}_torch{base_ver}_{cu}_{arch}")
-PY
-    )"
-    if [[ -n "$key" ]]; then
-      echo "Torch key      : ${key}"
-    fi
+  if command -v torch_sage_key >/dev/null 2>&1; then
+    key="$(torch_sage_key 2>/dev/null || true)"
+  fi
+  if [[ -n "$key" ]]; then
+    echo "Torch key      : ${key}"
   fi
 
-  # Summarize bundles in the repo, and whether this key is present
+  # Summarize bundles, passing this key
   hf_bundles_summary "$key"
 
   echo "=================================================="
@@ -835,29 +816,34 @@ print_bundle_matrix() {
   local tmp="${cache}/.hf_inspect.$$"
   mkdir -p "$cache"
 
-  # ---- Torch channel + key ----
+  # Ensure we have a channel decision
+  if [[ -z "${TORCH_CHANNEL_EFFECTIVE:-}" ]]; then
+    if [[ -n "${TORCH_CHANNEL:-}" ]]; then
+      export TORCH_CHANNEL_EFFECTIVE="$TORCH_CHANNEL"
+      export TORCH_CHANNEL_SOURCE="user"
+    elif command -v auto_channel_detect >/dev/null 2>&1; then
+      auto_channel_detect
+    fi
+  fi
+
   local chan="${TORCH_CHANNEL_EFFECTIVE:-unknown}"
   local src="${TORCH_CHANNEL_SOURCE:-auto}"
 
   local chan_label="$chan"
   if [[ "$chan_label" == "unknown" ]]; then
-    chan_label="unknown"
-  fi
-  if [[ "$src" != "auto" && "$chan" != "unknown" ]]; then
-    chan_label+=" (${src})"
-  elif [[ "$chan" != "unknown" ]]; then
+    :
+  elif [[ "$src" == "user" ]]; then
+    chan_label+=" (user)"
+  else
     chan_label+=" (auto)"
   fi
-
-  # Current Torch Sage key (py+torch+cu+arch)
-  local key
-  if command -v torch_sage_key >/dev/null 2>&1; then
-    key="$(torch_sage_key)"
-  else
-    key=""
-  fi
-
   echo "Torch Channel: ${chan_label}"
+
+  # Torch key from canonical helper
+  local key=""
+  if command -v torch_sage_key >/dev/null 2>&1; then
+    key="$(torch_sage_key 2>/dev/null || true)"
+  fi
   [[ -n "$key" ]] && echo "Torch Key:    ${key}"
 
   # If no HF token or git, we stop after torch info
@@ -919,8 +905,8 @@ print_bundle_matrix() {
     local abi ver_and_rest cu_arch
     abi="${base%%_torch*}"                 # pycp312
     ver_and_rest="${base#${abi}_torch}"    # 2.10.0.dev20251112_cu128_sm_120
-    cu_arch="${ver_and_rest##*_}"         # 120 (unused)
-    cu_arch="${ver_and_rest##*_cu}"       # not strictly needed here
+    cu_arch="${ver_and_rest##*_}"          # 120 (unused)
+    cu_arch="${ver_and_rest##*_cu}"        # not strictly needed here
     # Strip trailing "_cu..._sm_..."
     ver_part="${ver_and_rest%_cu*}"
 
@@ -935,6 +921,7 @@ print_bundle_matrix() {
 
   local total_sage="${#sage_all[@]}"
   local compat_sage="${#sage_compat[@]}"
+  local exact_match=0
   echo "Sage bundles: ${total_sage} (total), ${compat_sage} (Compatible)"
   if (( compat_sage > 0 )); then
     for entry in "${sage_compat[@]}"; do
@@ -943,6 +930,7 @@ print_bundle_matrix() {
       local mark=""
       if [[ -n "$key" && "$b" == "$key" ]]; then
         mark=" (Selected)"
+        exact_match=1
       fi
       echo "  ${entry}${mark}"
     done
@@ -1009,7 +997,9 @@ print_bundle_matrix() {
   fi
 
   # Path hints
-  if (( compat_sage > 0 )); then
+  if (( exact_match == 1 )); then
+    echo "Sage Path: Pull from HF (bundle restore)"
+  elif (( compat_sage > 0 )); then
     echo "Sage Path: uses HF bundle when key matches; build from source otherwise"
   else
     echo "Sage Path: Build from source (no compatible HF bundle yet)"
