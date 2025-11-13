@@ -772,10 +772,10 @@ PY
 
   echo "[torch] [stable] Probing index: ${url} (ABI=${py_abi}, ver=${TORCH_STABLE_VER})" >&2
 
-  # Example line:
+  # Example we want to match in the HTML:
   #   torch-2.10.0+cu128-cp312-cp312-manylinux_2_28_x86_64.whl
   curl -fsSL "$url" 2>/dev/null \
-    | grep -q "torch-${TORCH_STABLE_VER}\+${cuda}.*${py_abi}"
+    | grep -q "torch-${TORCH_STABLE_VER}+${cuda}.*${py_abi}"
 }
 
 # Decide which Torch channel to use and record *how* we got there.
