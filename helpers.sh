@@ -1217,11 +1217,21 @@ hf_fetch_sage_bundle() {
   git clone --depth=1 \
     --config http.lowSpeedLimit=1000 \
     --config http.lowSpeedTime=90 \
-    "$(hf_remote_url)" "$tmp" >/dev/null 2>&1 || { echo "[sage-bundle] ❌ Could not clone HF repo" >&2; rm -rf "$tmp"; return 1; }
+    "$(hf_remote_url)" "$tmp" >/dev/null 2>&1 || {
+      echo "[sage-bundle] ❌ Could not clone HF repo" >&2
+      rm -rf "$tmp"
+      return 1
+    }
   local patt="torch_sage_bundle_${key}.tgz"
-  [[ -f "$tmp/bundles/$patt" ]] || { echo "[sage-bundle] ❌ Bundle ($patt) not available in HF repo." >&2; rm -rf "$tmp"; return 1; }
+  [[ -f "$tmp/bundles/$patt" ]] || {
+    echo "[sage-bundle] ❌ Bundle ($patt) not available in HF repo." >&2
+    rm -rf "$tmp"
+    return 1
+  }
   echo "[sage-bundle] ✅ found bundle $patt" >&2
-  mkdir -p "$CACHE_DIR"; cp "$tmp/bundles/$patt" "$CACHE_DIR/"; rm -rf "$tmp"
+  mkdir -p "$CACHE_DIR"
+  cp "$tmp/bundles/$patt" "$CACHE_DIR/"
+  rm -rf "$tmp"
   echo "${CACHE_DIR}/${patt}"
 }
 
@@ -1247,7 +1257,10 @@ ensure_sage_from_bundle_or_build() {
   if [[ -f "$pattern" ]]; then
     tarpath="$pattern"
   else
-    tarpath="$(hf_fetch_sage_bundle "$key" | tail -n1)"
+    # Do NOT pipe or rely on pipefail; catch failure explicitly
+    if ! tarpath="$(hf_fetch_sage_bundle "$key")"; then
+      tarpath=""
+    fi
   fi
 
   if [[ -n "$tarpath" && -f "$tarpath" ]]; then
