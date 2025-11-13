@@ -1140,7 +1140,7 @@ build_sage_bundle() {
   local tarpath="${CACHE_DIR}/torch_sage_bundle_${key}.tgz"
 
   SAGE_TARPATH="$tarpath" "$PY" - << 'PY'
-import importlib, os, sysconfig, tarfile
+import importlib, os, sysconfig, tarfile, sys
 
 site_dir = sysconfig.get_paths()["purelib"]
 
@@ -1162,6 +1162,7 @@ if mod is None:
 
 pkg_path = os.path.dirname(mod.__file__)
 
+# Find the installed dist-info directory under site-packages (if present)
 base = pkg_name.replace('_', '').lower()
 dist_dir = None
 for entry in os.listdir(site_dir):
@@ -1172,22 +1173,28 @@ for entry in os.listdir(site_dir):
 tarpath = os.environ["SAGE_TARPATH"]
 
 with tarfile.open(tarpath, "w:gz") as tf:
-    tf.add(pkg_path, arcname=os.path.relpath(pkg_path, site_dir))
+    # Always store the package as "sageattention" (or whatever pkg_name is),
+    # regardless of where it lives on disk (editable installs, /tmp, etc).
+    tf.add(pkg_path, arcname=pkg_name)
+
+    # Store dist-info as just "sageattention-2.2.0.dist-info"
     if dist_dir and os.path.isdir(dist_dir):
-        tf.add(dist_dir, arcname=os.path.relpath(dist_dir, site_dir))
+        tf.add(dist_dir, arcname=os.path.basename(dist_dir))
 PY
 
   echo "$tarpath"
 }
 
 build_sage_bundle_wrapper() {
-  local key="${1:?}"
+  local key="${1:?SAGE_KEY required}"
   local tarpath="${CACHE_DIR}/torch_sage_bundle_${key}.tgz"
-  SAGE_TARPATH="$tarpath" "$PY_BIN" -m pip show torch >/dev/null 2>&1 || {
-    echo "[sage-bundle] Torch not installed; cannot build Sage bundle."
+
+  SAGE_TARPATH="$tarpath" "$PY" -m pip show torch >/dev/null 2>&1 || {
+    echo "[sage-bundle] Torch not installed; cannot build Sage bundle." >&2
     return 1
   }
-  SAGE_TARPATH="$tarpath" build_sage_bundle "$key"
+
+  tarpath="$(build_sage_bundle "$key")" || return 1
   echo "$tarpath"
 }
 
@@ -1198,9 +1205,9 @@ push_sage_bundle_if_requested() {
 
   local key tarpath
   key="$(torch_sage_key)"
-  echo "[sage-bundle] Building Sage bundle for key=${key}…" >&2
+  echo "[sage-bundle] Pushing Sage bundle to HF for key=${key}…" >&2
 
-  # Hard gate: if we can't import, do NOT push a broken bundle
+  # Hard gate: don't push a bundle if we can't import SageAttention
   if ! "$PY" - << 'PY'
 import importlib, sys
 mods = ["sageattention", "SageAttention", "sage_attention"]
@@ -1219,14 +1226,13 @@ PY
     return 1
   fi
 
-  tarpath="$(build_sage_bundle "$key")" || {
-    echo "[sage-bundle] Failed to build Sage bundle."
+  tarpath="$(build_sage_bundle_wrapper "$key")" || {
+    echo "[sage-bundle] Failed to build Sage bundle." >&2
     return 1
   }
 
   hf_push_files "torch_sage bundle ${key}" "$tarpath"
   echo "[sage-bundle] Uploaded torch_sage_bundle_${key}.tgz"
-
 }
 
 hf_fetch_sage_bundle() {
@@ -1255,14 +1261,34 @@ hf_fetch_sage_bundle() {
 }
 
 restore_sage_from_tar() {
-  "$PY" - << 'PY'
-import os, sysconfig, tarfile
+  local tar="${SAGE_TARPATH:?SAGE_TARPATH not set}"
 
-site_dir = sysconfig.get_paths()["purelib"]
-tarpath = os.environ["SAGE_TARPATH"]
+  local site
+  site="$("$PY" - <<'PY'
+import sys
+for p in sys.path:
+    if p.endswith("site-packages"):
+        print(p)
+        break
+PY
+)"
+  if [[ -z "$site" ]]; then
+    echo "[sage-bundle] ERROR: could not locate site-packages for $PY" >&2
+    return 1
+  fi
 
-with tarfile.open(tarpath, "r:gz") as tf:
-    tf.extractall(site_dir)
+  echo "[sage-bundle] Untarring SageAttention from $(basename "$tar") into ${site}…" >&2
+  mkdir -p "$site"
+  tar xzf "$tar" -C "$site"
+
+  "$PY" - <<'PY'
+import sys
+print("[sage-bundle] sys.executable:", sys.executable)
+try:
+    import sageattention
+    print("[sage-bundle] SAGE imported sucessfully from tar bundle:", sageattention, getattr(sageattention, "__file__", None))
+except Exception as e:
+    print("[sage-bundle] SAGE IMPORT ERROR:", repr(e))
 PY
 }
 
@@ -1278,9 +1304,11 @@ ensure_sage_from_bundle_or_build() {
   else
     local pattern="${CACHE_DIR}/torch_sage_bundle_${key}.tgz"
     if [[ -f "$pattern" ]]; then
+      echo "[sage-bundle] Tar exists in cache directory. Proceeding."
       tarpath="$pattern"
     else
       # Call hf_fetch_sage_bundle and store *all* stdout safely
+      echo "[sage-bundle] Attempting to acquire sage bundle with key ($key) from Huggingface."
       if out="$(hf_fetch_sage_bundle "$key")"; then
         # Last non-empty line = path returned by the function
         tarpath="$(printf "%s\n" "$out" | { 
@@ -1298,7 +1326,7 @@ ensure_sage_from_bundle_or_build() {
 
   # If tarpath is valid, restore from bundle
   if [[ -n "${tarpath:-}" && -f "$tarpath" ]]; then
-    echo "[sage-bundle] Using Sage bundle: $(basename "$tarpath")" >&2
+    echo "[sage-bundle] Attempting to restore Sage bundle: $(basename "$tarpath")" >&2
     SAGE_TARPATH="$tarpath" restore_sage_from_tar
     return 0
   fi
