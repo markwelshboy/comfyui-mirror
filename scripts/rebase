@@ -30,7 +30,6 @@ fi
 source_if_exists "${REPO}/.env"
 source_if_exists "${REPO}/helpers.sh"
 
-type -t auto_channel_detect >/dev/null 2>&1 && auto_channel_detect  || true
 type -t show_env            >/dev/null 2>&1 && show_env             || true
 
 echo "[rebase] done."
