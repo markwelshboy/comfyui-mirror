@@ -709,48 +709,73 @@ PY
 # ================================================================
 
 # Fetch latest nightly version for the selected CUDA stream (e.g. 2.10.0.dev20251112)
-# Handles both "+cu128" and URL-encoded "%2Bcu128" forms in the index.
+# Uses the torch sub-index: .../whl/nightly/<cuda>/torch/
 get_latest_torch_nightly_ver() {
-  local path="nightly/${TORCH_CUDA}"
-  local url="https://download.pytorch.org/whl/${path}/"
+  local cuda="${TORCH_CUDA:-cu128}"
+  local py_abi
+
+  # Figure out our ABI tag (cp312, etc.) using your venv Python
+  py_abi="$("$PY" - << 'PY'
+import sys
+print(f"cp{sys.version_info.major}{sys.version_info.minor}")
+PY
+  )" || py_abi="cp312"
+
+  local url="https://download.pytorch.org/whl/nightly/${cuda}/torch/"
+  echo "[torch] [nightly] Probing index: ${url} (ABI=${py_abi})" >&2
+
   local html ver
-
-  echo "[torch] [nightly] Probing index: ${url}" >&2
-
-  # Try to fetch the directory index; don't hard-fail if curl breaks.
   html="$(curl -fsSL "$url" 2>/dev/null || true)"
 
   if [[ -z "$html" ]]; then
-    echo "[torch] [nightly] ERROR: could not fetch index HTML for ${url}" >&2
-    # fall back to stable as a conservative choice
+    echo "[torch] [nightly] ERROR: could not fetch index HTML for ${url}; falling back to TORCH_STABLE_VER=${TORCH_STABLE_VER}" >&2
     echo "${TORCH_STABLE_VER}"
     return 0
   fi
 
-  # Examples this needs to match:
-  #   torch-2.10.0.dev20251111%2Bcu128-cp312-...
-  #   torch-2.10.0.dev20251111+cu128-cp312-...
+  # Example line:
+  #   torch-2.10.0.dev20250915+cu128-cp312-cp312-manylinux_2_28_x86_64.whl
+  #
+  # Strategy:
+  #   - match dev builds for *this* CUDA stream
+  #   - make sure the line also mentions our ABI (cp312)
+  #   - strip down to just "2.10.0.devYYYYMMDD"
   ver="$(
     printf '%s\n' "$html" \
-      | grep -oE 'torch-[0-9]+\.[0-9]+\.[0-9]+\.dev[0-9]{8}(%2B|\+)[^\"< ]*' \
-      | sed -E 's/^torch-([0-9]+\.[0-9]+\.[0-9]+\.dev[0-9]{8})(%2B|\+).*/\1/' \
+      | grep -oE "torch-[0-9]+\.[0-9]+\.[0-9]+\.dev[0-9]{8}\+${cuda}[^\"< ]*${py_abi}[^\"< ]*" \
+      | sed -E 's/^torch-([0-9]+\.[0-9]+\.[0-9]+\.dev[0-9]{8}).*$/\1/' \
       | sort -V | tail -1
   )"
 
   if [[ -n "$ver" ]]; then
+    echo "[torch] [nightly] Latest nightly from index: ${ver} (+${cuda}, ${py_abi})" >&2
     echo "$ver"
   else
-    echo "[torch] [nightly] WARNING: no dev build found on index; falling back to TORCH_STABLE_VER=${TORCH_STABLE_VER}" >&2
+    echo "[torch] [nightly] WARNING: no dev build found for CUDA=${cuda}, ABI=${py_abi}; falling back to TORCH_STABLE_VER=${TORCH_STABLE_VER}" >&2
     echo "${TORCH_STABLE_VER}"
   fi
 }
 
-# Return 0 if the stable wheel for this CUDA stream seems present on the PyTorch index
+# Return 0 if a stable torch wheel for this CUDA stream seems present on the PyTorch index.
+# Uses the torch sub-index: .../whl/<cuda>/torch/
 stable_torch_available() {
-  local url="https://download.pytorch.org/whl/${TORCH_CUDA}/"
-  # We only need to know if *any* wheel for the requested stable version exists on that index
-  # (exact cp tag/abi filename varies; index page is enough to decide)
-  curl -fsSL "$url" | grep -q "torch-${TORCH_STABLE_VER}\+${TORCH_CUDA}"
+  local cuda="${TORCH_CUDA:-cu128}"
+  local url="https://download.pytorch.org/whl/${cuda}/torch/"
+  local py_abi
+
+  # Determine our ABI (cp312 etc.) so we're not fooled by other ABIs.
+  py_abi="$("$PY" - << 'PY'
+import sys
+print(f"cp{sys.version_info.major}{sys.version_info.minor}")
+PY
+  )" || py_abi="cp312"
+
+  echo "[torch] [stable] Probing index: ${url} (ABI=${py_abi}, ver=${TORCH_STABLE_VER})" >&2
+
+  # Example line:
+  #   torch-2.10.0+cu128-cp312-cp312-manylinux_2_28_x86_64.whl
+  curl -fsSL "$url" 2>/dev/null \
+    | grep -q "torch-${TORCH_STABLE_VER}\+${cuda}.*${py_abi}"
 }
 
 # Decide which Torch channel to use and record *how* we got there.
@@ -774,11 +799,10 @@ auto_channel_detect() {
     echo "[torch] Channel preset via env: ${TORCH_CHANNEL}"
     if [[ "$TORCH_CHANNEL" == "nightly" && -z "${TORCH_NIGHTLY_VER:-}" ]]; then
       export TORCH_NIGHTLY_VER="$(get_latest_torch_nightly_ver)"
-      # If we somehow got a non-dev string, call that out.
       if [[ "$TORCH_NIGHTLY_VER" == *".dev"* ]]; then
         echo "[torch] [user] Using latest nightly: ${TORCH_NIGHTLY_VER} (+${TORCH_CUDA})"
       else
-        echo "[torch] [nightly] WARNING: resolved '${TORCH_NIGHTLY_VER}' which looks non-nightly; treating as effective version." >&2
+        echo "[torch] [nightly] WARNING: resolved '${TORCH_NIGHTLY_VER}', which looks non-nightly; treating as effective Torch version." >&2
       fi
     fi
     return 0
