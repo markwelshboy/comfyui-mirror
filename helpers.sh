@@ -1591,6 +1591,8 @@ ensure_nodes_from_bundle_or_build() {
     # tar -xzf ... -C ComfyUI
     tar -xzf "$tgz" -C "$(dirname "$CUSTOM_DIR")"
     echo "[custom-nodes] Restored custom nodes from bundle."
+    # After files are restored, install the recorded Python deps for this tag.
+    install_custom_nodes_requirements "$tag" || true
     return 0
   fi
 
