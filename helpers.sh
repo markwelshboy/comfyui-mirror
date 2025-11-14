@@ -501,24 +501,26 @@ _hf_api_base() {
 _custom_node_bundle_compatible() {
   local fname="${1:?bundle filename}"
 
-  # Tag: where we store the Wan2_1__Wan2_2__CUDA_12_8 style string
-  local tag="${BUNDLE_TAG:-${CUSTOM_NODES_BUNDLE_TAG:-}}"
+  # Tag: e.g. Wan2_1__Wan2_2__CUDA_12_8
+  local tag="${CUSTOM_NODES_BUNDLE_TAG:-${BUNDLE_TAG:-}}"
 
-  # Pins: numeric stack signature; try PIN_SIG first, then PINS
-  local signature=$(pins_signature)
-  local pins="${PIN_SIG:-${signature}}"
+  # Pins: numeric stack signature; prefer PIN_SIG, else compute via pins_signature()
+  local signature=""
+  if command -v pins_signature >/dev/null 2>&1; then
+    signature="$(pins_signature 2>/dev/null || true)"
+  fi
+  local pins="${PIN_SIG:-$signature}"
 
-  # If we have a tag, require it as a substring
-  if [[ -n "$tag" && "$fname" != *"${tag}"* ]]; then
+  # Require tag substring if we have one
+  if [[ -n "$tag" && "$fname" != *"$tag"* ]]; then
     return 1
   fi
 
-  # If we have pins, also require them as a substring
-  if [[ -n "$pins" && "$fname" != *"${pins}"* ]]; then
+  # Require pins substring if we have them
+  if [[ -n "$pins" && "$fname" != *"$pins"* ]]; then
     return 1
   fi
 
-  # Otherwise it’s compatible
   return 0
 }
 
@@ -951,7 +953,9 @@ print_bundle_matrix() {
   if [[ -n "$repo_url" ]]; then
     tmp="${CACHE_DIR:-/workspace/ComfyUI/cache}/.hf_matrix.$$"
     if git clone --depth=1 "$repo_url" "$tmp" >/dev/null 2>&1; then
+      #
       # ---- Sage bundles ----
+      #
       if compgen -G "$tmp/bundles/torch_sage_bundle_*.tgz" >/dev/null 2>&1; then
         local f base key_part ver label
         for f in "$tmp"/bundles/torch_sage_bundle_*.tgz; do
@@ -967,7 +971,7 @@ print_bundle_matrix() {
           [[ "$ver" == *dev* ]] && label="Nightly"
 
           local compat="no"
-          if [[ -n "$cuda_tag" && "$key_part" == *"${cuda_tag}" ]]; then
+          if [[ -n "$cuda_tag" && "$key_part" == *"${cuda_tag}"* ]]; then
             compat="yes"
             ((compat_sage++))
           fi
@@ -985,17 +989,32 @@ print_bundle_matrix() {
         done
       fi
 
+      #
       # ---- Custom node bundles ----
+      #
       if compgen -G "$tmp/bundles/custom_nodes_bundle_*.tgz" >/dev/null 2>&1; then
-        local g gbase gtag
+        local g gbase compat display_tag
         for g in "$tmp"/bundles/custom_nodes_bundle_*.tgz; do
           [[ -e "$g" ]] || continue
           ((total_cn++))
-          gbase="$(basename "$g" .tgz)"
-          gtag="${gbase#custom_nodes_bundle_}"
-          if [[ -n "${BUNDLE_TAG:-}" && "$gtag" == "$BUNDLE_TAG"* ]]; then
+          gbase="$(basename "$g")"
+
+          if _custom_node_bundle_compatible "$gbase"; then
             ((compat_cn++))
-            cn_lines+=("  ${gtag}")
+
+            # Compact display tag:
+            # - Prefer CUSTOM_NODES_BUNDLE_TAG / BUNDLE_TAG if set
+            # - Else strip prefix/suffix
+            if [[ -n "${CUSTOM_NODES_BUNDLE_TAG:-}" ]]; then
+              display_tag="${CUSTOM_NODES_BUNDLE_TAG}"
+            elif [[ -n "${BUNDLE_TAG:-}" ]]; then
+              display_tag="${BUNDLE_TAG}"
+            else
+              display_tag="${gbase#custom_nodes_bundle_}"
+              display_tag="${display_tag%.tgz}"
+            fi
+
+            cn_lines+=("  ${display_tag} (compatible)")
           fi
         done
       fi
@@ -1004,7 +1023,9 @@ print_bundle_matrix() {
     fi
   fi
 
+  #
   # ---- Compute Sage Path description ----
+  #
   local sage_path
   if (( exact_match == 1 )); then
     sage_path="Pull from HF (bundle restore — exact key match)"
@@ -1018,15 +1039,21 @@ print_bundle_matrix() {
     sage_path="Build from source (no compatible Sage bundles yet)"
   fi
 
+  #
   # ---- Custom-node path description ----
+  #
   local cn_path
   if (( compat_cn > 0 )); then
     cn_path="Pull from HF (bundle restore)"
-  else
+  elif (( total_cn > 0 )); then
     cn_path="Build from source (no matching custom-node bundle)"
+  else
+    cn_path="Build from source (no custom-node bundles found)"
   fi
 
+  #
   # ---- Print Sage bundle summary ----
+  #
   echo "Sage bundles: ${total_sage} (total), ${compat_sage} (compatible)"
   if (( compat_sage > 0 )); then
     printf '%s\n' "${sage_lines[@]}"
@@ -1034,7 +1061,9 @@ print_bundle_matrix() {
   echo "Sage Path: ${sage_path}"
   echo ""
 
+  #
   # ---- Print Custom-node bundle summary ----
+  #
   echo "Custom Node bundles: ${total_cn} (total), ${compat_cn} (compatible)"
   if (( compat_cn > 0 )); then
     printf '%s\n' "${cn_lines[@]}"
