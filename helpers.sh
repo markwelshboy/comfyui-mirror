@@ -2696,11 +2696,8 @@ show_env () {
   echo "LORAS_IDS:            ${LORAS_IDS_TO_DOWNLOAD:-Empty}"
   echo "======================================="
   echo ""
-  auto_channel_detect
-  echo ""
   hf_repo_info
   echo ""
-  print_bundle_matrix
-  echo ""
+  echo "======================================="
 
 }
