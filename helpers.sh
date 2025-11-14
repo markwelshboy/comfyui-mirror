@@ -5,7 +5,7 @@
 #   - Minimal, consistent Hugging Face vars (HF_REPO_ID, HF_REPO_TYPE, HF_TOKEN, CN_BRANCH)
 #   - Clear function groups with docs
 #   - Safe, idempotent, parallel node installation
-#   - Bundle pull-or-build logic keyed by CUSTOM_BUNDLE_TAG + PINS
+#   - Bundle pull-or-build logic keyed by CUSTOM_NODES_BUNDLE_TAG + PINS
 # ======================================================================
 
 # ----------------------------------------------------------------------
@@ -38,7 +38,7 @@ shopt -s extglob
 #   HF_TOKEN             - auth token
 #   CN_BRANCH            - default main
 #   HF_API_BASE          - default https://huggingface.co
-#   CUSTOM_BUNDLE_TAG           - logical “set” name (e.g. WAN2122_Baseline)
+#   CUSTOM_NODES_BUNDLE_TAG           - logical “set” name (e.g. WAN2122_Baseline)
 # Pins/signature:
 #   PINS                 - computed by pins_signature() if not set
 
@@ -547,9 +547,6 @@ hf_dataset_name() {
   echo "unknown_name"
 }
 
-# ================================================================
-# Hugging Face bundles summary via API (uses jq)
-# ================================================================
 _hf_api_base() {
   local base="${HF_API_BASE:-https://huggingface.co}"
   local type="${HF_REPO_TYPE:-dataset}"   # datasets or models
@@ -561,6 +558,32 @@ _hf_api_base() {
   fi
 
   echo "${base}/api/${type}s/${id}"
+}
+
+# Decide if a given custom-node bundle filename is "compatible"
+# with the current environment (bundle tag + pins).
+_custom_node_bundle_compatible() {
+  local fname="${1:?bundle filename}"
+
+  # Tag: where we store the Wan2_1__Wan2_2__CUDA_12_8 style string
+  local tag="${BUNDLE_TAG:-${CUSTOM_NODES_BUNDLE_TAG:-}}"
+
+  # Pins: numeric stack signature; try PIN_SIG first, then PINS
+  local signature=$(pins_signature)
+  local pins="${PIN_SIG:-${signature}}"
+
+  # If we have a tag, require it as a substring
+  if [[ -n "$tag" && "$fname" != *"${tag}"* ]]; then
+    return 1
+  fi
+
+  # If we have pins, also require them as a substring
+  if [[ -n "$pins" && "$fname" != *"${pins}"* ]]; then
+    return 1
+  fi
+
+  # Otherwise it’s compatible
+  return 0
 }
 
 hf_bundles_summary() {
@@ -688,7 +711,7 @@ _sage_bundle_basename() {
 
 _custom_nodes_bundle_basename() {
   local tag pins
-  tag="${CUSTOM_BUNDLE_TAG:?missing CUSTOM_BUNDLE_TAG}"     # e.g. Wan2_1__Wan2_2__CUDA_12_8
+  tag="${CUSTOM_NODES_BUNDLE_TAG:?missing CUSTOM_NODES_BUNDLE_TAG}"     # e.g. Wan2_1__Wan2_2__CUDA_12_8
   pins="$(pins_signature)"                    # your existing helper
   echo "custom_nodes_bundle_${tag}_${pins}_*.tgz"
 }
@@ -1393,7 +1416,7 @@ build_custom_nodes_manifest() {
 
   # Make sure the Python side sees where to write + which tag to use
   CUSTOM_DIR="${CUSTOM_DIR:?}" \
-  CUSTOM_BUNDLE_TAG="$tag" \
+  CUSTOM_NODES_BUNDLE_TAG="$tag" \
   out_json="$out" \
   "$PY_BIN" - <<'PY'
 import json, os, subprocess
@@ -1427,7 +1450,7 @@ for name in sorted(os.listdir(d)):
 
 out = os.environ["out_json"]
 with open(out, "w", encoding="utf-8") as f:
-    json.dump({"tag": os.environ.get("CUSTOM_BUNDLE_TAG", ""), "nodes": items}, f, indent=2)
+    json.dump({"tag": os.environ.get("CUSTOM_NODES_BUNDLE_TAG", ""), "nodes": items}, f, indent=2)
 PY
 }
 
@@ -1477,10 +1500,10 @@ install_custom_nodes_bundle() {
 }
 
 # ensure_nodes_from_bundle_or_build:
-#   If HF has a bundle matching CUSTOM_BUNDLE_TAG + PINS → install it
+#   If HF has a bundle matching CUSTOM_NODES_BUNDLE_TAG + PINS → install it
 #   Else build from NODES and optionally push a fresh bundle
 ensure_nodes_from_bundle_or_build() {
-  local tag="${CUSTOM_BUNDLE_TAG:?CUSTOM_BUNDLE_TAG required}"
+  local tag="${CUSTOM_NODES_BUNDLE_TAG:?CUSTOM_NODES_BUNDLE_TAG required}"
   local pins="${PINS:-$(pins_signature)}"
 
   mkdir -p "$CACHE_DIR" "$CUSTOM_LOG_DIR"
@@ -1510,10 +1533,10 @@ ensure_nodes_from_bundle_or_build() {
   install_custom_nodes_set
 }
 
-# push_bundle_if_requested: convenience wrapper (respects CUSTOM_BUNDLE_TAG/PINS)
+# push_bundle_if_requested: convenience wrapper (respects CUSTOM_NODES_BUNDLE_TAG/PINS)
 push_bundle_if_requested() {
-  [[ "${PUSH_CUSTOM_BUNDLE:-0}" = "1" ]] || return 0
-  local tag="${CUSTOM_BUNDLE_TAG:?CUSTOM_BUNDLE_TAG required}"
+  [[ "${PUSH_CUSTOM_NODES_BUNDLE:-0}" = "1" ]] || return 0
+  local tag="${CUSTOM_NODES_BUNDLE_TAG:?CUSTOM_NODES_BUNDLE_TAG required}"
   local pins="${PINS:-$(pins_signature)}"
   local base tarpath manifest reqs sha
   base="$(bundle_base "$tag" "$pins")"
@@ -2642,7 +2665,7 @@ show_env () {
   echo "Logs dir:             $COMFY_LOGS"
   echo "Output dir:           $OUTPUT_DIR"
   echo "Bundles dir:          $BUNDLES_DIR"
-  echo "Bundle tag:           $CUSTOM_BUNDLE_TAG"
+  echo "Bundle tag:           $CUSTOM_NODES_BUNDLE_TAG"
   echo "Workflow dir:         $WORKFLOW_DIR"
   echo "Model manifest URL:   $MODEL_MANIFEST_URL"
   echo ""
@@ -2656,12 +2679,16 @@ show_env () {
   echo "UPSCALE_DIR:          $UPSCALE_DIR"
   echo ""
   echo "HF_TOKEN:             $(if [ -n "$HF_TOKEN" ]; then echo "Set"; else echo "Not set"; fi)"
-  echo ""
-  hf_repo_info
-  echo ""
-  echo ""
   echo "CIVITAI_TOKEN:        $(if [ -n "$CIVITAI_TOKEN" ]; then echo "Set"; else echo "Not set"; fi)"
   echo "CHECKPOINT_IDS:       ${CHECKPOINT_IDS_TO_DOWNLOAD:-Empty}"
   echo "LORAS_IDS:            ${LORAS_IDS_TO_DOWNLOAD:-Empty}"
-  echo "======================================="  
+  echo "======================================="
+  echo ""
+  auto_channel_detect
+  echo ""
+  hf_repo_info
+  echo ""
+  print_bundle_matrix
+  echo ""
+
 }

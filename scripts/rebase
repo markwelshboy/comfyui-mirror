@@ -6,6 +6,7 @@ REPO="/workspace/comfyui-mirror"
 source_if_exists() {
   local f="$1"
   [[ -f "$f" ]] || return 0
+  echo "[source-if-exists] Sourcing $f ..."
   # shellcheck disable=SC1090
   source "$f"
 }
