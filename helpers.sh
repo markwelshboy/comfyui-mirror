@@ -149,7 +149,7 @@ copy_hearmeman_assets_if_any(){
 }
 
 # ======================================================================
-# Section 1: Generic utilities
+# Generic utilities
 # ======================================================================
 
 # tg: Telegram notify (best-effort)
@@ -160,12 +160,28 @@ tg() {
   fi
 }
 
-# need_tools_for_hf: Ensure git, git-lfs, jq available
-need_tools_for_hf() {
-  apt-get update -y >/dev/null 2>&1 || true
-  apt-get install -y jq git git-lfs >/dev/null 2>&1 || true
-  git lfs install --system || true
+# ======================================================================
+# ComfyUI core management
+# ======================================================================
+
+# ensure_comfy: Install or hard-reset ComfyUI at COMFY_HOME
+ensure_comfy() {
+  if [[ -d "$COMFY_HOME/.git" && -f "$COMFY_HOME/main.py" ]]; then
+    git -C "$COMFY_HOME" fetch --depth=1 origin || true
+    git -C "$COMFY_HOME" reset --hard origin/master 2>/dev/null \
+      || git -C "$COMFY_HOME" reset --hard origin/main 2>/dev/null || true
+  else
+    rm -rf "$COMFY_HOME"
+    git clone --depth=1 "$REPO_URL" "$COMFY_HOME"
+  fi
+
+  "$PIP_BIN" install -U pip wheel setuptools
+  [ -f "$COMFY_HOME/requirements.txt" ] && "$PIP_BIN" install -r "$COMFY_HOME/requirements.txt" || true
+  ln -sfn "$COMFY_HOME" /ComfyUI
 }
+# ======================================================================
+# Custom node installation (parallel)
+# ======================================================================
 
 # pins_signature: Build an identifier from numpy/cupy/opencv versions
 pins_signature() {
@@ -218,29 +234,6 @@ needs_recursive() {
     *) echo "false" ;;
   esac
 }
-
-# ======================================================================
-# Section 2: ComfyUI core management
-# ======================================================================
-
-# ensure_comfy: Install or hard-reset ComfyUI at COMFY_HOME
-ensure_comfy() {
-  if [[ -d "$COMFY_HOME/.git" && -f "$COMFY_HOME/main.py" ]]; then
-    git -C "$COMFY_HOME" fetch --depth=1 origin || true
-    git -C "$COMFY_HOME" reset --hard origin/master 2>/dev/null \
-      || git -C "$COMFY_HOME" reset --hard origin/main 2>/dev/null || true
-  else
-    rm -rf "$COMFY_HOME"
-    git clone --depth=1 "$REPO_URL" "$COMFY_HOME"
-  fi
-
-  "$PIP_BIN" install -U pip wheel setuptools
-  [ -f "$COMFY_HOME/requirements.txt" ] && "$PIP_BIN" install -r "$COMFY_HOME/requirements.txt" || true
-  ln -sfn "$COMFY_HOME" /ComfyUI
-}
-# ======================================================================
-# Section 3: Custom node installation (parallel)
-# ======================================================================
 
 # clone_or_pull: shallow clone or fast-forward reset
 clone_or_pull() {
@@ -378,7 +371,7 @@ install_custom_nodes_set() {
 }
 
 # ======================================================================
-# Section 4: Bundling (create/push/pull)
+# HF Bundling (create/push/pull)
 # ======================================================================
 
 # hf_remote_url: builds authenticated HTTPS remote for model/dataset repos
@@ -430,75 +423,10 @@ hf_push_files() {
   rm -rf "$tmp"
 }
 
-hf_fetch_compatible_sage_bundle() {
-  local key="${1:?SAGE_KEY}"
-  local repo_url tmp cuda_tag
-
-  repo_url="$(hf_remote_url 2>/dev/null || true)"
-  if [[ -z "$repo_url" ]]; then
-    echo "[sage-bundle] No HF repo URL; cannot search for compatible Sage bundles." >&2
-    return 1
-  fi
-
-  # Extract cuXXX_sm_YY part from our key (if present)
-  cuda_tag="$(printf '%s\n' "$key" | sed -E 's/.*_(cu[0-9]+_sm_[0-9]+)$/\1/' || true)"
-  if [[ -z "$cuda_tag" ]]; then
-    echo "[sage-bundle] Cannot derive CUDA/arch suffix from key=${key}; skipping compatible search." >&2
-    return 1
-  fi
-
-  tmp="${CACHE_DIR}/.hf_sage_compat.$$"
-  git lfs install >/dev/null 2>&1
-  if ! git clone --depth=1 "$repo_url" "$tmp" >/dev/null 2>&1; then
-    echo "[sage-bundle] ❌ Could not clone HF repo for compat lookup." >&2
-    rm -rf "$tmp"
-    return 1
-  fi
-
-  local f base k compat_list
-  compat_list=()
-
-  if compgen -G "$tmp/bundles/torch_sage_bundle_*.tgz" >/dev/null 2>&1; then
-    for f in "$tmp"/bundles/torch_sage_bundle_*.tgz; do
-      [[ -e "$f" ]] || continue
-      base="$(basename "$f" .tgz)"
-      k="${base#torch_sage_bundle_}"
-      [[ "$k" == *"${cuda_tag}" ]] || continue
-      compat_list+=("$k")
-    done
-  fi
-
-  if (( ${#compat_list[@]} == 0 )); then
-    echo "[sage-bundle] No compatible Sage bundles found for CUDA/arch=${cuda_tag}." >&2
-    rm -rf "$tmp"
-    return 1
-  fi
-
-  # Choose latest (lexicographically max) compatible key
-  IFS=$'\n' compat_list_sorted=($(printf '%s\n' "${compat_list[@]}" | sort))
-  unset IFS
-  local best_key="${compat_list_sorted[-1]}"
-  local best_file="torch_sage_bundle_${best_key}.tgz"
-  echo "[sage-bundle] Reusing compatible Sage bundle: ${best_file}" >&2
-
-  mkdir -p "$CACHE_DIR"
-  cp "$tmp/bundles/$best_file" "$CACHE_DIR/"
-  rm -rf "$tmp"
-  echo "${CACHE_DIR}/${best_file}"
-}
-
-#---------------------------------------------------------------
-#
-#
-# Torch and SageAttention helpers
-#
-#
-#---------------------------------------------------------------
-
 # ================================================================
 # Hugging Face dataset name helpers
 # ================================================================
-# Expect HF_REPO like: markwelshboyx/hearmemanAI-comfyUI-workflows
+# Expect HF_REPO_ID like: markwelshboyx/hearmemanAI-comfyUI-workflows
 # or can fall back to parsing HF_REMOTE_URL if defined
 
 hf_dataset_namespace() {
@@ -560,6 +488,14 @@ _hf_api_base() {
   echo "${base}/api/${type}s/${id}"
 }
 
+#---------------------------------------------------------------
+#
+#
+# Torch and SageAttention helpers
+#
+#
+#---------------------------------------------------------------
+
 # Decide if a given custom-node bundle filename is "compatible"
 # with the current environment (bundle tag + pins).
 _custom_node_bundle_compatible() {
@@ -584,6 +520,63 @@ _custom_node_bundle_compatible() {
 
   # Otherwise it’s compatible
   return 0
+}
+
+hf_fetch_compatible_sage_bundle() {
+  local key="${1:?SAGE_KEY}"
+  local repo_url tmp cuda_tag
+
+  repo_url="$(hf_remote_url 2>/dev/null || true)"
+  if [[ -z "$repo_url" ]]; then
+    echo "[sage-bundle] No HF repo URL; cannot search for compatible Sage bundles." >&2
+    return 1
+  fi
+
+  # Extract cuXXX_sm_YY part from our key (if present)
+  cuda_tag="$(printf '%s\n' "$key" | sed -E 's/.*_(cu[0-9]+_sm_[0-9]+)$/\1/' || true)"
+  if [[ -z "$cuda_tag" ]]; then
+    echo "[sage-bundle] Cannot derive CUDA/arch suffix from key=${key}; skipping compatible search." >&2
+    return 1
+  fi
+
+  tmp="${CACHE_DIR}/.hf_sage_compat.$$"
+  git lfs install >/dev/null 2>&1
+  if ! git clone --depth=1 "$repo_url" "$tmp" >/dev/null 2>&1; then
+    echo "[sage-bundle] ❌ Could not clone HF repo for compat lookup." >&2
+    rm -rf "$tmp"
+    return 1
+  fi
+
+  local f base k compat_list
+  compat_list=()
+
+  if compgen -G "$tmp/bundles/torch_sage_bundle_*.tgz" >/dev/null 2>&1; then
+    for f in "$tmp"/bundles/torch_sage_bundle_*.tgz; do
+      [[ -e "$f" ]] || continue
+      base="$(basename "$f" .tgz)"
+      k="${base#torch_sage_bundle_}"
+      [[ "$k" == *"${cuda_tag}" ]] || continue
+      compat_list+=("$k")
+    done
+  fi
+
+  if (( ${#compat_list[@]} == 0 )); then
+    echo "[sage-bundle] No compatible Sage bundles found for CUDA/arch=${cuda_tag}." >&2
+    rm -rf "$tmp"
+    return 1
+  fi
+
+  # Choose latest (lexicographically max) compatible key
+  IFS=$'\n' compat_list_sorted=($(printf '%s\n' "${compat_list[@]}" | sort))
+  unset IFS
+  local best_key="${compat_list_sorted[-1]}"
+  local best_file="torch_sage_bundle_${best_key}.tgz"
+  echo "[sage-bundle] Reusing compatible Sage bundle: ${best_file}" >&2
+
+  mkdir -p "$CACHE_DIR"
+  cp "$tmp/bundles/$best_file" "$CACHE_DIR/"
+  rm -rf "$tmp"
+  echo "${CACHE_DIR}/${best_file}"
 }
 
 hf_bundles_summary() {
@@ -642,10 +635,6 @@ hf_bundles_summary() {
   rm -rf "$tmp"
 }
 
-# ================================================================
-# Quick Hugging Face repo connection summary
-# ================================================================
-
 hf_repo_info() {
   local ns name type url
   ns="$(hf_dataset_namespace)"
@@ -680,9 +669,6 @@ hf_repo_info() {
   if [[ -n "$key" ]]; then
     echo "Torch key      : ${key}"
   fi
-
-  # Summarize bundles, passing this key
-  hf_bundles_summary "$key"
 
   echo "=================================================="
 }
@@ -1087,9 +1073,6 @@ print(f"[install-torch] Installed: {torch.__version__} | CUDA {torch.version.cud
 PY
 }
 
-# ================================================================
-# Utility: print quick Torch/Sage environment summary
-# ================================================================
 show_torch_sage_env_summary() {
   echo "=================================================="
   echo "Torch Channel  : ${TORCH_CHANNEL}"
