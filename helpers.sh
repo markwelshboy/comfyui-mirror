@@ -1139,30 +1139,62 @@ print_bundle_matrix() {
 install_torch() {
   echo "[torch] Installing Torch (${TORCH_CHANNEL})..." >&2
 
+  local url ver
+
   case "${TORCH_CHANNEL}" in
     stable)
-      local url="https://download.pytorch.org/whl/${TORCH_CUDA}"
-      local ver="${TORCH_STABLE_VER}+${TORCH_CUDA}"
+      # Stable: explicit version pin (we know 2.9.1 works for cu128/cp312)
+      url="https://download.pytorch.org/whl/${TORCH_CUDA}"
+      ver="${TORCH_VERSION_EFFECTIVE:-${TORCH_STABLE_VER}}+${TORCH_CUDA}"
+
       env -u PIP_REQUIRE_HASHES -u PIP_CONSTRAINT \
         $PIP install --no-cache-dir \
           "torch==${ver}" torchvision torchaudio \
           --index-url "$url"
       ;;
-    nightly)
-      local url="https://download.pytorch.org/whl/nightly/${TORCH_CUDA}"
-      local ver="${TORCH_NIGHTLY_VER}+${TORCH_CUDA}"
+
+    weekly|nightly)
+      # Weekly/Nightly: let pip resolve a compatible trio from the nightly index.
+      # We do NOT pin torch==… here to avoid resolver conflicts like you just hit.
+      url="https://download.pytorch.org/whl/nightly/${TORCH_CUDA}"
+
       env -u PIP_REQUIRE_HASHES -u PIP_CONSTRAINT \
         $PIP install --pre --no-cache-dir \
-          "torch==${ver}" torchvision torchaudio \
+          torch torchvision torchaudio \
           --index-url "$url"
       ;;
+
     *)
-      echo "[install-torch] FATAL: Unknown TORCH_CHANNEL=${TORCH_CHANNEL}"; return 1;;
+      echo "[install-torch] FATAL: Unknown TORCH_CHANNEL=${TORCH_CHANNEL}" >&2
+      return 1
+      ;;
   esac
+
+  # After install, record the actual torch version and print it
+  local actual
+  actual="$($PY - <<'PY'
+import torch, sys
+v = torch.__version__
+print(v)
+PY
+)" || actual="unknown"
+
+  if [[ "$actual" != "unknown" ]]; then
+    # strip any '+cuXXX' suffix for the "core" version
+    local base="${actual%%+*}"
+    export TORCH_VERSION_EFFECTIVE="$base"
+    # For non-stable, keep TORCH_NIGHTLY_VER in sync with what we actually installed
+    if [[ "${TORCH_CHANNEL}" != "stable" ]]; then
+      export TORCH_NIGHTLY_VER="$base"
+    fi
+  fi
+
+  echo "[install-torch] Installed torch: ${actual}"
 
   $PY - <<'PY'
 import torch
-print(f"[install-torch] Installed: {torch.__version__} | CUDA {torch.version.cuda}")
+print(f"[install-torch] Torch full version : {torch.__version__}")
+print(f"[install-torch] Torch CUDA version : {torch.version.cuda}")
 PY
 }
 
@@ -1217,7 +1249,7 @@ PY
   echo "Detected GPU compute capability: ${CC_TORCH}"
 
   # Toolchain for CUDA 12.x
-  unset CC CXX SAGE_CUDA_ARCH_LIST SAGE_GENCODE CUDA_ARCH_LIST PIP_CONSTRAINT PIP_REQUIRE_HASHES
+  unset CC CXX SAGE_CUDA_ARCH_LIST SAGE_GENCODE CUDA_ARCH_LIST
   if ! command -v g++-12 >/dev/null; then
     apt-get update && apt-get install -y gcc-12 g++-12
   fi
@@ -1238,7 +1270,7 @@ PY
   rm -rf /tmp/SageAttention
   git clone https://github.com/thu-ml/SageAttention.git /tmp/SageAttention
 
-  if $PIP install --no-build-isolation -e /tmp/SageAttention 2>&1 | tee /workspace/logs/sage_build.log; then
+  if env -u PIP_REQUIRE_HASHES -u PIP_CONSTRAINT $PIP install --no-build-isolation -e /tmp/SageAttention 2>&1 | tee /workspace/logs/sage_build.log; then
     echo "SageAttention built OK"
     return 0
   else
@@ -1377,7 +1409,7 @@ hf_fetch_sage_bundle() {
 #   Look for pip_cache/pip_cache_${key}.tgz in HF repo, copy into CACHE_DIR, echo local path.
 hf_fetch_pip_cache() {
   local key="${1:?pip cache key required}"
-  local tmp="${CACHE_DIR:-/workspace/ComfyUI/cache}/.hf_pip.$$"
+  local tmp="${CACHE_DIR}/.hf_pip.$$"
   local repo_url
   repo_url="$(hf_remote_url 2>/dev/null || true)"
 
@@ -1411,26 +1443,26 @@ hf_fetch_pip_cache() {
 }
 
 # push_pip_cache_if_requested:
-#   If PUSH_PIP_CACHE=1 and PIP_CACHE_DIR is non-empty, tar it and push to HF.
+#   If PUSH_CUSTOM_NODES_PIP_CACHE=1 and CUSTOM_NODES_PIP_CACHE_DIR is non-empty, tar it and push to HF.
 push_pip_cache_if_requested() {
-  if [[ "${PUSH_PIP_CACHE:-0}" != "1" ]]; then
+  if [[ "${PUSH_CUSTOM_NODES_PIP_CACHE:-0}" != "1" ]]; then
     return 0
   fi
 
-  local cache="${PIP_CACHE_DIR:-}"
+  local cache="${CUSTOM_NODES_PIP_CACHE_DIR:-}"
   if [[ -z "$cache" || ! -d "$cache" ]]; then
-    echo "[pip-cache] No PIP_CACHE_DIR set; nothing to push." >&2
+    echo "[pip-cache] No CUSTOM_NODES_PIP_CACHE_DIR set; nothing to push." >&2
     return 0
   fi
 
   if [[ -z "$(ls -A "$cache" 2>/dev/null)" ]]; then
-    echo "[pip-cache] PIP_CACHE_DIR is empty; skipping push." >&2
+    echo "[pip-cache] CUSTOM_NODES_PIP_CACHE_DIR is empty; skipping push." >&2
     return 0
   fi
 
   local key tgz
   key="$(pip_cache_key)"
-  tgz="${CACHE_DIR:-/workspace/ComfyUI/cache}/pip_cache_${key}.tgz"
+  tgz="${CACHE_DIR}/pip_cache_${key}.tgz"
 
   echo "[pip-cache] Creating pip cache archive ${tgz}..."
   tar -czf "$tgz" -C "$cache" . || {
@@ -1444,18 +1476,20 @@ push_pip_cache_if_requested() {
 }
 
 # ensure_pip_cache_for_custom_nodes:
-#   If USE_PIP_CACHE_FOR_NODES is set, compute cache dir and restore from HF if present.
+#   If USE_PIP_CACHE_FOR_CUSTOM_NODES is set, compute cache dir and restore from HF if present.
 ensure_pip_cache_for_custom_nodes() {
-  if [[ "${USE_PIP_CACHE_FOR_NODES:-0}" != "1" ]]; then
+  if [[ "${USE_PIP_CACHE_FOR_CUSTOM_NODES:-0}" != "1" ]]; then
     return 0
   fi
 
   local key cache
   key="$(pip_cache_key)"
-  cache="${CACHE_DIR:-/workspace/ComfyUI/cache}/pip_custom_${key}"
+  cache="${CACHE_DIR}/pip_custom_${key}"
 
   mkdir -p "$cache"
+  export CUSTOM_NODES_PIP_CACHE_DIR="$cache"
   export PIP_CACHE_DIR="$cache"
+
   echo "[pip-cache] Using PIP_CACHE_DIR=${PIP_CACHE_DIR} (custom nodes only)" >&2
 
   # If cache is empty, try to hydrate it from HF
@@ -1659,14 +1693,14 @@ install_custom_nodes_requirements() {
   }
 
   echo "[custom-nodes] Installing custom-node requirements from ${req_work}..."
-  # Respect your usual "no hashes / no constraints" dance
-  env -u PIP_REQUIRE_HASHES -u PIP_CONSTRAINT \
-    "$PIP" install -r "$req_work" || {
-      echo "[custom-nodes] ⚠️ pip install -r ${req_work} failed; see logs above." >&2
-      # leave temp dir in place for inspection
-      rm -rf "$tmp"
-      return 1
-    }
+  # Use pip cache for these installs; keep hashes disabled.
+  env -u PIP_REQUIRE_HASHES \
+      PIP_CACHE_DIR="$CUSTOM_NODES_PIP_CACHE_DIR" \
+      "$PIP" install -r "$req_work" || {
+        echo "[custom-nodes] ⚠️ pip install -r ${req_work} failed; see logs above." >&2
+        rm -rf "$tmp"
+        return 1
+      }
 
   rm -rf "$tmp"
   return 0
@@ -1780,14 +1814,17 @@ ensure_custom_nodes_from_bundle_or_build() {
   local pattern="${CACHE_DIR}/custom_nodes_bundle_${tag}_${pins}_*.tgz"
   local tgz=""
 
-  tgz="$(hf_fetch_latest_custom_nodes_bundle "$tag" "$pins" | tail -n1)"
-
+  if tgz="$(hf_fetch_latest_custom_nodes_bundle "$tag" "$pins")"; then
+    echo "[custom-nodes] Fetched latest custom node bundle ($tgz) from HF"
+  else
+    tgz=""
+  fi
   if [[ -n "$tgz" && -f "$tgz" ]]; then
-    echo "[custom-nodes] Using HF bundle: $(basename "$tgz")"
+    echo "[custom-nodes] Extracting HF bundle ($(basename "$tgz")) to restore custom nodes."
     rm -rf "$CUSTOM_DIR"
     mkdir -p "$(dirname "$CUSTOM_DIR")"
     tar -xzf "$tgz" -C "$(dirname "$CUSTOM_DIR")"
-    echo "[custom-nodes] Restored custom nodes from HF bundle."
+    echo "[custom-nodes] Extracted custom nodes from HF bundle."
     install_custom_nodes_requirements "$tag" || true
     push_bundle_if_requested || true
     push_pip_cache_if_requested || true
