@@ -430,6 +430,63 @@ hf_push_files() {
   rm -rf "$tmp"
 }
 
+hf_fetch_compatible_sage_bundle() {
+  local key="${1:?SAGE_KEY}"
+  local repo_url tmp cuda_tag
+
+  repo_url="$(hf_remote_url 2>/dev/null || true)"
+  if [[ -z "$repo_url" ]]; then
+    echo "[sage-bundle] No HF repo URL; cannot search for compatible Sage bundles." >&2
+    return 1
+  fi
+
+  # Extract cuXXX_sm_YY part from our key (if present)
+  cuda_tag="$(printf '%s\n' "$key" | sed -E 's/.*_(cu[0-9]+_sm_[0-9]+)$/\1/' || true)"
+  if [[ -z "$cuda_tag" ]]; then
+    echo "[sage-bundle] Cannot derive CUDA/arch suffix from key=${key}; skipping compatible search." >&2
+    return 1
+  fi
+
+  tmp="${CACHE_DIR}/.hf_sage_compat.$$"
+  git lfs install >/dev/null 2>&1
+  if ! git clone --depth=1 "$repo_url" "$tmp" >/dev/null 2>&1; then
+    echo "[sage-bundle] ❌ Could not clone HF repo for compat lookup." >&2
+    rm -rf "$tmp"
+    return 1
+  fi
+
+  local f base k compat_list
+  compat_list=()
+
+  if compgen -G "$tmp/bundles/torch_sage_bundle_*.tgz" >/dev/null 2>&1; then
+    for f in "$tmp"/bundles/torch_sage_bundle_*.tgz; do
+      [[ -e "$f" ]] || continue
+      base="$(basename "$f" .tgz)"
+      k="${base#torch_sage_bundle_}"
+      [[ "$k" == *"${cuda_tag}" ]] || continue
+      compat_list+=("$k")
+    done
+  fi
+
+  if (( ${#compat_list[@]} == 0 )); then
+    echo "[sage-bundle] No compatible Sage bundles found for CUDA/arch=${cuda_tag}." >&2
+    rm -rf "$tmp"
+    return 1
+  fi
+
+  # Choose latest (lexicographically max) compatible key
+  IFS=$'\n' compat_list_sorted=($(printf '%s\n' "${compat_list[@]}" | sort))
+  unset IFS
+  local best_key="${compat_list_sorted[-1]}"
+  local best_file="torch_sage_bundle_${best_key}.tgz"
+  echo "[sage-bundle] Reusing compatible Sage bundle: ${best_file}" >&2
+
+  mkdir -p "$CACHE_DIR"
+  cp "$tmp/bundles/$best_file" "$CACHE_DIR/"
+  rm -rf "$tmp"
+  echo "${CACHE_DIR}/${best_file}"
+}
+
 #---------------------------------------------------------------
 #
 #
@@ -711,49 +768,18 @@ PY
 # Fetch latest nightly version for the selected CUDA stream (e.g. 2.10.0.dev20251112)
 # Uses the torch sub-index: .../whl/nightly/<cuda>/torch/
 get_latest_torch_nightly_ver() {
-  local cuda="${TORCH_CUDA:-cu128}"
-  local py_abi
+  local url="https://download.pytorch.org/whl/nightly/${TORCH_CUDA}/torch/"
+  local py_abi="cp$(python3 -c 'import sys; print(f"{sys.version_info.major}{sys.version_info.minor}")')"
 
-  # Figure out our ABI tag (cp312, etc.) using your venv Python
-  py_abi="$("$PY" - << 'PY'
-import sys
-print(f"cp{sys.version_info.major}{sys.version_info.minor}")
-PY
-  )" || py_abi="cp312"
-
-  local url="https://download.pytorch.org/whl/nightly/${cuda}/torch/"
-  echo "[torch] [nightly] Probing index: ${url} (ABI=${py_abi})" >&2
-
-  local html ver
-  html="$(curl -fsSL "$url" 2>/dev/null || true)"
-
-  if [[ -z "$html" ]]; then
-    echo "[torch] [nightly] ERROR: could not fetch index HTML for ${url}; falling back to TORCH_STABLE_VER=${TORCH_STABLE_VER}" >&2
-    echo "${TORCH_STABLE_VER}"
-    return 0
-  fi
-
-  # Example line:
-  #   torch-2.10.0.dev20250915+cu128-cp312-cp312-manylinux_2_28_x86_64.whl
-  #
-  # Strategy:
-  #   - match dev builds for *this* CUDA stream
-  #   - make sure the line also mentions our ABI (cp312)
-  #   - strip down to just "2.10.0.devYYYYMMDD"
+  local ver
   ver="$(
-    printf '%s\n' "$html" \
-      | grep -oE "torch-[0-9]+\.[0-9]+\.[0-9]+\.dev[0-9]{8}\+${cuda}[^\"< ]*${py_abi}[^\"< ]*" \
-      | sed -E 's/^torch-([0-9]+\.[0-9]+\.[0-9]+\.dev[0-9]{8}).*$/\1/' \
+    curl -fsSL "$url" \
+      | grep -oE "torch-[0-9]+\.[0-9]+\.[0-9]+\.dev[0-9]{8}\+${TORCH_CUDA}-${py_abi}-${py_abi}" \
+      | sed -E "s/^torch-([0-9]+\.[0-9]+\.[0-9]+\.dev[0-9]{8})\+${TORCH_CUDA}.*/\1/" \
       | sort -V | tail -1
-  )"
+  )" || true
 
-  if [[ -n "$ver" ]]; then
-    echo "[torch] [nightly] Latest nightly from index: ${ver} (+${cuda}, ${py_abi})" >&2
-    echo "$ver"
-  else
-    echo "[torch] [nightly] WARNING: no dev build found for CUDA=${cuda}, ABI=${py_abi}; falling back to TORCH_STABLE_VER=${TORCH_STABLE_VER}" >&2
-    echo "${TORCH_STABLE_VER}"
-  fi
+  [[ -n "$ver" ]] && echo "$ver" || echo ""
 }
 
 get_latest_torch_stable_ver() {
@@ -773,26 +799,32 @@ PY
     | sort -V | tail -1
 }
 
+compute_effective_from_nightly() {
+  # $1: nightly ver like 2.10.0.dev20251113
+  local nightly="$1"
+  local base="${nightly%%.dev*}"    # 2.10.0
+
+  case "${TORCH_CHANNEL:-nightly}" in
+    weekly)
+      # Weekly tag: e.g. 2025w46 (UTC week)
+      local week_tag
+      week_tag="$(date -u +%Yw%V)"
+      echo "${base}.dev${week_tag}"
+      ;;
+    *)
+      # nightly (or anything else) → keep exact nightly
+      echo "${nightly}"
+      ;;
+  esac
+}
+
 # Return 0 if a stable torch wheel for this CUDA stream seems present on the PyTorch index.
 # Uses the torch sub-index: .../whl/<cuda>/torch/
 stable_torch_available() {
-  local cuda="${TORCH_CUDA:-cu128}"
-  local url="https://download.pytorch.org/whl/${cuda}/torch/"
-  local py_abi
-
-  # Determine our ABI (cp312 etc.) so we're not fooled by other ABIs.
-  py_abi="$("$PY" - << 'PY'
-import sys
-print(f"cp{sys.version_info.major}{sys.version_info.minor}")
-PY
-  )" || py_abi="cp312"
-
-  echo "[torch] [stable] Probing index: ${url} (ABI=${py_abi}, ver=${TORCH_STABLE_VER})" >&2
-
-  # Example we want to match in the HTML:
-  #   torch-2.10.0+cu128-cp312-cp312-manylinux_2_28_x86_64.whl
-  curl -fsSL "$url" 2>/dev/null \
-    | grep -q "torch-${TORCH_STABLE_VER}+${cuda}.*${py_abi}"
+  local url="https://download.pytorch.org/whl/${TORCH_CUDA}/torch/"
+  local py_abi="cp$(python3 -c 'import sys; print(f"{sys.version_info.major}{sys.version_info.minor}")')"
+  curl -fsSL "$url" \
+    | grep -q "torch-${TORCH_STABLE_VER}\+${TORCH_CUDA}-${py_abi}-${py_abi}"
 }
 
 # Decide which Torch channel to use and record *how* we got there.
@@ -807,194 +839,199 @@ PY
 #   get_latest_torch_nightly_ver
 #
 # Sets:
-#   TORCH_CHANNEL              ("stable"|"nightly")
+#   TORCH_CHANNEL              ("stable"|"weekly"|"nightly")
 #   TORCH_CHANNEL_EFFECTIVE    (same as above)
 #   TORCH_CHANNEL_SOURCE       ("user"|"auto")
 #   TORCH_VERSION_EFFECTIVE    (the actual version string we’ll install)
 auto_channel_detect() {
+  # User explicitly set channel: respect it.
   if [[ -n "${TORCH_CHANNEL:-}" ]]; then
     echo "[torch] Channel preset via env: ${TORCH_CHANNEL}"
-    if [[ "$TORCH_CHANNEL" == "nightly" && -z "${TORCH_NIGHTLY_VER:-}" ]]; then
-      export TORCH_NIGHTLY_VER="$(get_latest_torch_nightly_ver)"
-      if [[ "$TORCH_NIGHTLY_VER" == *".dev"* ]]; then
-        echo "[torch] [user] Using latest nightly: ${TORCH_NIGHTLY_VER} (+${TORCH_CUDA})"
-      else
-        echo "[torch] [nightly] WARNING: resolved '${TORCH_NIGHTLY_VER}', which looks non-nightly; treating as effective Torch version." >&2
-      fi
-    fi
+
+    case "${TORCH_CHANNEL}" in
+      nightly|weekly)
+        # Need a nightly baseline to know what to install.
+        if [[ -z "${TORCH_NIGHTLY_VER:-}" ]]; then
+          echo "[torch] [${TORCH_CHANNEL}] Probing index: https://download.pytorch.org/whl/nightly/${TORCH_CUDA}/torch/ (ABI=$(python3 - <<'PY'
+import sys; print(f"cp{sys.version_info.major}{sys.version_info.minor}")
+PY
+))"
+          local nv
+          nv="$(get_latest_torch_nightly_ver)"
+          if [[ -z "$nv" ]]; then
+            echo "[torch] [${TORCH_CHANNEL}] WARNING: could not determine latest nightly from index."
+            echo "[torch] [${TORCH_CHANNEL}] Falling back to TORCH_STABLE_VER=${TORCH_STABLE_VER}"
+            export TORCH_NIGHTLY_VER="${TORCH_STABLE_VER}"
+          else
+            export TORCH_NIGHTLY_VER="$nv"
+            echo "[torch] [${TORCH_CHANNEL}] Latest nightly from index: ${TORCH_NIGHTLY_VER} (+${TORCH_CUDA})"
+          fi
+        fi
+        # TORCH_VERSION_EFFECTIVE is what drives bundle keys.
+        export TORCH_VERSION_EFFECTIVE="$(compute_effective_from_nightly "${TORCH_NIGHTLY_VER}")"
+        echo "[torch] [user] Using ${TORCH_CHANNEL} effective version: ${TORCH_VERSION_EFFECTIVE} (+${TORCH_CUDA})"
+        ;;
+      stable)
+        # Stable: TORCH_VERSION_EFFECTIVE is just the stable tag
+        export TORCH_VERSION_EFFECTIVE="${TORCH_STABLE_VER}"
+        echo "[torch] [user] Using stable: ${TORCH_VERSION_EFFECTIVE} (+${TORCH_CUDA})"
+        ;;
+      *)
+        echo "[torch] Unknown TORCH_CHANNEL=${TORCH_CHANNEL}, defaulting to nightly-like behavior."
+        export TORCH_CHANNEL="nightly"
+        auto_channel_detect
+        ;;
+    esac
     return 0
   fi
 
-  echo "[torch] Auto-detecting channel for CUDA=${TORCH_CUDA}, stable=${TORCH_STABLE_VER}…" >&2
+  # Auto mode: prefer stable if visible; otherwise nightly
+  echo "[torch] Auto-detecting channel for CUDA=${TORCH_CUDA}, stable=${TORCH_STABLE_VER}…"
   if stable_torch_available; then
     export TORCH_CHANNEL="stable"
+    export TORCH_VERSION_EFFECTIVE="${TORCH_STABLE_VER}"
     echo "[torch] ✅ Stable is available on index — selecting stable"
   else
     export TORCH_CHANNEL="nightly"
-    export TORCH_NIGHTLY_VER="$(get_latest_torch_nightly_ver)"
-    echo "[torch] ⚠️ Stable wheel not found on index — selecting nightly ${TORCH_NIGHTLY_VER}"
+    echo "[torch] ⚠️ Stable wheel not found on index — selecting nightly"
+    local nv
+    nv="$(get_latest_torch_nightly_ver)"
+    if [[ -z "$nv" ]]; then
+      echo "[torch] [nightly] WARNING: could not determine latest nightly from index."
+      echo "[torch] [nightly] Falling back to TORCH_STABLE_VER=${TORCH_STABLE_VER}"
+      export TORCH_NIGHTLY_VER="${TORCH_STABLE_VER}"
+      export TORCH_VERSION_EFFECTIVE="${TORCH_STABLE_VER}"
+    else
+      export TORCH_NIGHTLY_VER="$nv"
+      export TORCH_VERSION_EFFECTIVE="$(compute_effective_from_nightly "${TORCH_NIGHTLY_VER}")"
+      echo "[torch] [nightly] Latest nightly from index: ${TORCH_NIGHTLY_VER} (+${TORCH_CUDA}), effective=${TORCH_VERSION_EFFECTIVE}"
+    fi
   fi
 }
 
 print_bundle_matrix() {
-  local key channel channel_src channel_label
-  local cache="${CACHE_DIR:-/workspace/ComfyUI/cache}"
+  local chan="${TORCH_CHANNEL:-auto}"
+  local chan_src="auto"
+  [[ -n "${TORCH_CHANNEL:-}" ]] && chan_src="user"
 
-  key="$(torch_sage_key)"
-
-  # Channel + provenance (auto vs user)
-  if [[ -n "${TORCH_CHANNEL:-}" ]]; then
-    channel="${TORCH_CHANNEL}"
-    channel_src="user"
-  else
-    channel="auto"
-    channel_src="auto"
+  # Current torch+smi combo → Sage key
+  local torch_key
+  if ! torch_key="$(torch_sage_key 2>/dev/null)"; then
+    torch_key="unknown"
   fi
 
-  printf "Torch Channel: %s (%s)\n" "$channel" "$channel_src"
-  printf "Torch Key:     %s\n" "$key"
+  echo "Torch Channel: ${chan} (${chan_src})"
+  echo "Torch Key:    ${torch_key}"
 
-  # Parse the current key into ABI / VER / CU / ARCH
-  local cur_abi cur_ver cur_cu cur_arch tmp1 tmp2
-  IFS=_ read -r cur_abi cur_ver cur_cu tmp1 tmp2 <<< "$key"
-  cur_arch="${tmp1}_${tmp2}"
-
-  # HF repo scan
-  local tmp_repo="${cache}/.hf_scan.$$"
-  git lfs install >/dev/null 2>&1 || true
-
-  if ! git clone --depth=1 "$(hf_remote_url)" "$tmp_repo" >/dev/null 2>&1; then
-    echo "Sage bundles: (unable to scan HF repo)"
-    echo "Custom Node bundles: (unable to scan HF repo)"
-    echo "Sage Path: Build from source (repo not accessible)"
-    echo "Custom Node Path: Install via git clone (per-node)"
-    rm -rf "$tmp_repo" 2>/dev/null || true
-    return 0
+  # Derive CUDA+arch suffix for "compatible" bundles: cuXXX_sm_YY
+  local cuda_tag=""
+  if [[ "$torch_key" == pycp* ]]; then
+    # extract "cu128_sm_89" from pycp312_torch…_cu128_sm_89
+    cuda_tag="$(printf '%s\n' "$torch_key" | sed -E 's/.*_(cu[0-9]+_sm_[0-9]+)$/\1/' || true)"
   fi
 
-  # -------------------------
-  # Scan Sage bundles
-  # -------------------------
-  local sage_total=0
-  local sage_compat=0
-  local sage_list=""
-  local sage_have_current=0
-  local sage_have_compat_remote=0
-  local sage_have_compat_cache=0
+  # Clone HF repo (read-only) to inspect bundles
+  local repo_url tmp
+  repo_url="$(hf_remote_url 2>/dev/null || true)"
 
-  local f k abi ver cu a1 a2 arch ver_core kind mark
+  local total_sage=0 compat_sage=0 exact_match=0
+  local sage_lines=()
+  local total_cn=0 compat_cn=0
+  local cn_lines=()
 
-  # Cache path for the exact current key
-  local cache_sage="${cache}/torch_sage_bundle_${key}.tgz"
-  if [[ -f "$cache_sage" ]]; then
-    sage_have_compat_cache=1
+  if [[ -n "$repo_url" ]]; then
+    tmp="${CACHE_DIR:-/workspace/ComfyUI/cache}/.hf_matrix.$$"
+    if git clone --depth=1 "$repo_url" "$tmp" >/dev/null 2>&1; then
+      # ---- Sage bundles ----
+      if compgen -G "$tmp/bundles/torch_sage_bundle_*.tgz" >/dev/null 2>&1; then
+        local f base key_part ver label
+        for f in "$tmp"/bundles/torch_sage_bundle_*.tgz; do
+          [[ -e "$f" ]] || continue
+          ((total_sage++))
+          base="$(basename "$f" .tgz)"
+          key_part="${base#torch_sage_bundle_}"
+
+          # Extract the torch version segment between "torch" and "_cu"
+          ver="$(printf '%s\n' "$key_part" \
+                | sed -E 's/^pycp[0-9]+_torch([^_]+)_cu[0-9]+_sm_.+$/\1/' || true)"
+          label="Stable"
+          [[ "$ver" == *dev* ]] && label="Nightly"
+
+          local compat="no"
+          if [[ -n "$cuda_tag" && "$key_part" == *"${cuda_tag}" ]]; then
+            compat="yes"
+            ((compat_sage++))
+          fi
+
+          local mark=""
+          if [[ "$key_part" == "$torch_key" ]]; then
+            exact_match=1
+            mark=" (Selected)"
+          fi
+
+          # Only list compatible ones in the detail section
+          if [[ "$compat" == "yes" ]]; then
+            sage_lines+=("  (${label}) ${key_part}${mark}")
+          fi
+        done
+      fi
+
+      # ---- Custom node bundles ----
+      if compgen -G "$tmp/bundles/custom_nodes_bundle_*.tgz" >/dev/null 2>&1; then
+        local g gbase gtag
+        for g in "$tmp"/bundles/custom_nodes_bundle_*.tgz; do
+          [[ -e "$g" ]] || continue
+          ((total_cn++))
+          gbase="$(basename "$g" .tgz)"
+          gtag="${gbase#custom_nodes_bundle_}"
+          if [[ -n "${BUNDLE_TAG:-}" && "$gtag" == "$BUNDLE_TAG"* ]]; then
+            ((compat_cn++))
+            cn_lines+=("  ${gtag}")
+          fi
+        done
+      fi
+
+      rm -rf "$tmp"
+    fi
   fi
 
-  shopt -s nullglob
-  for f in "${tmp_repo}/bundles"/torch_sage_bundle_*.tgz; do
-    [[ -e "$f" ]] || break
-    ((sage_total++))
-    local fname="${f##*/}"
-    k="${fname#torch_sage_bundle_}"
-    k="${k%.tgz}"
-
-    # Parse into ABI / VER / CU / ARCH to check compatibility
-    IFS=_ read -r abi ver cu a1 a2 <<< "$k"
-    arch="${a1}_${a2}"
-
-    local compat=0
-    if [[ "$abi" == "$cur_abi" && "$cu" == "$cur_cu" && "$arch" == "$cur_arch" ]]; then
-      compat=1
-      ((sage_compat++))
-      sage_have_compat_remote=1
-    fi
-    if [[ "$k" == "$key" ]]; then
-      sage_have_current=1
-    fi
-
-    # Classify type by version string
-    ver_core="${ver#torch}"  # e.g. 2.10.0.dev20251110 or 2.10.0.dev2025w46
-    if [[ "$ver_core" == *w[0-9]* ]]; then
-      kind="Weekly"
-    elif [[ "$ver_core" == *dev* ]]; then
-      kind="Nightly"
-    else
-      kind="Stable"
-    fi
-
-    # Mark current key
-    mark=""
-    if [[ "$k" == "$key" ]]; then
-      mark=" (Selected)"
-    elif [[ "$compat" -eq 1 ]]; then
-      mark=" (Compat)"
-    fi
-
-    sage_list+=$(printf "  (%-7s) %s%s\n" "$kind" "$k" "$mark")
-  done
-  shopt -u nullglob
-
-  printf "Sage bundles: %d (total), %d (Compatible)\n" "$sage_total" "$sage_compat"
-  if [[ -n "$sage_list" ]]; then
-    printf "%s\n" "$sage_list"
-  fi
-
-  # Decide Sage Path
+  # ---- Compute Sage Path description ----
   local sage_path
-  if [[ "$sage_have_current" -eq 1 || "$sage_have_compat_cache" -eq 1 || "$sage_have_compat_remote" -eq 1 ]]; then
-    sage_path="Pull from HF (bundle restore available)"
-  else
-    sage_path="Build from source"
-  fi
-
-  # -------------------------
-  # Scan Custom Node bundles
-  # -------------------------
-  local cn_total=0
-  local cn_compat=0
-  local cn_list=""
-
-  local tag="${BUNDLE_TAG:-unknown}"
-  local pins=""
-  if type -t pins_signature >/dev/null 2>&1; then
-    pins="$(pins_signature)"
-  fi
-
-  shopt -s nullglob
-  for f in "${tmp_repo}/bundles"/custom_nodes_bundle_*.tgz; do
-    [[ -e "$f" ]] || break
-    ((cn_total++))
-    local fname="${f##*/}"
-    local base="${fname%.tgz}"
-
-    # Compatibility: filename contains "<tag>_<pins>"
-    local compat=0
-    if [[ -n "$tag" && -n "$pins" && "$base" == *"${tag}_${pins}"* ]]; then
-      compat=1
-      ((cn_compat++))
-      cn_list+=$(printf "  %s (Selected)\n" "$tag")
+  if (( exact_match == 1 )); then
+    sage_path="Pull from HF (bundle restore — exact key match)"
+  elif (( compat_sage > 0 )); then
+    if [[ -n "$cuda_tag" ]]; then
+      sage_path="Build from source (no exact bundle; ${compat_sage} compatible for ${cuda_tag})"
     else
-      cn_list+=$(printf "  %s\n" "$base")
+      sage_path="Build from source (no exact bundle; ${compat_sage} compatible by CUDA/arch)"
     fi
-  done
-  shopt -u nullglob
+  else
+    sage_path="Build from source (no compatible Sage bundles yet)"
+  fi
 
-  printf "Custom Node Tag:   %s\n" "$tag"
-  printf "Pins:              %s\n" "${pins:-<none>}"
-  printf "Custom Node bundles: %d (total), %d (Compatible)\n" "$cn_total" "$cn_compat"
-  [[ -n "$cn_list" ]] && printf "%s\n" "$cn_list"
-
+  # ---- Custom-node path description ----
   local cn_path
-  if [[ "$cn_compat" -gt 0 ]]; then
+  if (( compat_cn > 0 )); then
     cn_path="Pull from HF (bundle restore)"
   else
-    cn_path="Install via git clone (per-node)"
+    cn_path="Build from source (no matching custom-node bundle)"
   fi
 
-  printf "Sage Path:         %s\n" "$sage_path"
-  printf "Custom Node Path:  %s\n" "$cn_path"
+  # ---- Print Sage bundle summary ----
+  echo "Sage bundles: ${total_sage} (total), ${compat_sage} (compatible)"
+  if (( compat_sage > 0 )); then
+    printf '%s\n' "${sage_lines[@]}"
+  fi
+  echo "Sage Path: ${sage_path}"
+  echo ""
 
-  rm -rf "$tmp_repo" 2>/dev/null || true
+  # ---- Print Custom-node bundle summary ----
+  echo "Custom Node bundles: ${total_cn} (total), ${compat_cn} (compatible)"
+  if (( compat_cn > 0 )); then
+    printf '%s\n' "${cn_lines[@]}"
+  fi
+  echo "Custom Node Path: ${cn_path}"
+  echo ""
 }
 
 install_torch() {
@@ -1049,21 +1086,15 @@ import sys, os, torch
 
 abi = f"cp{sys.version_info.major}{sys.version_info.minor}"
 
-channel     = (os.environ.get("TORCH_CHANNEL") or "").strip().lower()
-stable_ver  = (os.environ.get("TORCH_STABLE_VER") or "").strip()
-nightly_ver = (os.environ.get("TORCH_NIGHTLY_VER") or "").strip()
+# Prefer an "effective" version (for weekly/stable aliasing),
+# fall back to the actual torch.__version__ if not set.
+eff = os.environ.get("TORCH_VERSION_EFFECTIVE", "").strip()
+if not eff:
+    eff = torch.__version__
 
-if channel == "stable" and stable_ver:
-    base_ver = stable_ver
-elif channel == "nightly" and nightly_ver:
-    base_ver = nightly_ver
-else:
-    # Fall back to the *actual* installed torch version (minus the "+cu128" suffix)
-    base_ver = torch.__version__.split("+", 1)[0]
+base_ver = eff.split('+', 1)[0].replace('+', '_')
 
-base_ver = base_ver.replace("+", "_")
-
-cu_raw = (torch.version.cuda or "").replace(".", "")
+cu_raw = (torch.version.cuda or "").replace('.', '')
 cu = f"cu{cu_raw}" if cu_raw else "cu_unknown"
 
 arch = (os.environ.get("GPU_ARCH") or "").strip().lower()
@@ -1226,17 +1257,17 @@ hf_fetch_sage_bundle() {
     --config http.lowSpeedLimit=1000 \
     --config http.lowSpeedTime=90 \
     "$(hf_remote_url)" "$tmp" >/dev/null 2>&1 || {
-      echo "[sage-bundle] ❌ Could not clone HF repo" >&2
+      echo "[sage-bundle] ❌ Could not clone HF repo." >&2
       rm -rf "$tmp"
       return 1
     }
   local patt="torch_sage_bundle_${key}.tgz"
   [[ -f "$tmp/bundles/$patt" ]] || {
-    echo "[sage-bundle] ❌ Bundle ($patt) not available in HF repo." >&2
-    rm -rf "$tmp"
-    return 1
-  }
-  echo "[sage-bundle] ✅ found bundle $patt" >&2
+      echo "[sage-bundle] ❌ Bundle (${patt}) not available in HF repo." >&2
+      rm -rf "$tmp"
+      return 1
+    }
+  echo "[sage-bundle] ✅ Retrieved bundle $patt from HF" >&2
   mkdir -p "$CACHE_DIR"
   cp "$tmp/bundles/$patt" "$CACHE_DIR/"
   rm -rf "$tmp"
@@ -1276,40 +1307,41 @@ PY
 }
 
 ensure_sage_from_bundle_or_build() {
-  local key tarpath out
+  local key tarpath
   key="$(torch_sage_key)"
 
   echo "[sage-bundle] Looking for Sage bundle key=${key}…" >&2
 
-  # If the user wants a fresh build, skip bundle restore entirely
+  # If the user wants a fresh build, skip bundle lookup entirely
   if [[ "${SAGE_FORCE_REBUILD:-0}" == "1" ]]; then
     echo "[sage-bundle] SAGE_FORCE_REBUILD=1 — skipping bundle restore and rebuilding from source." >&2
   else
     local pattern="${CACHE_DIR}/torch_sage_bundle_${key}.tgz"
+
     if [[ -f "$pattern" ]]; then
-      echo "[sage-bundle] Tar exists in cache directory. Proceeding."
       tarpath="$pattern"
+      echo "[sage-bundle] Found local Sage bundle in cache: $(basename "$tarpath")" >&2
     else
-      # Call hf_fetch_sage_bundle and store *all* stdout safely
-      echo "[sage-bundle] Attempting to acquire sage bundle with key ($key) from Huggingface."
-      if out="$(hf_fetch_sage_bundle "$key")"; then
-        # Last non-empty line = path returned by the function
-        tarpath="$(printf "%s\n" "$out" | { 
-          local last="" line
-          while IFS= read -r line; do
-            [[ -n "$line" ]] && last="$line"
-          done
-          printf "%s" "$last"
-        })"
+      # Exact bundle from HF?
+      if tarpath="$(hf_fetch_sage_bundle "$key" 2>/dev/null)"; then
+        :
       else
         tarpath=""
+      fi
+
+      # If still nothing, optionally reuse a compatible bundle (same cuXXX_sm_YY)
+      if [[ -z "$tarpath" && "${SAGE_ALLOW_COMPAT_REUSE:-0}" == "1" ]]; then
+        if tarpath="$(hf_fetch_compatible_sage_bundle "$key" 2>/dev/null)"; then
+          :
+        else
+          tarpath=""
+        fi
       fi
     fi
   fi
 
-  # If tarpath is valid, restore from bundle
   if [[ -n "${tarpath:-}" && -f "$tarpath" ]]; then
-    echo "[sage-bundle] Attempting to restore Sage bundle: $(basename "$tarpath")" >&2
+    echo "[sage-bundle] Using Sage bundle: $(basename "$tarpath")" >&2
     SAGE_TARPATH="$tarpath" restore_sage_from_tar
     return 0
   fi
