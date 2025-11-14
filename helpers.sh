@@ -331,7 +331,8 @@ rewrite_custom_nodes_requirements() {
     return 1
   fi
 
-  cp "$in" "$out"
+  rm -f "$out"
+  \cp "$in" "$out"
 
   # Walk all env vars prefixed with CUSTOM_NODES_REQ_REWRITE_
   local var spec pkg repl
@@ -1495,6 +1496,7 @@ ensure_pip_cache_for_custom_nodes() {
   # If cache is empty, try to hydrate it from HF
   if [[ -z "$(ls -A "$cache" 2>/dev/null)" ]]; then
     local tgz
+    echo "[pip-cache] Attempting to retrieve from HF, compatible cache for key: $key..." >&2
     tgz="$(hf_fetch_pip_cache "$key")"
     if [[ -n "$tgz" && -f "$tgz" ]]; then
       echo "[pip-cache] Restoring pip cache from $(basename "$tgz")..." >&2

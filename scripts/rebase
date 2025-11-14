@@ -1,7 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="/workspace/$(basename `git rev-parse --show-toplevel`)"
+# Resolve this script's path (works even if called via symlink or from another dir)
+SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
+if [[ -L "$SCRIPT_PATH" ]]; then
+  SCRIPT_PATH="$(readlink -f "$SCRIPT_PATH")"
+fi
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+
+# Repo root is the parent of scripts/
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+export REPO_ROOT
 
 source_if_exists() {
   local f="$1"
@@ -11,12 +20,12 @@ source_if_exists() {
   source "$f"
 }
 
-if [[ ! -d "${REPO}/.git" ]]; then
-  echo "[rebase] No git repo at ${REPO}"
+if [[ ! -d "${REPO_ROOT}/.git" ]]; then
+  echo "[rebase] No git repo at ${REPO_ROOT}"
   exit 1
 fi
 
-cd "${REPO}"
+cd "${REPO_ROOT}"
 
 branch="$(git rev-parse --abbrev-ref HEAD || echo main)"
 echo "[rebase] Updating branch ${branch}…"
@@ -28,8 +37,8 @@ if ! git pull --rebase --autostash; then
 fi
 
 # Reload env and helpers
-source_if_exists "${REPO}/.env"
-source_if_exists "${REPO}/helpers.sh"
+source_if_exists "${REPO_ROOT}/.env"
+source_if_exists "${REPO_ROOT}/helpers.sh"
 
 type -t show_env            >/dev/null 2>&1 && show_env             || true
 

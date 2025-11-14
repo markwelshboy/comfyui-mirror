@@ -1,7 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="/workspace/$(basename `git rev-parse --show-toplevel`)"
+# Resolve this script's path (works even if called via symlink or from another dir)
+SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
+if [[ -L "$SCRIPT_PATH" ]]; then
+  SCRIPT_PATH="$(readlink -f "$SCRIPT_PATH")"
+fi
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+
+# Repo root is the parent of scripts/
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+export REPO_ROOT
 
 source_if_exists() {
   local f="$1"
@@ -13,8 +22,8 @@ source_if_exists() {
 
 # Provider/session env + project env + helpers
 source_if_exists "/root/.secrets/env.current"
-source_if_exists "${REPO}/.env"
-source_if_exists "${REPO}/helpers.sh"
+source_if_exists "${REPO_ROOT}/.env"
+source_if_exists "${REPO_ROOT}/helpers.sh"
 
 # Optional: auto summaries/details if functions exist
 type -t show_env            >/dev/null 2>&1 && show_env             || true
