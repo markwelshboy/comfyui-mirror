@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="/workspace/comfyui-mirror"
+REPO="/workspace/$(basename `git rev-parse --show-toplevel`)"
 
 source_if_exists() {
   local f="$1"

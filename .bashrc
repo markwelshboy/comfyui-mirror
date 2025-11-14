@@ -102,8 +102,8 @@ if type -t load_runtime_env >/dev/null 2>&1; then
   load_runtime_env 2>/dev/null || true
 fi
 
-# Make sure /workspace is on PATH for mirror/rebase helpers etc.
+# Make sure /workspace etc. is on PATH for mirror/rebase helpers etc.
 case ":$PATH:" in
   *:/workspace:*) ;;
-  *) export PATH="/workspace:$PATH" ;;
+  *) export PATH="/workspace:/workspace/comfyui-mirror:/workspace/comfyui-mirror/scripts:$PATH" ;;
 esac

@@ -29,7 +29,7 @@ shopt -s extglob
 # Required (python):
 #   PY, PIP              - venv python/pip
 # Optional (misc tooling):
-#   REPO_URL             - ComfyUI repo URL (default comfyanonymous/ComfyUI)
+#   COMFY_REPO_URL       - ComfyUI repo URL (default comfyanonymous/ComfyUI)
 #   GIT_DEPTH            - default 1
 #   MAX_NODE_JOBS        - default 6..8
 # Hugging Face:
@@ -43,7 +43,7 @@ shopt -s extglob
 #   PINS                 - computed by pins_signature() if not set
 
 # Provide reasonable fallbacks if .env forgot any
-: "${REPO_URL:=https://github.com/comfyanonymous/ComfyUI}"
+: "${COMFY_REPO_URL:=https://github.com/comfyanonymous/ComfyUI}"
 : "${GIT_DEPTH:=1}"
 : "${MAX_NODE_JOBS:=8}"
 : "${HF_API_BASE:=https://huggingface.co}"
@@ -172,7 +172,7 @@ ensure_comfy() {
       || git -C "$COMFY_HOME" reset --hard origin/main 2>/dev/null || true
   else
     rm -rf "$COMFY_HOME"
-    git clone --depth=1 "$REPO_URL" "$COMFY_HOME"
+    git clone --depth=1 "$COMFY_REPO_URL" "$COMFY_HOME"
   fi
 
   "$PIP_BIN" install -U pip wheel setuptools
@@ -180,7 +180,7 @@ ensure_comfy() {
   ln -sfn "$COMFY_HOME" /ComfyUI
 }
 # ======================================================================
-# Custom node installation (parallel)
+# Custom node installation (parallel + cache)
 # ======================================================================
 
 # pins_signature: Build an identifier from numpy/cupy/opencv versions
@@ -209,6 +209,22 @@ print(f"np{norm(np)}_cupy{norm(cp)}_cv{norm(cv)}")
 PY
 }
 
+# python_abi_tag: returns e.g. "312" for CPython 3.12
+python_abi_tag() {
+  "$PY" - << 'PY'
+import sys
+print(f"{sys.version_info.major}{sys.version_info.minor}")
+PY
+}
+
+# pip_cache_key: combine ABI + pins_signature
+pip_cache_key() {
+  local abi sig
+  abi="$(python_abi_tag)"
+  sig="$(pins_signature)"
+  echo "py${abi}_${sig}"
+}
+
 # bundle_ts: Sorting-friendly timestamp
 bundle_ts() { date +%Y%m%d-%H%M; }
 
@@ -227,12 +243,20 @@ sha_name()        { echo "${1}.sha256"; }
 # repo_dir_name: Stable dir name from repo URL
 repo_dir_name() { basename "${1%.git}"; }
 
-# needs_recursive: mark repos that need --recursive
+# needs_recursive: mark repos that need --recursive based on env config
+# CUSTOM_NODES_RECURSIVE_REPOS is a space-separated list of substrings.
 needs_recursive() {
-  case "$1" in
-    *ComfyUI_UltimateSDUpscale*) echo "true" ;;
-    *) echo "false" ;;
-  esac
+  local repo_name="$1"
+  local patterns="${CUSTOM_NODES_RECURSIVE_REPOS:-}"
+
+  for pat in $patterns; do
+    [[ -n "$pat" && "$repo_name" == *"$pat"* ]] && {
+      echo "true"
+      return 0
+    }
+  done
+
+  echo "false"
 }
 
 # clone_or_pull: shallow clone or fast-forward reset
@@ -292,6 +316,46 @@ resolve_nodes_list() {
   else
     printf '%s\n' "${out[@]}"
   fi
+}
+
+# rewrite_custom_nodes_requirements:
+#   - in:  original consolidated requirements (from HF)
+#   - out: rewritten file we actually feed to pip
+# Uses CUSTOM_NODES_REQ_REWRITE_*="pkg|replacement" from .env.
+rewrite_custom_nodes_requirements() {
+  local in="$1"
+  local out="$2"
+
+  if [[ ! -f "$in" ]]; then
+    echo "[custom-nodes] rewrite_custom_nodes_requirements: input missing: $in" >&2
+    return 1
+  fi
+
+  cp "$in" "$out"
+
+  # Walk all env vars prefixed with CUSTOM_NODES_REQ_REWRITE_
+  local var spec pkg repl
+  for var in ${!CUSTOM_NODES_REQ_REWRITE_@}; do
+    spec="${!var}"
+    [[ -z "$spec" ]] && continue
+
+    IFS='|' read -r pkg repl <<<"$spec"
+    pkg="${pkg// /}"   # strip spaces
+    [[ -z "$pkg" ]] && continue
+
+    # Drop any line whose first token matches pkg
+    sed -i -E "/^${pkg}(\s|$)/d" "$out"
+
+    # If replacement begins with "#", we just drop it and move on
+    if [[ "$repl" == "#"* || -z "$repl" ]]; then
+      echo "[custom-nodes] rewrite: removed '${pkg}' with no replacement (rule: ${var})"
+      continue
+    fi
+
+    # Append replacement line at end
+    echo "$repl" >>"$out"
+    echo "[custom-nodes] rewrite: replaced '${pkg}' -> '${repl}' (rule: ${var})"
+  done
 }
 
 # install_custom_nodes_set: bounded parallel installer (wait -n throttle, no FIFOs)
@@ -1309,6 +1373,105 @@ hf_fetch_sage_bundle() {
   echo "${CACHE_DIR}/${patt}"
 }
 
+# hf_fetch_pip_cache:
+#   Look for pip_cache/pip_cache_${key}.tgz in HF repo, copy into CACHE_DIR, echo local path.
+hf_fetch_pip_cache() {
+  local key="${1:?pip cache key required}"
+  local tmp="${CACHE_DIR:-/workspace/ComfyUI/cache}/.hf_pip.$$"
+  local repo_url
+  repo_url="$(hf_remote_url 2>/dev/null || true)"
+
+  if [[ -z "$repo_url" ]]; then
+    echo "[pip-cache] hf_fetch_pip_cache: no HF repo URL" >&2
+    return 0
+  fi
+
+  git lfs install >/dev/null 2>&1
+  if ! git clone --depth=1 "$repo_url" "$tmp" >/dev/null 2>&1; then
+    echo "[pip-cache] ❌ Could not clone HF repo while looking for pip cache" >&2
+    rm -rf "$tmp"
+    return 0
+  fi
+
+  local rel="pip_cache/pip_cache_${key}.tgz"
+  local src="${tmp}/${rel}"
+
+  if [[ ! -f "$src" ]]; then
+    echo "[pip-cache] No pip cache found for key=${key}" >&2
+    rm -rf "$tmp"
+    return 0
+  fi
+
+  mkdir -p "${CACHE_DIR:-/workspace/ComfyUI/cache}"
+  local dst="${CACHE_DIR}/pip_cache_${key}.tgz"
+  cp "$src" "$dst"
+  rm -rf "$tmp"
+
+  echo "$dst"
+}
+
+# push_pip_cache_if_requested:
+#   If PUSH_PIP_CACHE=1 and PIP_CACHE_DIR is non-empty, tar it and push to HF.
+push_pip_cache_if_requested() {
+  if [[ "${PUSH_PIP_CACHE:-0}" != "1" ]]; then
+    return 0
+  fi
+
+  local cache="${PIP_CACHE_DIR:-}"
+  if [[ -z "$cache" || ! -d "$cache" ]]; then
+    echo "[pip-cache] No PIP_CACHE_DIR set; nothing to push." >&2
+    return 0
+  fi
+
+  if [[ -z "$(ls -A "$cache" 2>/dev/null)" ]]; then
+    echo "[pip-cache] PIP_CACHE_DIR is empty; skipping push." >&2
+    return 0
+  fi
+
+  local key tgz
+  key="$(pip_cache_key)"
+  tgz="${CACHE_DIR:-/workspace/ComfyUI/cache}/pip_cache_${key}.tgz"
+
+  echo "[pip-cache] Creating pip cache archive ${tgz}..."
+  tar -czf "$tgz" -C "$cache" . || {
+    echo "[pip-cache] ❌ Failed to tar pip cache." >&2
+    return 1
+  }
+
+  hf_push_files "pip_cache ${key}" "$tgz"
+  echo "[pip-cache] Uploaded pip_cache_${key}.tgz" >&2
+
+}
+
+# ensure_pip_cache_for_custom_nodes:
+#   If USE_PIP_CACHE_FOR_NODES is set, compute cache dir and restore from HF if present.
+ensure_pip_cache_for_custom_nodes() {
+  if [[ "${USE_PIP_CACHE_FOR_NODES:-0}" != "1" ]]; then
+    return 0
+  fi
+
+  local key cache
+  key="$(pip_cache_key)"
+  cache="${CACHE_DIR:-/workspace/ComfyUI/cache}/pip_custom_${key}"
+
+  mkdir -p "$cache"
+  export PIP_CACHE_DIR="$cache"
+  echo "[pip-cache] Using PIP_CACHE_DIR=${PIP_CACHE_DIR} (custom nodes only)" >&2
+
+  # If cache is empty, try to hydrate it from HF
+  if [[ -z "$(ls -A "$cache" 2>/dev/null)" ]]; then
+    local tgz
+    tgz="$(hf_fetch_pip_cache "$key")"
+    if [[ -n "$tgz" && -f "$tgz" ]]; then
+      echo "[pip-cache] Restoring pip cache from $(basename "$tgz")..." >&2
+      tar -xzf "$tgz" -C "$cache" || {
+        echo "[pip-cache] ⚠️ Failed to extract pip cache archive; continuing without it." >&2
+      }
+      echo "[pip-cache] Restored pip cache from tar file." >&2
+    fi
+  fi
+}
+
 restore_sage_from_tar() {
   local tar="${SAGE_TARPATH:?SAGE_TARPATH not set}"
 
@@ -1459,6 +1622,56 @@ hf_fetch_custom_nodes_requirements_for_tag() {
   echo "$req_dst"
 }
 
+# Install custom-node requirements tied to a bundle tag.
+# Looks for: requirements/consolidated_requirements_${tag}.txt in your HF repo.
+install_custom_nodes_requirements() {
+  local tag="${1:?bundle tag required}"
+
+  local repo_url tmp req_src req_work
+  repo_url="$(hf_remote_url 2>/dev/null || true)"
+
+  if [[ -z "$repo_url" ]]; then
+    echo "[custom-nodes] install_custom_nodes_requirements: hf_remote_url unresolved" >&2
+    return 1
+  fi
+
+  tmp="${CACHE_DIR:-/workspace/ComfyUI/cache}/.hf_reqs.$$"
+  mkdir -p "$tmp"
+
+  echo "[custom-nodes] Fetching requirements for tag=${tag} from HF repo..."
+  if ! git clone --depth=1 "$repo_url" "$tmp" >/dev/null 2>&1; then
+    echo "[custom-nodes] ❌ Could not clone HF repo for requirements" >&2
+    rm -rf "$tmp"
+    return 1
+  fi
+
+  req_src="${tmp}/requirements/consolidated_requirements_${tag}.txt"
+  if [[ ! -f "$req_src" ]]; then
+    echo "[custom-nodes] ⚠️ No consolidated requirements found for tag=${tag} at ${req_src}" >&2
+    rm -rf "$tmp"
+    return 0  # not fatal; we just skip extra reqs
+  fi
+
+  req_work="${CACHE_DIR:-/workspace/ComfyUI/cache}/consolidated_requirements_${tag}.rewritten.txt"
+  rewrite_custom_nodes_requirements "$req_src" "$req_work" || {
+    echo "[custom-nodes] ⚠️ rewrite_custom_nodes_requirements failed; using original file" >&2
+    req_work="$req_src"
+  }
+
+  echo "[custom-nodes] Installing custom-node requirements from ${req_work}..."
+  # Respect your usual "no hashes / no constraints" dance
+  env -u PIP_REQUIRE_HASHES -u PIP_CONSTRAINT \
+    "$PIP" install -r "$req_work" || {
+      echo "[custom-nodes] ⚠️ pip install -r ${req_work} failed; see logs above." >&2
+      # leave temp dir in place for inspection
+      rm -rf "$tmp"
+      return 1
+    }
+
+  rm -rf "$tmp"
+  return 0
+}
+
 # build_custom_nodes_manifest: create JSON manifest of installed nodes
 build_custom_nodes_manifest() {
   local tag="${1:?tag}" out="${2:?out_json}"
@@ -1548,52 +1761,43 @@ install_custom_nodes_bundle() {
   fi
 }
 
-# Install Python deps for a given custom-nodes tag using the HF-consolidated requirements.
-install_custom_nodes_requirements() {
-  local tag="${1:?tag required}"
-  local req_path
-
-  req_path="$(hf_fetch_custom_nodes_requirements_for_tag "$tag")" || {
-    # Not fatal: we can still run with whatever is already in the venv.
-    echo "[custom-nodes] Skipping consolidated requirements install (none found for ${tag})." >&2
-    return 0
-  }
-
-  echo "[custom-nodes] Installing extra Python deps for tag=${tag} from $(basename "$req_path")" >&2
-  # Use your venv pip here; you already export PIP in .env
-  "${PIP:-pip}" install --no-cache-dir -r "$req_path"
-}
-
-# ensure_nodes_from_bundle_or_build:
+# ensure_custom_nodes_from_bundle_or_build:
 #   If HF has a bundle matching CUSTOM_NODES_BUNDLE_TAG + PINS → install it
 #   Else build from NODES and optionally push a fresh bundle
-ensure_nodes_from_bundle_or_build() {
+ensure_custom_nodes_from_bundle_or_build() {
   local tag="${CUSTOM_NODES_BUNDLE_TAG:?CUSTOM_NODES_BUNDLE_TAG required}"
   local pins="${PINS:-$(pins_signature)}"
 
   mkdir -p "$CACHE_DIR" "$CUSTOM_LOG_DIR"
   mkdir -p "$(dirname "$CUSTOM_DIR")"
 
+  # Enable PIP cache for custom-node requirements only
+  ensure_pip_cache_for_custom_nodes
+
   echo "[custom-nodes] PINS = $pins"
   echo "[custom-nodes] Looking for bundle tag=${tag}, pins=${pins}…"
 
+  local pattern="${CACHE_DIR}/custom_nodes_bundle_${tag}_${pins}_*.tgz"
   local tgz=""
-  if ! tgz="$(hf_fetch_latest_custom_nodes_bundle "$tag" "$pins")"; then
-    tgz=""
-  fi
+
+  tgz="$(hf_fetch_latest_custom_nodes_bundle "$tag" "$pins" | tail -n1)"
 
   if [[ -n "$tgz" && -f "$tgz" ]]; then
-    echo "[custom-nodes] Using bundle: $(basename "$tgz")"
+    echo "[custom-nodes] Using HF bundle: $(basename "$tgz")"
     rm -rf "$CUSTOM_DIR"
     mkdir -p "$(dirname "$CUSTOM_DIR")"
     tar -xzf "$tgz" -C "$(dirname "$CUSTOM_DIR")"
-    echo "[custom-nodes] Restored custom nodes from bundle."
+    echo "[custom-nodes] Restored custom nodes from HF bundle."
     install_custom_nodes_requirements "$tag" || true
+    push_bundle_if_requested || true
+    push_pip_cache_if_requested || true
     return 0
   fi
 
-  echo "[custom-nodes] No bundle available — installing from DEFAULT_NODES…"
+  echo "[custom-nodes] No HF bundle available — installing from DEFAULT_NODES…"
   install_custom_nodes_set
+  push_bundle_if_requested || true
+  push_pip_cache_if_requested || true
 }
 
 # push_bundle_if_requested: convenience wrapper (respects CUSTOM_NODES_BUNDLE_TAG/PINS)

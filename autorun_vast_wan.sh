@@ -80,7 +80,7 @@ fi
 source "$ENVIRONMENT"
 
 if [ ! -f "$HELPERS" ]; then
-  echo "[fatal] helpers.sh not found at: $HELPERS"
+  echo "[fatal] Required helpers.sh not found at: $HELPERS"
   exit 1
 fi
 # shellcheck source=/dev/null
@@ -217,10 +217,7 @@ export PINS="$(pins_signature)"
 echo "[custom-nodes] PINS = $PINS"
 
 # 9.2) Prefer HF bundle for (BUNDLE_TAG + PINS); else build from list (CUSTOM_NODE_LIST_FILE → CUSTOM_NODE_LIST → DEFAULT_NODES)
-ensure_nodes_from_bundle_or_build
-
-# 9.3) Optional: push a new bundle if requested (requires HF_* env set)
-push_bundle_if_requested
+ensure_custom_nodes_from_bundle_or_build
 
 # =============================================================================================
 #
@@ -234,8 +231,10 @@ push_bundle_if_requested
 #  10.1) Huggingface Model downloader from manifest (uses helpers.sh)
 #===============================================================================================
 
+echo "Downloading Huggingface assets using manifest..."
+
 if aria2_enqueue_and_wait_from_manifest ; then
-  echo "✅ All Huggingface models from manifest downloaded."
+  echo "✅ Requested Huggingface models from manifest downloaded."
 else
   echo "⚠️ Some Huggingface model downloads had issues. Check ${COMFY_LOGS}/aria2_manifest.log"
 fi
@@ -247,22 +246,10 @@ fi
 echo "Downloading CivitAI assets using environment-defined lists..."
 
 if aria2_enqueue_and_wait_from_civitai ; then
-  echo "✅ All CivitAI models downloaded successfully!"
+  echo "✅ Requested CivitAI models downloaded from environment variables."
 else
   echo "⚠️ No CivitAI Lora/Checkpoint models downloaded. Check ${CIVITAI_LOG_DIR}/aria2_civitai.log if this is unexpected."
 fi
-
-#===============================================================================================
-#  10.2.1) Rename any .zip loras to .safetensors
-#===============================================================================================
-#echo "Renaming loras downloaded as zip files to safetensors files...."
-#cd $LORAS_DIR
-#for file in *.zip; do
-#  echo "Renaming $file to ${file%.zip}.safetensors"
-#  mv "$file" "${file%.zip}.safetensors"
-#done
-# Return to workspace
-#cd /workspace
 
 #===============================================================================================
 #  11) Relocate upscaling models from comfyui-mirror git dir to proper upscale dir

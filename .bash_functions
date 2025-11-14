@@ -34,12 +34,12 @@ git_identity() {
 git_identity usage:
 
   # One-time global setup:
-  git config --global user.name  "Your Name"
-  git config --global user.email "you@example.com"
+  git config --global user.name  "Mark Richards"
+  git config --global user.email "mark.david.richards@gmail.com"
 
   # Optional per-repo override (run inside repo):
-  git config user.name  "Your Name"
-  git config user.email "you@project-email.com"
+  git config user.name  "Mark Richards"
+  git config user.email "mark.david.richards@pgmail.com"
 
 Current effective Git identity:
 EOF
