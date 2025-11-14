@@ -1422,6 +1422,43 @@ hf_fetch_latest_custom_nodes_bundle() {
   echo "${CACHE_DIR}/${latest}"
 }
 
+# Fetch the consolidated requirements file for a given custom-nodes tag
+# from the HF dataset into CACHE_DIR and echo its local path.
+hf_fetch_custom_nodes_requirements_for_tag() {
+  local tag="${1:?tag required}"
+  local tmp="${CACHE_DIR:-/workspace/ComfyUI/cache}/.hf_reqs.$$"
+  local repo_url
+
+  repo_url="$(hf_remote_url 2>/dev/null || true)"
+  if [[ -z "$repo_url" ]]; then
+    echo "[custom-nodes] hf_fetch_custom_nodes_requirements_for_tag: no HF repo URL" >&2
+    return 1
+  fi
+
+  git clone --depth=1 "$repo_url" "$tmp" >/dev/null 2>&1 || {
+    echo "[custom-nodes] ❌ Could not clone HF repo for requirements." >&2
+    rm -rf "$tmp"
+    return 1
+  }
+
+  # Name is derived exactly like on the push side: requirements/<reqs_name(tag)>
+  local req_rel="requirements/$(reqs_name "$tag")"
+  local req_src="$tmp/$req_rel"
+
+  if [[ ! -f "$req_src" ]]; then
+    echo "[custom-nodes] ⚠️ No consolidated requirements found for tag=${tag} (${req_rel})." >&2
+    rm -rf "$tmp"
+    return 1
+  fi
+
+  mkdir -p "${CACHE_DIR:-/workspace/ComfyUI/cache}"
+  local req_dst="${CACHE_DIR}/$(basename "$req_src")"
+  cp "$req_src" "$req_dst"
+  rm -rf "$tmp"
+
+  echo "$req_dst"
+}
+
 # build_custom_nodes_manifest: create JSON manifest of installed nodes
 build_custom_nodes_manifest() {
   local tag="${1:?tag}" out="${2:?out_json}"
@@ -1509,6 +1546,22 @@ install_custom_nodes_bundle() {
     local extracted; extracted="$(tar -tzf "$tgz" | head -1 | cut -d/ -f1)"
     [[ -n "$extracted" ]] && mv -f "$parent/$extracted" "$CUSTOM_DIR"
   fi
+}
+
+# Install Python deps for a given custom-nodes tag using the HF-consolidated requirements.
+install_custom_nodes_requirements() {
+  local tag="${1:?tag required}"
+  local req_path
+
+  req_path="$(hf_fetch_custom_nodes_requirements_for_tag "$tag")" || {
+    # Not fatal: we can still run with whatever is already in the venv.
+    echo "[custom-nodes] Skipping consolidated requirements install (none found for ${tag})." >&2
+    return 0
+  }
+
+  echo "[custom-nodes] Installing extra Python deps for tag=${tag} from $(basename "$req_path")" >&2
+  # Use your venv pip here; you already export PIP in .env
+  "${PIP:-pip}" install --no-cache-dir -r "$req_path"
 }
 
 # ensure_nodes_from_bundle_or_build:
