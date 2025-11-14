@@ -1577,21 +1577,17 @@ ensure_nodes_from_bundle_or_build() {
   echo "[custom-nodes] PINS = $pins"
   echo "[custom-nodes] Looking for bundle tag=${tag}, pins=${pins}…"
 
-  local pattern="${CACHE_DIR}/custom_nodes_bundle_${tag}_${pins}_*.tgz"
   local tgz=""
-
-  tgz="$(hf_fetch_latest_custom_nodes_bundle "$tag" "$pins" | tail -n1)"
+  if ! tgz="$(hf_fetch_latest_custom_nodes_bundle "$tag" "$pins")"; then
+    tgz=""
+  fi
 
   if [[ -n "$tgz" && -f "$tgz" ]]; then
     echo "[custom-nodes] Using bundle: $(basename "$tgz")"
-    # Clean out any partial installs
     rm -rf "$CUSTOM_DIR"
     mkdir -p "$(dirname "$CUSTOM_DIR")"
-    # This matches exactly what you did manually:
-    # tar -xzf ... -C ComfyUI
     tar -xzf "$tgz" -C "$(dirname "$CUSTOM_DIR")"
     echo "[custom-nodes] Restored custom nodes from bundle."
-    # After files are restored, install the recorded Python deps for this tag.
     install_custom_nodes_requirements "$tag" || true
     return 0
   fi
