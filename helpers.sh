@@ -1040,7 +1040,7 @@ print_bundle_matrix() {
   fi
 
   #
-  # ---- Custom-node path description ----
+  # ---- Custom-nodes path description ----
   #
   local cn_path
   if (( compat_cn > 0 )); then
