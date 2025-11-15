@@ -423,8 +423,7 @@ rewrite_custom_nodes_requirements() {
     return 1
   fi
 
-  rm -f "$out"
-  \cp "$in" "$out"
+  system cp -f "$in" "$out"
 
   # Walk all env vars prefixed with CUSTOM_NODES_REQ_REWRITE_
   local var spec pkg repl
@@ -1540,7 +1539,7 @@ push_pip_cache_if_requested() {
   key="$(pip_cache_key)"
   tgz="${CACHE_DIR}/pip_cache_${key}.tgz"
 
-  echo "[pip-cache] Creating pip cache archive ${tgz}..."
+  echo "[pip-cache] Creating pip cache archive ${tgz}..." >&2
   tar -czf "$tgz" -C "$cache" . || {
     echo "[pip-cache] ❌ Failed to tar pip cache." >&2
     return 1
@@ -1871,6 +1870,7 @@ build_custom_nodes_bundle() {
   fi
   tar -C "$(dirname "$CUSTOM_DIR")" -czf "$tarpath" "$(basename "$CUSTOM_DIR")"
   sha256sum "$tarpath" > "$sha"
+  echo "[custom-nodes] [build_custom_nodes_bundle] Built manifest, reqs, tar, sha256 bundle for HF upload." >&2
   echo "$tarpath"
 }
 
@@ -1948,8 +1948,9 @@ push_bundle_if_requested() {
   manifest="${CACHE_DIR}/$(manifest_name "$tag")"
   reqs="${CACHE_DIR}/$(reqs_name "$tag")"
   sha="${CACHE_DIR}/$(sha_name "$base")"
+  echo "[custom-nodes] Attempting to upload [$base] to HF"
   hf_push_files "bundle ${base}" "$tarpath" "$sha" "$manifest" "$reqs"
-  echo "Uploaded bundle [$base]"
+  echo "[custom-nodes] Uploaded bundle [$base]"
 }
 
 #=======================================================================================

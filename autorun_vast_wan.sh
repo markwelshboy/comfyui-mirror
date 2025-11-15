@@ -194,7 +194,9 @@ lock_in_numeric_stack
 #
 #====================================================================================
 
+echo "[comfy-install] Starting install of ComfyUI."
 ensure_comfy
+echo "[comfy-install] Completed ComfyUI install."
 
 # =============================================================================================
 #  9.) Hearmeman WAN templates/other (special case)
@@ -225,7 +227,9 @@ export PINS="$(pins_signature)"
 echo "[custom-nodes] PINS = $PINS"
 
 # 9.2) Prefer HF bundle for (BUNDLE_TAG + PINS); else build from list (CUSTOM_NODE_LIST_FILE → CUSTOM_NODE_LIST → DEFAULT_NODES)
+echo "== [custom-nodes] phase starting…"
 ensure_custom_nodes_from_bundle_or_build
+echo "== [custom-nodes] phase done, moving to model downloads…"
 
 # =============================================================================================
 #
@@ -239,12 +243,12 @@ ensure_custom_nodes_from_bundle_or_build
 #  10.1) Huggingface Model downloader from manifest (uses helpers.sh)
 #===============================================================================================
 
-echo "Downloading Huggingface assets using manifest..."
+echo "[downloads] Downloading Huggingface assets using manifest..."
 
 if aria2_enqueue_and_wait_from_manifest ; then
-  echo "✅ Requested Huggingface models from manifest downloaded."
+  echo "✅ [downloads] Requested Huggingface models from manifest downloaded."
 else
-  echo "⚠️ Some Huggingface model downloads had issues. Check ${COMFY_LOGS}/aria2_manifest.log"
+  echo "⚠️ [downloads] Some Huggingface model downloads had issues. Check ${COMFY_LOGS}/aria2_manifest.log"
 fi
 
 #===============================================================================================
