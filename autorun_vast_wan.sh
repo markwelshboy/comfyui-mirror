@@ -51,9 +51,11 @@ mkdir -p /workspace/logs
 
 echo "Saved session env to $SESSION_ENV; summary at $SUMMARY"
 
-# -----------------------------
+#====================================================================================
+#
 # -1) Special overrides
-# -----------------------------
+#
+#====================================================================================
 
 # This is in case there's any special installs or overrides that needs to occur when starting the machine before starting ComfyUI
 if [ -f "/workspace/additional_params.sh" ]; then
@@ -64,10 +66,13 @@ else
   echo "additional_params.sh not found in /workspace. Skipping..."
 fi
 
-# -----------------------------
+#====================================================================================
+#
 # 0) Require .env and helpers
 #    (.env defines PATH, PY, PIP, pip flags, etc.)
-# -----------------------------
+#
+#====================================================================================
+
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ENVIRONMENT="${ENVIRONMENT:-$SCRIPT_DIR/.env}"
 HELPERS="${HELPERS:-$SCRIPT_DIR/helpers.sh}"
@@ -86,15 +91,20 @@ fi
 # shellcheck source=/dev/null
 source "$HELPERS"
 
-# -----------------------------
+#====================================================================================
+#
 # 1) OS prereqs & workspace
-# -----------------------------
+#
+#====================================================================================
 
 ensure_base_deps
 
-# -----------------------------
+#====================================================================================
+#
 # 2) Ensure venv exists FIRST
-# -----------------------------
+#
+#====================================================================================
+
 if [ ! -x /opt/venv/bin/python ]; then
   python3.12 -m venv /opt/venv
 fi
@@ -112,93 +122,90 @@ if [ ! -x "$PY" ] || [ ! -x "$PIP" ]; then
   exit 1
 fi
 
-#------------------------------
+#------------------------------------------------------------------------------------
 # 2.2) Derive any environment variables and summarize
-#------------------------------
+#------------------------------------------------------------------------------------
 
 show_env
 
-# -----------------------------
+#====================================================================================
+#
 # 3) Set up required system-wide directories
-# -----------------------------
+#
+#====================================================================================
 
 ensure_dirs
 
-# -----------------------------
-# 5) Base and PyTorch tooling in venv
-# -----------------------------
+#====================================================================================
+#
+# 4) Base and PyTorch tooling in venv
+#
+#====================================================================================
 
 $PIP install -U pip wheel setuptools ninja packaging
 
-# Decide stable vs. nightly 
-#   - (fills TORCH_NIGHTLY_VER automatically if nightly, uses curl installed in on start script)
+#------------------------------------------------------------------
+# 4.1) Decide stable vs. nightly 
+#      (fills TORCH_NIGHTLY_VER automatically if nightly, uses curl
+#      installed in on start script)
+#------------------------------------------------------------------
+
 auto_channel_detect
+
+#------------------------------------------------------------------
+# 4.2) Install torch bundle (no cache)
+#------------------------------------------------------------------
 
 install_torch
 
-# -----------------------------
-# 6) Pull/build SageAttention: prefer pre-compiled HF bundle, fallback to source ----------
-# -----------------------------
+#====================================================================================
+#
+# 5) Pull/build SageAttention: prefer pre-compiled HF bundle, 
+#    fallback to source if not available for this PY/Arch/etc.
+#
+#====================================================================================
 
 ensure_sage_from_bundle_or_build
 
-#  Optional: push a new Sage bundle if requested (export PUSH_SAGE_BUNDLE=1, requires HF_* env set)
+#------------------------------------------------------------------
+# 5.1) Optional: push a new Sage bundle if requested 
+#      (export PUSH_SAGE_BUNDLE=1, requires HF_* env set)
+#------------------------------------------------------------------
+
 push_sage_bundle_if_requested
 
-# 6.1) ---------- OpenCV cleanup (avoid 'cv2' namespace collisions) ----------
-$PIP uninstall -y opencv-python opencv-python-headless opencv-contrib-python opencv-contrib-python-headless >/dev/null 2>&1 || true
-$PY - <<'PY'
-import sys, os, glob, shutil
-site=[p for p in sys.path if p.endswith("site-packages")]
-if site:
-    site=site[0]
-    for p in [os.path.join(site,"cv2"), *glob.glob(os.path.join(site,"cv2*"))]:
-        try:
-            if os.path.isdir(p): shutil.rmtree(p, ignore_errors=True)
-            elif os.path.isfile(p): os.remove(p)
-            print("Removed:", p)
-        except Exception as e:
-            print("Skip:", p, e)
-PY
+#====================================================================================
+#
+# 6) OpenCV cleanup & Pinning
+#
+#====================================================================================
 
-# 6.2) ---------- pin numeric stack (single source of truth) ----------
-$PIP install -U numpy cupy-cuda12x opencv-contrib-python
-$PY - <<'PY'
-import numpy, importlib
-print("numpy:", numpy.__version__)
-try:
-    import cupy; print("cupy:", cupy.__version__)
-except Exception as e:
-    print("cupy ERROR:", e)
-try:
-    import cv2
-    v=getattr(cv2,"__version__",None)
-    if v is None:
-        cv2=cv2.cv2
-        v=cv2.__version__
-    print("opencv:", v)
-except Exception as e:
-    print("opencv ERROR:", e)
-PY
+cleanup_opencv_namespace
+
+#------------------------------------------------------------------
+# 6.1) Pin numeric stack (single source of truth) 
+#------------------------------------------------------------------
+
+lock_in_numeric_stack
 
 #====================================================================================
-# 7.) Ensure ComfyUI present and up-to-date
+# 8.) Ensure ComfyUI present and up-to-date
 #
 #====================================================================================
 
 ensure_comfy
 
 # =============================================================================================
-#  8.) Hearmeman WAN templates/other (special case)
+#  9.) Hearmeman WAN templates/other (special case)
 # =============================================================================================
 
 copy_hearmeman_assets_if_any
 
 # =============================================================================================
-#  9) Custom nodes management
+#  10) Custom nodes management
 # =============================================================================================
 
-# 9.0) Try to fetch remote node list (optional). If HF isn't configured, this will no-op.
+# 10.0) Try to fetch remote node list (optional). If HF isn't configured, this will no-op.
 #      If we get a list, write it to a temp file and let the installer use it.
 REMOTE_LIST="$(hf_fetch_nodes_list || true)"
 if [[ -n "$REMOTE_LIST" ]]; then

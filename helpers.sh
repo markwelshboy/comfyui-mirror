@@ -179,6 +179,98 @@ ensure_comfy() {
   [ -f "$COMFY_HOME/requirements.txt" ] && "$PIP_BIN" install -r "$COMFY_HOME/requirements.txt" || true
   ln -sfn "$COMFY_HOME" /ComfyUI
 }
+
+# ======================================================================
+# OpenCV Cleanup / "Pin" Numeric Stack
+# ======================================================================
+
+# Remove stray OpenCV wheels and cv2 dirs to avoid namespace collisions.
+cleanup_opencv_namespace() {
+  echo "[numeric-cleanup] Cleaning up legacy OpenCV wheels and cv2 namespace…" >&2
+
+  # 1) Uninstall common OpenCV wheels quietly (ignore errors)
+  env -u PIP_REQUIRE_HASHES -u PIP_CONSTRAINT \
+    "$PIP" uninstall -y \
+      opencv-python \
+      opencv-python-headless \
+      opencv-contrib-python \
+      opencv-contrib-python-headless >/dev/null 2>&1 || true
+
+  # 2) Remove dangling cv2 dirs/files from site-packages
+  "$PY" - <<'PY'
+import sys, os, glob, shutil
+
+site = [p for p in sys.path if p.endswith("site-packages")]
+if not site:
+    print("[numeric-cleanup] No site-packages found; skipping cv2 cleanup.")
+else:
+    site = site[0]
+    paths = [os.path.join(site, "cv2")] + glob.glob(os.path.join(site, "cv2*"))
+    for p in paths:
+        try:
+            if os.path.isdir(p):
+                shutil.rmtree(p, ignore_errors=True)
+                print("[numeric-cleanup] Removed dir:", p)
+            elif os.path.isfile(p):
+                os.remove(p)
+                print("[numeric-cleanup] Removed file:", p)
+        except Exception as e:
+            print("[numeric-cleanup] Skip:", p, "->", e)
+PY
+}
+
+# Install and verify the pinned numeric stack (numpy / cupy / opencv).
+# Uses NUMPY_VER / CUPY_VER / OPENCV_VER from .env as single source of truth.
+lock_in_numeric_stack() {
+  echo "[numeric-stack] Pinning numeric stack…" >&2
+  echo "[numeric-stack]  NUMPY_VER  = ${NUMPY_VER:-<unset>}" >&2
+  echo "[numeric-stack]  CUPY_VER   = ${CUPY_VER:-<unset>}" >&2
+  echo "[numeric-stack]  OPENCV_VER = ${OPENCV_VER:-<unset>}" >&2
+  echo ""
+  echo "[numeric-stack] pins_signature: $(pins_signature 2>/dev/null || echo '<n/a>')" >&2
+
+  # Safety: make sure we actually have pins
+  if [[ -z "${NUMPY_VER:-}" || -z "${CUPY_VER:-}" || -z "${OPENCV_VER:-}" ]]; then
+    echo "[numeric-stack] FATAL: NUMPY_VER/CUPY_VER/OPENCV_VER must be set in .env" >&2
+    return 1
+  fi
+
+  # We *want* these to be authoritative, so ignore any global constraints/hashes.
+  env -u PIP_REQUIRE_HASHES -u PIP_CONSTRAINT \
+    "$PIP" install -U \
+      "$NUMPY_VER" \
+      "$CUPY_VER" \
+      "$OPENCV_VER"
+
+  # Quick sanity check and version report
+  "$PY" - <<'PY'
+import sys
+
+print("[numeric-stack] Python:", sys.version.split()[0])
+
+try:
+    import numpy
+    print("[numeric-stack] numpy :", numpy.__version__)
+except Exception as e:
+    print("[numeric-stack] numpy ERROR:", repr(e))
+
+try:
+    import cupy
+    print("[numeric-stack] cupy  :", cupy.__version__)
+except Exception as e:
+    print("[numeric-stack] cupy ERROR:", repr(e))
+
+try:
+    import cv2
+    v = getattr(cv2, "__version__", None)
+    if v is None and hasattr(cv2, "cv2"):
+        v = getattr(cv2.cv2, "__version__", "<unknown>")
+    print("[numeric-stack] opencv:", v)
+except Exception as e:
+    print("[numeric-stack] opencv ERROR:", repr(e))
+PY
+}
+
 # ======================================================================
 # Custom node installation (parallel + cache)
 # ======================================================================
