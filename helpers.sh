@@ -531,6 +531,33 @@ install_custom_nodes_set() {
 # HF Bundling (create/push/pull)
 # ======================================================================
 
+hf_ensure_local_repo() {
+  local repo="${HF_LOCAL_REPO:-${CACHE_DIR}/.hf_repo}"
+  local url
+
+  url="$(hf_remote_url 2>/dev/null || true)"
+  if [[ -z "$url" ]]; then
+    echo "[hf-local-repo] hf_ensure_local_repo: hf_remote_url unresolved" >&2
+    return 1
+  fi
+
+  mkdir -p "$(dirname "$repo")"
+
+  if [[ -d "$repo/.git" ]]; then
+    # Cheap refresh in case you’ve pushed new bundles
+    git -C "$repo" fetch --depth=1 origin main >/dev/null 2>&1 || true
+    git -C "$repo" reset --hard origin/main >/dev/null 2>&1 || true
+  else
+    echo "[hf-local-repo] Cloning HF repo once into $repo…" >&2
+    git clone --depth=1 "$url" "$repo" >/dev/null 2>&1 || {
+      echo "[hf-local-repo] ❌ Failed to clone HF repo into $repo" >&2
+      return 1
+    }
+  fi
+
+  echo "$repo"
+}
+
 # hf_remote_url: builds authenticated HTTPS remote for model/dataset repos
 hf_remote_url() {
   : "${HF_TOKEN:?missing HF_TOKEN}" "${HF_REPO_ID:?missing HF_REPO_ID}"
@@ -683,13 +710,13 @@ _custom_node_bundle_compatible() {
 
 hf_fetch_compatible_sage_bundle() {
   local key="${1:?SAGE_KEY}"
-  local repo_url tmp cuda_tag
 
-  repo_url="$(hf_remote_url 2>/dev/null || true)"
-  if [[ -z "$repo_url" ]]; then
-    echo "[sage-bundle] No HF repo URL; cannot search for compatible Sage bundles." >&2
+  local repo cuda_tag
+  repo="$(hf_ensure_local_repo)" || {
+    echo "[sage-bundle] hf_fetch_latest_custom_nodes_bundle: no local repo." >&2
     return 1
-  fi
+  }
+
 
   # Extract cuXXX_sm_YY part from our key (if present)
   cuda_tag="$(printf '%s\n' "$key" | sed -E 's/.*_(cu[0-9]+_sm_[0-9]+)$/\1/' || true)"
@@ -698,19 +725,11 @@ hf_fetch_compatible_sage_bundle() {
     return 1
   fi
 
-  tmp="${CACHE_DIR}/.hf_sage_compat.$$"
-  git lfs install >/dev/null 2>&1
-  if ! git clone --depth=1 "$repo_url" "$tmp" >/dev/null 2>&1; then
-    echo "[sage-bundle] ❌ Could not clone HF repo for compat lookup." >&2
-    rm -rf "$tmp"
-    return 1
-  fi
-
   local f base k compat_list
   compat_list=()
 
-  if compgen -G "$tmp/bundles/torch_sage_bundle_*.tgz" >/dev/null 2>&1; then
-    for f in "$tmp"/bundles/torch_sage_bundle_*.tgz; do
+  if compgen -G "${repo}/bundles/torch_sage_bundle_*.tgz" >/dev/null 2>&1; then
+    for f in "${repo}"/bundles/torch_sage_bundle_*.tgz; do
       [[ -e "$f" ]] || continue
       base="$(basename "$f" .tgz)"
       k="${base#torch_sage_bundle_}"
@@ -721,7 +740,6 @@ hf_fetch_compatible_sage_bundle() {
 
   if (( ${#compat_list[@]} == 0 )); then
     echo "[sage-bundle] No compatible Sage bundles found for CUDA/arch=${cuda_tag}." >&2
-    rm -rf "$tmp"
     return 1
   fi
 
@@ -733,39 +751,27 @@ hf_fetch_compatible_sage_bundle() {
   echo "[sage-bundle] Reusing compatible Sage bundle: ${best_file}" >&2
 
   mkdir -p "$CACHE_DIR"
-  cp "$tmp/bundles/$best_file" "$CACHE_DIR/"
-  rm -rf "$tmp"
+  cp "${repo}/bundles/$best_file" "$CACHE_DIR/"
   echo "${CACHE_DIR}/${best_file}"
 }
 
 hf_bundles_summary() {
   local key="${1:-}"               # optional: current torch_sage_key
   local cache="${CACHE_DIR:-/workspace/ComfyUI/cache}"
-  local tmp="${cache}/.hf_inspect.$$"
 
   mkdir -p "$cache"
 
-  if ! command -v git >/dev/null 2>&1; then
-    echo "Bundles (git) : git not installed"
-    return 0
-  fi
-  if [[ -z "${HF_TOKEN:-}" ]]; then
-    echo "Bundles (git) : HF_TOKEN not set"
-    return 0
-  fi
+  local repo
+  repo="$(hf_ensure_local_repo)" || {
+    echo "[sage-bundle] hf_fetch_latest_custom_nodes_bundle: no local repo." >&2
+    return 1
+  }
 
-  echo "Bundles (repo) : inspecting via git clone…"
-  git lfs install >/dev/null 2>&1 || true
-  if ! git clone --depth=1 "$(hf_remote_url)" "$tmp" >/dev/null 2>&1; then
-    echo "  ❌ clone failed; cannot inspect bundles"
-    rm -rf "$tmp"
-    return 0
-  fi
+  echo "Bundles (local repo) : inspecting…"
 
-  local bundle_dir="${tmp}/bundles"
+  local bundle_dir="${repo}/bundles"
   if [[ ! -d "$bundle_dir" ]]; then
     echo "  Bundles dir  : (none)"
-    rm -rf "$tmp"
     return 0
   fi
 
@@ -790,8 +796,6 @@ hf_bundles_summary() {
       echo "  This key     : ❌ no torch_sage bundle for ${key}"
     fi
   fi
-
-  rm -rf "$tmp"
 }
 
 hf_repo_info() {
@@ -1098,86 +1102,81 @@ print_bundle_matrix() {
     cuda_tag="$(printf '%s\n' "$torch_key" | sed -E 's/.*_(cu[0-9]+_sm_[0-9]+)$/\1/' || true)"
   fi
 
-  # Clone HF repo (read-only) to inspect bundles
-  local repo_url tmp
-  repo_url="$(hf_remote_url 2>/dev/null || true)"
-
+  # Read local HF repo to inspect bundles
+  local repo
+  repo="$(hf_ensure_local_repo)" || {
+    echo "[sage-bundle] hf_fetch_latest_custom_nodes_bundle: no local repo." >&2
+    return 1
+  }
   local total_sage=0 compat_sage=0 exact_match=0
   local sage_lines=()
   local total_cn=0 compat_cn=0
   local cn_lines=()
 
-  if [[ -n "$repo_url" ]]; then
-    tmp="${CACHE_DIR:-/workspace/ComfyUI/cache}/.hf_matrix.$$"
-    if git clone --depth=1 "$repo_url" "$tmp" >/dev/null 2>&1; then
-      #
-      # ---- Sage bundles ----
-      #
-      if compgen -G "$tmp/bundles/torch_sage_bundle_*.tgz" >/dev/null 2>&1; then
-        local f base key_part ver label
-        for f in "$tmp"/bundles/torch_sage_bundle_*.tgz; do
-          [[ -e "$f" ]] || continue
-          ((total_sage++))
-          base="$(basename "$f" .tgz)"
-          key_part="${base#torch_sage_bundle_}"
+  #
+  # ---- Sage bundles ----
+  #
+  if compgen -G "${repo}/bundles/torch_sage_bundle_*.tgz" >/dev/null 2>&1; then
+    local f base key_part ver label
+    for f in "${repo}"/bundles/torch_sage_bundle_*.tgz; do
+      [[ -e "$f" ]] || continue
+      ((total_sage++))
+      base="$(basename "$f" .tgz)"
+      key_part="${base#torch_sage_bundle_}"
 
-          # Extract the torch version segment between "torch" and "_cu"
-          ver="$(printf '%s\n' "$key_part" \
-                | sed -E 's/^pycp[0-9]+_torch([^_]+)_cu[0-9]+_sm_.+$/\1/' || true)"
-          label="Stable"
-          [[ "$ver" == *dev* ]] && label="Nightly"
+      # Extract the torch version segment between "torch" and "_cu"
+      ver="$(printf '%s\n' "$key_part" \
+            | sed -E 's/^pycp[0-9]+_torch([^_]+)_cu[0-9]+_sm_.+$/\1/' || true)"
+      label="Stable"
+      [[ "$ver" == *dev* ]] && label="Nightly"
 
-          local compat="no"
-          if [[ -n "$cuda_tag" && "$key_part" == *"${cuda_tag}"* ]]; then
-            compat="yes"
-            ((compat_sage++))
-          fi
-
-          local mark=""
-          if [[ "$key_part" == "$torch_key" ]]; then
-            exact_match=1
-            mark=" (Selected)"
-          fi
-
-          # Only list compatible ones in the detail section
-          if [[ "$compat" == "yes" ]]; then
-            sage_lines+=("  (${label}) ${key_part}${mark}")
-          fi
-        done
+      local compat="no"
+      if [[ -n "$cuda_tag" && "$key_part" == *"${cuda_tag}"* ]]; then
+        compat="yes"
+        ((compat_sage++))
       fi
 
-      #
-      # ---- Custom node bundles ----
-      #
-      if compgen -G "$tmp/bundles/custom_nodes_bundle_*.tgz" >/dev/null 2>&1; then
-        local g gbase compat display_tag
-        for g in "$tmp"/bundles/custom_nodes_bundle_*.tgz; do
-          [[ -e "$g" ]] || continue
-          ((total_cn++))
-          gbase="$(basename "$g")"
-
-          if _custom_node_bundle_compatible "$gbase"; then
-            ((compat_cn++))
-
-            # Compact display tag:
-            # - Prefer CUSTOM_NODES_BUNDLE_TAG / BUNDLE_TAG if set
-            # - Else strip prefix/suffix
-            if [[ -n "${CUSTOM_NODES_BUNDLE_TAG:-}" ]]; then
-              display_tag="${CUSTOM_NODES_BUNDLE_TAG}"
-            elif [[ -n "${BUNDLE_TAG:-}" ]]; then
-              display_tag="${BUNDLE_TAG}"
-            else
-              display_tag="${gbase#custom_nodes_bundle_}"
-              display_tag="${display_tag%.tgz}"
-            fi
-
-            cn_lines+=("  ${display_tag} (compatible)")
-          fi
-        done
+      local mark=""
+      if [[ "$key_part" == "$torch_key" ]]; then
+        exact_match=1
+        mark=" (Selected)"
       fi
 
-      rm -rf "$tmp"
-    fi
+      # Only list compatible ones in the detail section
+      if [[ "$compat" == "yes" ]]; then
+        sage_lines+=("  (${label}) ${key_part}${mark}")
+      fi
+    done
+  fi
+
+  #
+  # ---- Custom node bundles ----
+  #
+  if compgen -G "${repo}/bundles/custom_nodes_bundle_*.tgz" >/dev/null 2>&1; then
+    local g gbase compat display_tag
+    for g in "${repo}"/bundles/custom_nodes_bundle_*.tgz; do
+      [[ -e "$g" ]] || continue
+      ((total_cn++))
+      gbase="$(basename "$g")"
+
+      if _custom_node_bundle_compatible "$gbase"; then
+        ((compat_cn++))
+
+        # Compact display tag:
+        # - Prefer CUSTOM_NODES_BUNDLE_TAG / BUNDLE_TAG if set
+        # - Else strip prefix/suffix
+        if [[ -n "${CUSTOM_NODES_BUNDLE_TAG:-}" ]]; then
+          display_tag="${CUSTOM_NODES_BUNDLE_TAG}"
+        elif [[ -n "${BUNDLE_TAG:-}" ]]; then
+          display_tag="${BUNDLE_TAG}"
+        else
+          display_tag="${gbase#custom_nodes_bundle_}"
+          display_tag="${display_tag%.tgz}"
+        fi
+
+        cn_lines+=("  ${display_tag} (compatible)")
+      fi
+    done
   fi
 
   #
@@ -1474,63 +1473,47 @@ PY
 }
 
 hf_fetch_sage_bundle() {
-  local key="${1:?SAGE_KEY}" tmp="${CACHE_DIR}/.hf_sage.$$"
-  git lfs install >/dev/null 2>&1
-  GIT_CURL_VERBOSE=${GIT_CURL_VERBOSE:-0} GIT_TRACE=${GIT_TRACE:-0} \
-  git clone --depth=1 \
-    --config http.lowSpeedLimit=1000 \
-    --config http.lowSpeedTime=90 \
-    "$(hf_remote_url)" "$tmp" >/dev/null 2>&1 || {
-      echo "[sage-bundle] ❌ Could not clone HF repo." >&2
-      rm -rf "$tmp"
-      return 1
-    }
-  local patt="torch_sage_bundle_${key}.tgz"
-  [[ -f "$tmp/bundles/$patt" ]] || {
-      echo "[sage-bundle] ❌ Bundle (${patt}) not available in HF repo." >&2
-      rm -rf "$tmp"
-      return 1
-    }
-  echo "[sage-bundle] ✅ Retrieved bundle $patt from HF" >&2
+  local key="${1:?SAGE_KEY}" repo patt local_tgz
+  repo="$(hf_ensure_local_repo)" || {
+    echo "[sage-bundle] ❌ Could not ensure local HF repo" >&2
+    return 1
+  }
+
+  patt="${repo}/bundles/torch_sage_bundle_${key}.tgz"
+  if [[ ! -f "$patt" ]]; then
+    echo "[sage-bundle] ❌ Bundle (torch_sage_bundle_${key}.tgz) not available in HF repo." >&2
+    return 1
+  fi
+
   mkdir -p "$CACHE_DIR"
-  cp "$tmp/bundles/$patt" "$CACHE_DIR/"
-  rm -rf "$tmp"
-  echo "${CACHE_DIR}/${patt}"
+  local_tgz="${CACHE_DIR}/$(basename "$patt")"
+  cp -f "$patt" "$local_tgz"
+
+  echo "$local_tgz"
 }
 
 # hf_fetch_pip_cache:
 #   Look for pip_cache/pip_cache_${key}.tgz in HF repo, copy into CACHE_DIR, echo local path.
 hf_fetch_pip_cache() {
   local key="${1:?pip cache key required}"
-  local tmp="${CACHE_DIR}/.hf_pip.$$"
-  local repo_url
-  repo_url="$(hf_remote_url 2>/dev/null || true)"
+  local repo
 
-  if [[ -z "$repo_url" ]]; then
-    echo "[pip-cache] hf_fetch_pip_cache: no HF repo URL" >&2
-    return 0
-  fi
-
-  git lfs install >/dev/null 2>&1
-  if ! git clone --depth=1 "$repo_url" "$tmp" >/dev/null 2>&1; then
-    echo "[pip-cache] ❌ Could not clone HF repo while looking for pip cache" >&2
-    rm -rf "$tmp"
-    return 0
-  fi
+  repo="$(hf_ensure_local_repo)" || {
+    echo "[sage-bundle] hf_fetch_latest_custom_nodes_bundle: no local repo." >&2
+    return 1
+  }
 
   local rel="pip_cache/pip_cache_${key}.tgz"
-  local src="${tmp}/${rel}"
+  local src="${repo}/${rel}"
 
   if [[ ! -f "$src" ]]; then
     echo "[pip-cache] No pip cache found for key=${key}" >&2
-    rm -rf "$tmp"
     return 0
   fi
 
   mkdir -p "${CACHE_DIR:-/workspace/ComfyUI/cache}"
   local dst="${CACHE_DIR}/pip_cache_${key}.tgz"
-  cp "$src" "$dst"
-  rm -rf "$tmp"
+  cp -f "$src" "$dst"
 
   echo "$dst"
 }
@@ -1683,69 +1666,51 @@ ensure_sage_from_bundle_or_build() {
 # hf_fetch_latest_custom_nodes_bundle: pull newest matching bundle for tag+pins into CACHE_DIR
 #   echoes local tgz path or empty
 hf_fetch_latest_custom_nodes_bundle() {
-  local tag="${1:?tag}" pins="${2:?pins}"
-  local tmp="${CACHE_DIR}/.hf_pull.$$"
+  local tag="${1:?bundle tag required}"
+  local pins="${2:?pins required}"
+  local repo patt best
 
+  repo="$(hf_ensure_local_repo)" || {
+    echo "[custom-nodes] hf_fetch_latest_custom_nodes_bundle: no local repo" >&2
+    return 1
+  }
+
+  patt="${repo}/bundles/custom_nodes_bundle_${tag}_${pins}_*.tgz"
+
+  if ! compgen -G "$patt" >/dev/null 2>&1; then
+    echo "[custom-nodes] No custom-nodes bundle found for tag=${tag}, pins=${pins}" >&2
+    return 1
+  fi
+
+  # pick “latest” by lexicographic sort on filename (timestamp suffix)
+  best="$(ls -1 $patt | sort | tail -n1)"
   mkdir -p "$CACHE_DIR"
-  rm -rf "$tmp"
-
-  # Quiet git lfs + clone
-  git lfs install >/dev/null 2>&1
-  if ! git clone --depth=1 "$(hf_remote_url)" "$tmp" >/dev/null 2>&1; then
-    rm -rf "$tmp"
-    return 1
-  fi
-
-  # Our manual test showed the files live in tmp/bundles/
-  local patt="custom_nodes_bundle_${tag}_${pins}_*.tgz"
-  local latest
-  latest="$(cd "$tmp/bundles" && ls -1 $patt 2>/dev/null | sort | tail -n1)"
-
-  if [[ -z "$latest" ]]; then
-    rm -rf "$tmp"
-    return 1
-  fi
-
-  cp "$tmp/bundles/$latest" "$CACHE_DIR/"
-  rm -rf "$tmp"
-
-  # Only print the final local path, nothing else
-  echo "${CACHE_DIR}/${latest}"
+  cp -f "$best" "$CACHE_DIR/"
+  echo "${CACHE_DIR}/$(basename "$best")"
 }
 
 # Fetch the consolidated requirements file for a given custom-nodes tag
 # from the HF dataset into CACHE_DIR and echo its local path.
 hf_fetch_custom_nodes_requirements_for_tag() {
   local tag="${1:?tag required}"
-  local tmp="${CACHE_DIR:-/workspace/ComfyUI/cache}/.hf_reqs.$$"
-  local repo_url
+  local repo req_src req_dst
 
-  repo_url="$(hf_remote_url 2>/dev/null || true)"
-  if [[ -z "$repo_url" ]]; then
-    echo "[custom-nodes] hf_fetch_custom_nodes_requirements_for_tag: no HF repo URL" >&2
-    return 1
-  fi
-
-  git clone --depth=1 "$repo_url" "$tmp" >/dev/null 2>&1 || {
-    echo "[custom-nodes] ❌ Could not clone HF repo for requirements." >&2
-    rm -rf "$tmp"
+  repo="$(hf_ensure_local_repo)" || {
+    echo "[custom-nodes] hf_fetch_latest_custom_nodes_bundle: no local repo" >&2
     return 1
   }
 
   # Name is derived exactly like on the push side: requirements/<reqs_name(tag)>
-  local req_rel="requirements/$(reqs_name "$tag")"
-  local req_src="$tmp/$req_rel"
+  local req_src="${repo}/requirements/$(reqs_name "$tag")"
 
   if [[ ! -f "$req_src" ]]; then
     echo "[custom-nodes] ⚠️ No consolidated requirements found for tag=${tag} (${req_rel})." >&2
-    rm -rf "$tmp"
     return 1
   fi
 
   mkdir -p "${CACHE_DIR:-/workspace/ComfyUI/cache}"
   local req_dst="${CACHE_DIR}/$(basename "$req_src")"
-  cp "$req_src" "$req_dst"
-  rm -rf "$tmp"
+  cp -f "$req_src" "$req_dst"
 
   echo "$req_dst"
 }
@@ -1755,28 +1720,15 @@ hf_fetch_custom_nodes_requirements_for_tag() {
 install_custom_nodes_requirements() {
   local tag="${1:?bundle tag required}"
 
-  local repo_url tmp req_src req_work
-  repo_url="$(hf_remote_url 2>/dev/null || true)"
-
-  if [[ -z "$repo_url" ]]; then
-    echo "[custom-nodes] install_custom_nodes_requirements: hf_remote_url unresolved" >&2
+  local repo req_src req_work
+  repo="$(hf_ensure_local_repo)" || {
+    echo "[custom-nodes] hf_fetch_latest_custom_nodes_bundle: no local repo" >&2
     return 1
-  fi
+  }
 
-  tmp="${CACHE_DIR:-/workspace/ComfyUI/cache}/.hf_reqs.$$"
-  mkdir -p "$tmp"
-
-  echo "[custom-nodes] Fetching requirements for tag=${tag} from HF repo..."
-  if ! git clone --depth=1 "$repo_url" "$tmp" >/dev/null 2>&1; then
-    echo "[custom-nodes] ❌ Could not clone HF repo for requirements" >&2
-    rm -rf "$tmp"
-    return 1
-  fi
-
-  req_src="${tmp}/requirements/consolidated_requirements_${tag}.txt"
+  req_src="${repo}/requirements/consolidated_requirements_${tag}.txt"
   if [[ ! -f "$req_src" ]]; then
     echo "[custom-nodes] ⚠️ No consolidated requirements found for tag=${tag} at ${req_src}" >&2
-    rm -rf "$tmp"
     return 0  # not fatal; we just skip extra reqs
   fi
 
@@ -1792,11 +1744,9 @@ install_custom_nodes_requirements() {
       PIP_CACHE_DIR="$CUSTOM_NODES_PIP_CACHE_DIR" \
       "$PIP" install -r "$req_work" || {
         echo "[custom-nodes] ⚠️ pip install -r ${req_work} failed; see logs above." >&2
-        rm -rf "$tmp"
         return 1
       }
 
-  rm -rf "$tmp"
   return 0
 }
 
@@ -1895,6 +1845,7 @@ install_custom_nodes_bundle() {
 ensure_custom_nodes_from_bundle_or_build() {
   local tag="${CUSTOM_NODES_BUNDLE_TAG:?CUSTOM_NODES_BUNDLE_TAG required}"
   local pins="${PINS:-$(pins_signature)}"
+  local ok=0
 
   mkdir -p "$CACHE_DIR" "$CUSTOM_LOG_DIR"
   mkdir -p "$(dirname "$CUSTOM_DIR")"
@@ -1905,30 +1856,38 @@ ensure_custom_nodes_from_bundle_or_build() {
   echo "[custom-nodes] PINS = $pins"
   echo "[custom-nodes] Looking for bundle tag=${tag}, pins=${pins}…"
 
-  local pattern="${CACHE_DIR}/custom_nodes_bundle_${tag}_${pins}_*.tgz"
   local tgz=""
+  tgz="$(hf_fetch_latest_custom_nodes_bundle "$tag" "$pins" 2>/dev/null || true)"
 
-  if tgz="$(hf_fetch_latest_custom_nodes_bundle "$tag" "$pins")"; then
-    echo "[custom-nodes] Fetched latest custom node bundle ($tgz) from HF"
-  else
-    tgz=""
-  fi
   if [[ -n "$tgz" && -f "$tgz" ]]; then
-    echo "[custom-nodes] Extracting HF bundle ($(basename "$tgz")) to restore custom nodes."
+    echo "[custom-nodes] Using HF bundle: $(basename "$tgz")"
     rm -rf "$CUSTOM_DIR"
     mkdir -p "$(dirname "$CUSTOM_DIR")"
     tar -xzf "$tgz" -C "$(dirname "$CUSTOM_DIR")"
-    echo "[custom-nodes] Extracted custom nodes from HF bundle."
-    install_custom_nodes_requirements "$tag" || true
-    push_bundle_if_requested || true
-    push_pip_cache_if_requested || true
-    return 0
+    echo "[custom-nodes] Restored custom nodes from HF bundle."
+
+    if install_custom_nodes_requirements "$tag"; then
+      ok=1
+    else
+      ok=0
+      echo "[custom-nodes] ⚠️ Requirements install failed; NOT pushing bundle/cache." >&2
+    fi
+  else
+    echo "[custom-nodes] No HF bundle available — installing from DEFAULT_NODES…" >&2
+    if install_custom_nodes_set && install_custom_nodes_requirements "$tag"; then
+      ok=1
+    else
+      ok=0
+      echo "[custom-nodes] ⚠️ Custom-node install failed; NOT pushing bundle/cache." >&2
+    fi
   fi
 
-  echo "[custom-nodes] No HF bundle available — installing from DEFAULT_NODES…"
-  install_custom_nodes_set
-  push_bundle_if_requested || true
-  push_pip_cache_if_requested || true
+  if (( ok == 1 )); then
+    push_bundle_if_requested || true
+    push_pip_cache_if_requested || true
+  fi
+
+  return $ok
 }
 
 # push_bundle_if_requested: convenience wrapper (respects CUSTOM_NODES_BUNDLE_TAG/PINS)
