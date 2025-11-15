@@ -94,16 +94,25 @@ if [ -f "$HOME/.bash_aliases" ]; then
   . "$HOME/.bash_aliases"
 fi
 
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+if [[ -L "$SCRIPT_PATH" ]]; then
+  SCRIPT_PATH="$(readlink -f "$SCRIPT_PATH")"
+fi
+repo_root="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+
 # -------------------------
 # Vast / ComfyUI environment wiring
 # -------------------------
+
+# Make sure /workspace etc. is on PATH for mirror/rebase helpers etc.
+case ":$PATH:" in
+  *:/workspace:*) ;;
+  *) export PATH="/workspace:$repo_root:$repo_root/scripts:$PATH" ;;
+esac
+
 # Try to align this interactive shell with the bootstrap/autorun environment
 if type -t load_runtime_env >/dev/null 2>&1; then
   load_runtime_env 2>/dev/null || true
 fi
 
-# Make sure /workspace etc. is on PATH for mirror/rebase helpers etc.
-case ":$PATH:" in
-  *:/workspace:*) ;;
-  *) export PATH="/workspace:/workspace/comfyui-mirror:/workspace/comfyui-mirror/scripts:$PATH" ;;
-esac
+cd /workspace

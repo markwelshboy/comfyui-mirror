@@ -9,15 +9,22 @@ source_if_exists() {
 
 # Load the "runtime env" so an SSH shell matches the autorun context
 load_runtime_env() {
-  local secrets="/root/.secrets/env.current"
-  local repo="/workspace/comfyui-mirror"
+
+  # Discover repo root as the directory containing this .env file
+  SCRIPT_PATH="${BASH_SOURCE[0]}"
+  if [[ -L "$SCRIPT_PATH" ]]; then
+    SCRIPT_PATH="$(readlink -f "$SCRIPT_PATH")"
+  fi
+  repo_root="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+  
+  secrets="/root/.secrets/env.current"
 
   # Tokens & session env
   source_if_exists "$secrets"
 
   # ComfyUI repo env + helpers
-  source_if_exists "$repo/.env"
-  source_if_exists "$repo/helpers.sh"
+  source_if_exists "$repo_root/.env"
+  source_if_exists "$repo_root/helpers.sh"
 
   # If helpers defined some higher-level summaries, show them briefly
   if type -t auto_channel_detect >/dev/null 2>&1; then

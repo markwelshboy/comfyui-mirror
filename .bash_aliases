@@ -41,18 +41,22 @@ alias gds='git diff --stat'
 # -------------------------
 # Pod / ComfyUI helpers
 # -------------------------
-# Your existing helpers, just moved here
-alias mirror='/workspace/mirror'
-alias rebase='/workspace/rebase'
+# Discover repo root as the directory containing this .env file
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+if [[ -L "$SCRIPT_PATH" ]]; then
+  SCRIPT_PATH="$(readlink -f "$SCRIPT_PATH")"
+fi
+repo_root="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 
 # Common locations
 alias cwork='cd /workspace'
-alias cmirror='cd /workspace/comfyui-mirror'
+alias cmirror="cd $repo_root"
 alias ccomfy='cd /workspace/ComfyUI'
 
 # Log helpers
 alias blog='cd /workspace && tail -f /workspace/bootstrap_run.log'
 alias clog='cd /workspace/logs && ls -ltr'
+alias slogs='cd /workspace/logs && ls -ltr'
 
 # Python shortcuts inside the venv (if present)
 if [ -x /opt/venv/bin/python3 ]; then
