@@ -1571,7 +1571,7 @@ ensure_pip_cache_for_custom_nodes() {
   # If cache is empty, try to hydrate it from HF
   if [[ -z "$(ls -A "$cache" 2>/dev/null)" ]]; then
     local tgz
-    echo "[pip-cache] Attempting to retrieve from HF, compatible cache for key: $key..." >&2
+    echo "[pip-cache] Attempting to retrieve from local HF repo, compatible cache for key: $key..." >&2
     tgz="$(hf_fetch_pip_cache "$key")"
     if [[ -n "$tgz" && -f "$tgz" ]]; then
       echo "[pip-cache] Restoring pip cache from $(basename "$tgz")..." >&2
@@ -1810,6 +1810,48 @@ build_consolidated_reqs() {
   rm -f "$tmp"
 }
 
+# Build consolidated requirements for a custom-nodes bundle
+# using `pip freeze` as the source of truth.
+#
+# Usage:
+#   build_consolidated_reqs_from_freeze "$CUSTOM_NODES_BUNDLE_TAG" "$reqs_path"
+#
+# It:
+#   - Runs `pip freeze` in the current venv
+#   - Drops numeric stack & torch (we pin them elsewhere)
+#   - Drops infra packages (pip, setuptools, wheel)
+#   - Normalizes / sorts / dedups
+build_consolidated_reqs_from_freeze() {
+  local tag="${1:?tag required}" out="${2:?out_txt required}"
+  local tmp; tmp="$(mktemp)"
+
+  echo "[custom-nodes] [freeze-requirements] Capturing environment via pip freeze for tag=${tag}…" >&2
+
+  # Be defensive about hash/constraint envs
+  if ! env -u PIP_REQUIRE_HASHES -u PIP_CONSTRAINT \
+        "$PIP" freeze >"$tmp" 2>/dev/null; then
+    echo "[custom-nodes] [freeze-requirements] pip freeze failed; leaving ${out} untouched" >&2
+    rm -f "$tmp"
+    return 1
+  fi
+
+  # Filter:
+  #  - Drop torch / numeric stack (we control via .env pins)
+  #  - Drop obvious infra tools that don’t belong in node replays
+  #
+  # NOTE: keep git+ / @ git URLs etc – they’re already resolved in freeze output.
+  grep -vE '^((torch(|vision|audio))|numpy|cupy(|-cuda.*)|opencv(|-python|-contrib-python|-headless)|nvidia-.*|triton)\b' "$tmp" \
+    | grep -vE '^(pip|setuptools|wheel|pkg-resources)\b' \
+    | sed '/^\s*$/d' \
+    | sort -u >"$out" || true
+
+  local count
+  count="$(wc -l <"$out" | tr -d '[:space:]')"
+  echo "[custom-nodes] [freeze-requirements] Wrote ${count} lines to ${out}" >&2
+
+  rm -f "$tmp"
+}
+
 # build_custom_nodes_bundle: pack custom_nodes + metadata into CACHE_DIR, returns tgz path
 build_custom_nodes_bundle() {
   local tag="${1:?tag}" pins="${2:?pins}" ts="$(bundle_ts)"
@@ -1821,7 +1863,12 @@ build_custom_nodes_bundle() {
   local sha="${CACHE_DIR}/$(sha_name "$base")"
 
   build_custom_nodes_manifest "$tag" "$manifest"
-  build_consolidated_reqs "$tag" "$reqs"
+  # Consolidated requirements for this tag
+  if command -v build_consolidated_reqs_from_freeze >/dev/null 2>&1; then
+    build_consolidated_reqs_from_freeze "$tag" "$reqs" || build_consolidated_reqs "$tag" "$reqs"
+  else
+    build_consolidated_reqs "$tag" "$reqs"
+  fi
   tar -C "$(dirname "$CUSTOM_DIR")" -czf "$tarpath" "$(basename "$CUSTOM_DIR")"
   sha256sum "$tarpath" > "$sha"
   echo "$tarpath"
