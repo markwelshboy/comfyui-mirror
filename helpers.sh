@@ -2242,7 +2242,7 @@ aria2_show_download_snapshot() {
         dir="${dir#$ROOT/}"
       fi
 
-      printf " %3d%% [%-*s] %10s/s (%10s / %10s)  [ %-20s ] %s\n" \
+      printf " %3d%% [%-*s] %8s/s (%6s / %6s)  [ %-28s ] %s\n" \
         "$pct" "$W" "$bar" \
         "$(helpers_human_bytes "$spd")" \
         "$(helpers_human_bytes "$done")" \
