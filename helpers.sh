@@ -1929,14 +1929,11 @@ ensure_custom_nodes_from_bundle_or_build() {
   fi
 
   if (( ok == 1 )); then
-    echo "[custom-nodes] Custom node install succeeded, pushing bundle and pip cache if requested."
     push_bundle_if_requested || true
     push_pip_cache_if_requested || true
-    echo "[custom-nodes] Pushes complete (if requested)."
   fi
 
-  echo "[custom-nodes] About to return: $ok"
-  return $ok
+  return $(( ok == 1 ? 0 : 1 ))
 }
 
 # push_bundle_if_requested: convenience wrapper (respects CUSTOM_NODES_BUNDLE_TAG/PINS)
