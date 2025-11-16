@@ -1547,7 +1547,6 @@ push_pip_cache_if_requested() {
 
   hf_push_files "pip_cache ${key}" "$tgz"
   echo "[pip-cache] Uploaded pip_cache_${key}.tgz" >&2
-
 }
 
 # ensure_pip_cache_for_custom_nodes:
@@ -1930,10 +1929,13 @@ ensure_custom_nodes_from_bundle_or_build() {
   fi
 
   if (( ok == 1 )); then
+    echo "[custom-nodes] Custom node install succeeded, pushing bundle and pip cache if requested."
     push_bundle_if_requested || true
     push_pip_cache_if_requested || true
+    echo "[custom-nodes] Pushes complete (if requested)."
   fi
 
+  echo "[custom-nodes] About to return: $ok"
   return $ok
 }
 
