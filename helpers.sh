@@ -536,20 +536,23 @@ hf_ensure_local_repo() {
 
   url="$(hf_remote_url 2>/dev/null || true)"
   if [[ -z "$url" ]]; then
-    echo "[hf-local-repo] hf_ensure_local_repo: hf_remote_url unresolved" >&2
+    echo "[hf-ensure-local-repo] hf_ensure_local_repo: hf_remote_url unresolved" >&2
     return 1
+  else
+    echo "[hf-ensure-local-repo] Trying repo url=${url}"
   fi
 
   mkdir -p "$(dirname "$repo")"
 
   if [[ -d "$repo/.git" ]]; then
     # Cheap refresh in case you’ve pushed new bundles
+    echo "[hf-ensure-local-repo] Refreshing repo (no download)"
     git -C "$repo" fetch --depth=1 origin main >/dev/null 2>&1 || true
     git -C "$repo" reset --hard origin/main >/dev/null 2>&1 || true
   else
-    echo "[hf-local-repo] Cloning HF repo once into $repo…" >&2
+    echo "[hf-ensure-local-repo] Cloning HF repo once into $repo…" >&2
     git clone --depth=1 "$url" "$repo" >/dev/null 2>&1 || {
-      echo "[hf-local-repo] ❌ Failed to clone HF repo into $repo" >&2
+      echo "[hf-ensure-local-repo] ❌ Failed to clone HF repo into $repo" >&2
       return 1
     }
   fi

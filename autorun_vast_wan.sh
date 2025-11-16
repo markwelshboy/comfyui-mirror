@@ -139,11 +139,24 @@ ensure_dirs
 
 #====================================================================================
 #
+# 4) Start downloading models
+#
+#====================================================================================
+
+aria2_clear_results >/dev/null 2>&1 || true
+helpers_have_aria2_rpc || aria2_start_daemon
+
+aria2_download_from_manifest
+
+#====================================================================================
+#
 # 4) Base and PyTorch tooling in venv
 #
 #====================================================================================
 
 $PIP install -U pip wheel setuptools ninja packaging
+
+aria2_show_download_snapshot
 
 #------------------------------------------------------------------
 # 4.1) Decide stable vs. nightly 
@@ -159,6 +172,8 @@ auto_channel_detect
 
 install_torch
 
+aria2_show_download_snapshot
+
 #====================================================================================
 #
 # 5) Pull/build SageAttention: prefer pre-compiled HF bundle, 
@@ -168,12 +183,16 @@ install_torch
 
 ensure_sage_from_bundle_or_build
 
+aria2_show_download_snapshot
+
 #------------------------------------------------------------------
 # 5.1) Optional: push a new Sage bundle if requested 
 #      (export PUSH_SAGE_BUNDLE=1, requires HF_* env set)
 #------------------------------------------------------------------
 
 push_sage_bundle_if_requested
+
+aria2_show_download_snapshot
 
 #====================================================================================
 #
@@ -183,11 +202,15 @@ push_sage_bundle_if_requested
 
 cleanup_opencv_namespace
 
+aria2_show_download_snapshot
+
 #------------------------------------------------------------------
 # 6.1) Pin numeric stack (single source of truth) 
 #------------------------------------------------------------------
 
 lock_in_numeric_stack
+
+aria2_show_download_snapshot
 
 #====================================================================================
 # 8.) Ensure ComfyUI present and up-to-date
@@ -198,11 +221,15 @@ echo "[comfy-install] Starting install of ComfyUI."
 ensure_comfy
 echo "[comfy-install] Completed ComfyUI install."
 
+aria2_show_download_snapshot
+
 # =============================================================================================
 #  9.) Hearmeman WAN templates/other (special case)
 # =============================================================================================
 
 copy_hearmeman_assets_if_any
+
+aria2_show_download_snapshot
 
 # =============================================================================================
 #  10) Custom nodes management
@@ -235,25 +262,23 @@ else
     exit 1
 fi
 
-# =============================================================================================
-#
-#
-#  10 ) Download all requested models, from HuggingFace manifests, CivitAI, etc.
-#
-#
-# =============================================================================================
-
 #===============================================================================================
-#  10.1) Huggingface Model downloader from manifest (uses helpers.sh)
+#
+#  10) Check progress of Huggingface Model downloader
+#
 #===============================================================================================
 
-echo "[downloads] Downloading Huggingface assets using manifest..."
+echo "[downloads] Checking download progress..."
 
-if aria2_enqueue_and_wait_from_manifest ; then
-  echo "✅ [downloads] Requested Huggingface models from manifest downloaded."
-else
-  echo "⚠️ [downloads] Some Huggingface model downloads had issues. Check ${COMFY_LOGS}/aria2_manifest.log"
-fi
+aria2_monitor_progress \
+  "${ARIA2_PROGRESS_INTERVAL:-15}" \
+  "${ARIA2_PROGRESS_BAR_WIDTH:-40}" \
+  "${COMFY_LOGS:-/workspace/logs}/aria2_progress.log"
+
+# Show completed block when done
+helpers_print_completed_from_aria2 2>/dev/null || true
+
+aria2_clear_results >/dev/null 2>&1 || true
 
 #===============================================================================================
 #  10.2) CivitAI model downloader
