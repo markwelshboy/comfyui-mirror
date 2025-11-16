@@ -1965,7 +1965,7 @@ ensure_custom_nodes_from_bundle_or_build() {
     fi
   else
     echo "[custom-nodes] No HF bundle available — installing from DEFAULT_NODES…" >&2
-    if install_custom_nodes_set && install_custom_nodes_requirements "$tag"; then
+    if install_custom_nodes_set; then
       ok=1
     else
       ok=0
