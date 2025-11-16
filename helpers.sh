@@ -500,18 +500,18 @@ install_custom_nodes_set() {
       clone_or_pull "$repo" "$dst" "$rec"
 
       if ! build_node "$dst"; then
-        echo "[custom-nodes] ❌ Install ERROR $name (see ${CUSTOM_LOG_DIR}/${name}.log)"
+        echo "[custom-nodes] ❌ Install ERROR $name (see ${CUSTOM_LOG_DIR}/${name}.log)" >&2
         exit 1
       fi
 
-      echo "[custom-nodes] ✅ Completed install for: $name"
+      echo "[custom-nodes] ✅ Completed install for: $name" >&2
     ) &
 
     pids+=("$!")
     running=$((running+1))
   done
 
-  echo "[custom-nodes] Waiting for parallel node installs to complete…"
+  echo "[custom-nodes] Waiting for parallel node installs to complete…" >&2
   # Wait for remaining jobs
   while (( running > 0 )); do
     if ! wait -n; then errs=$((errs+1)); fi
@@ -519,10 +519,10 @@ install_custom_nodes_set() {
   done
 
   if (( errs > 0 )); then
-    echo "[custom-nodes] ❌ Completed with ${errs} error(s). Check logs: $CUSTOM_LOG_DIR"
+    echo "[custom-nodes] ❌ Completed with ${errs} error(s). Check logs: $CUSTOM_LOG_DIR" >&2
     return 2
   else
-    echo "[custom-nodes] ✅ All nodes installed successfully."
+    echo "[custom-nodes] ✅ All nodes installed successfully." >&2
   fi
 }
 
@@ -539,18 +539,19 @@ hf_ensure_local_repo() {
     echo "[hf-ensure-local-repo] hf_ensure_local_repo: hf_remote_url unresolved" >&2
     return 1
   else
-    echo "[hf-ensure-local-repo] Trying repo url=${url}" >&2
+    echo "[hf-ensure-local-repo] Master repo url=${url}" >&2
   fi
 
-  mkdir -p "$(dirname "$repo")"
+  echo "[hf-ensure-local-repo] Using local repo=${repo}" >&2
 
   if [[ -d "$repo/.git" ]]; then
     # Cheap refresh in case you’ve pushed new bundles
-    echo "[hf-ensure-local-repo] Refreshing repo (no download)" >&2
+    echo "[hf-ensure-local-repo] Refreshing repo" >&2
     git -C "$repo" fetch --depth=1 origin main >/dev/null 2>&1 || true
     git -C "$repo" reset --hard origin/main >/dev/null 2>&1 || true
   else
-    echo "[hf-ensure-local-repo] Cloning HF repo once into $repo…" >&2
+    echo "[hf-ensure-local-repo] Cloning HF repo into $repo…" >&2
+    mkdir -p "$(dirname "$repo")"
     git clone --depth=1 "$url" "$repo" >/dev/null 2>&1 || {
       echo "[hf-ensure-local-repo] ❌ Failed to clone HF repo into $repo" >&2
       return 1
