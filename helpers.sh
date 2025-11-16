@@ -1638,11 +1638,10 @@ ensure_sage_from_bundle_or_build() {
     local pattern="${CACHE_DIR}/torch_sage_bundle_${key}.tgz"
 
     if [[ -f "$pattern" ]]; then
-      tarpath="$pattern"
-      echo "[sage-bundle] Found local Sage bundle in cache: $(basename "$tarpath")" >&2
+      echo "[sage-bundle] Found local Sage bundle in cache: $(basename "$pattern")" >&2
     else
       # Exact bundle from HF
-      echo "[sage-bundle] No version of bundle found in local cache: $(basename "$tarpath"). Attempting to fetch bundle from HF repo." >&2
+      echo "[sage-bundle] No version of bundle found in local cache: $(basename $pattern). Attempting to fetch bundle from HF repo." >&2
       if tarpath="$(hf_fetch_sage_bundle "$key" 2>/dev/null)"; then
         :
       else
