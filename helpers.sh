@@ -189,7 +189,7 @@ cleanup_opencv_namespace() {
   echo "[numeric-cleanup] Cleaning up legacy OpenCV wheels and cv2 namespace…" >&2
 
   # 1) Uninstall common OpenCV wheels quietly (ignore errors)
-  env -u PIP_REQUIRE_HASHES -u PIP_CONSTRAINT \
+  env -u PIP_REQUIRE_HASHES -u PIP_BUILD_CONSTRAINT \
     "$PIP" uninstall -y \
       opencv-python \
       opencv-python-headless \
@@ -236,7 +236,7 @@ lock_in_numeric_stack() {
   fi
 
   # We *want* these to be authoritative, so ignore any global constraints/hashes.
-  env -u PIP_REQUIRE_HASHES -u PIP_CONSTRAINT \
+  env -u PIP_REQUIRE_HASHES -u PIP_BUILD_CONSTRAINT \
     "$PIP" install -U \
       "$NUMPY_VER" \
       "$CUPY_VER" \
@@ -377,7 +377,7 @@ build_node() {
   {
     echo "==> [$name] $(date -Is) start"
     if [[ -f "$dst/requirements.txt" ]]; then
-      "$PIP_BIN" install --no-cache-dir -r "$dst/requirements.txt" || true
+      "$PIP_BIN" install -r "$dst/requirements.txt" || true
     fi
     if [[ -f "$dst/install.py" ]]; then
       "$PY_BIN" "$dst/install.py" || true
@@ -1244,7 +1244,7 @@ install_torch() {
       url="https://download.pytorch.org/whl/${TORCH_CUDA}"
       ver="${TORCH_VERSION_EFFECTIVE:-${TORCH_STABLE_VER}}+${TORCH_CUDA}"
 
-      env -u PIP_REQUIRE_HASHES -u PIP_CONSTRAINT \
+      env -u PIP_REQUIRE_HASHES -u PIP_BUILD_CONSTRAINT \
         $PIP install --no-cache-dir \
           "torch==${ver}" torchvision torchaudio \
           --index-url "$url"
@@ -1255,7 +1255,7 @@ install_torch() {
       # We do NOT pin torch==… here to avoid resolver conflicts like you just hit.
       url="https://download.pytorch.org/whl/nightly/${TORCH_CUDA}"
 
-      env -u PIP_REQUIRE_HASHES -u PIP_CONSTRAINT \
+      env -u PIP_REQUIRE_HASHES -u PIP_BUILD_CONSTRAINT \
         $PIP install --pre --no-cache-dir \
           torch torchvision torchaudio \
           --index-url "$url"
@@ -1368,7 +1368,7 @@ PY
   rm -rf /tmp/SageAttention
   git clone https://github.com/thu-ml/SageAttention.git /tmp/SageAttention
 
-  if env -u PIP_REQUIRE_HASHES -u PIP_CONSTRAINT $PIP install --no-build-isolation -e /tmp/SageAttention 2>&1 | tee /workspace/logs/sage_build.log; then
+  if env -u PIP_REQUIRE_HASHES -u PIP_BUILD_CONSTRAINT $PIP install --no-build-isolation -e /tmp/SageAttention 2>&1 | tee /workspace/logs/sage_build.log; then
     echo "[sage-bundle] [install_sage_from_source] SageAttention built OK"
     return 0
   else
@@ -1847,9 +1847,14 @@ build_consolidated_reqs() {
       cat "$r"
     done
   ) > "$tmp"
-  # Strip torch/opencv/cupy/numpy (we pin them), remove comments/empties, sort unique
+
+  # Strip torch/opencv/cupy/numpy/sageattention (we manage them separately),
+  # remove comments/empties, sort unique
   grep -vE '^(torch|torchvision|torchaudio|opencv(|-python|-contrib-python|-headless)|cupy(|-cuda.*)|numpy)\b' "$tmp" \
-    | sed '/^\s*#/d;/^\s*$/d' | sort -u > "$out" || true
+    | grep -vi 'sageattention' \
+    | sed '/^\s*#/d;/^\s*$/d' \
+    | sort -u > "$out" || true
+
   rm -f "$tmp"
 }
 
@@ -1871,7 +1876,7 @@ build_consolidated_reqs_from_freeze() {
   echo "[custom-nodes] [freeze-requirements] Capturing environment via pip freeze for tag=${tag}…" >&2
 
   # Be defensive about hash/constraint envs
-  if ! env -u PIP_REQUIRE_HASHES -u PIP_CONSTRAINT \
+  if ! env -u PIP_REQUIRE_HASHES -u PIP_BUILD_CONSTRAINT \
         "$PIP" freeze >"$tmp" 2>/dev/null; then
     echo "[custom-nodes] [freeze-requirements] pip freeze failed; leaving ${out} untouched" >&2
     rm -f "$tmp"
@@ -1881,10 +1886,12 @@ build_consolidated_reqs_from_freeze() {
   # Filter:
   #  - Drop torch / numeric stack (we control via .env pins)
   #  - Drop obvious infra tools that don’t belong in node replays
+  #  - Drop SageAttention
   #
   # NOTE: keep git+ / @ git URLs etc – they’re already resolved in freeze output.
   grep -vE '^((torch(|vision|audio))|numpy|cupy(|-cuda.*)|opencv(|-python|-contrib-python|-headless)|nvidia-.*|triton)\b' "$tmp" \
     | grep -vE '^(pip|setuptools|wheel|pkg-resources)\b' \
+    | grep -vi 'sageattention' \
     | sed '/^\s*$/d' \
     | sort -u >"$out" || true
 
