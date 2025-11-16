@@ -539,14 +539,14 @@ hf_ensure_local_repo() {
     echo "[hf-ensure-local-repo] hf_ensure_local_repo: hf_remote_url unresolved" >&2
     return 1
   else
-    echo "[hf-ensure-local-repo] Trying repo url=${url}"
+    echo "[hf-ensure-local-repo] Trying repo url=${url}" >&2
   fi
 
   mkdir -p "$(dirname "$repo")"
 
   if [[ -d "$repo/.git" ]]; then
     # Cheap refresh in case you’ve pushed new bundles
-    echo "[hf-ensure-local-repo] Refreshing repo (no download)"
+    echo "[hf-ensure-local-repo] Refreshing repo (no download)" >&2
     git -C "$repo" fetch --depth=1 origin main >/dev/null 2>&1 || true
     git -C "$repo" reset --hard origin/main >/dev/null 2>&1 || true
   else
@@ -1342,7 +1342,7 @@ maj,minr = torch.cuda.get_device_capability(0) if torch.cuda.is_available() else
 print(f"{maj}.{minr}")
 PY
   )"
-  echo "Detected GPU compute capability: ${CC_TORCH}"
+  echo "[sage-bundle] [install_sage_from_source] Detected GPU compute capability: ${CC_TORCH}" >&2
 
   # Toolchain for CUDA 12.x
   unset CC CXX SAGE_CUDA_ARCH_LIST SAGE_GENCODE CUDA_ARCH_LIST
@@ -1360,17 +1360,18 @@ PY
     8.*)  export TORCH_CUDA_ARCH_LIST="8.6;8.0"          ;;
     *)    export TORCH_CUDA_ARCH_LIST="8.0"              ;;
   esac
-  echo "TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}"
+  echo "[sage-bundle] [install_sage_from_source] TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}" >&2
 
   # Clean + build (NO build isolation, so setup can import torch)
+  echo "[sage-bundle] [install_sage_from_source] Clonging SageAttention, repo=https://github.com/thu-ml/SageAttention.git" >&2
   rm -rf /tmp/SageAttention
   git clone https://github.com/thu-ml/SageAttention.git /tmp/SageAttention
 
   if env -u PIP_REQUIRE_HASHES -u PIP_CONSTRAINT $PIP install --no-build-isolation -e /tmp/SageAttention 2>&1 | tee /workspace/logs/sage_build.log; then
-    echo "SageAttention built OK"
+    echo "[sage-bundle] [install_sage_from_source] SageAttention built OK"
     return 0
   else
-    echo "SageAttention build FAILED — see /workspace/logs/sage_build.log" >&2
+    echo "[sage-bundle] [install_sage_from_source] SageAttention build FAILED — see /workspace/logs/sage_build.log" >&2
     return 1
   fi
 }
@@ -1379,6 +1380,8 @@ build_sage_bundle() {
   local key="${1:?SAGE_KEY required}"
   mkdir -p "$CACHE_DIR"
   local tarpath="${CACHE_DIR}/torch_sage_bundle_${key}.tgz"
+  
+  echo "[sage-bundle] [build_sage_bundle] Building Sage Bundle..." >&2
 
   SAGE_TARPATH="$tarpath" "$PY" - << 'PY'
 import importlib, os, sysconfig, tarfile, sys
@@ -1431,7 +1434,7 @@ build_sage_bundle_wrapper() {
   local tarpath="${CACHE_DIR}/torch_sage_bundle_${key}.tgz"
 
   SAGE_TARPATH="$tarpath" "$PY" -m pip show torch >/dev/null 2>&1 || {
-    echo "[sage-bundle] Torch not installed; cannot build Sage bundle." >&2
+    echo "[sage-bundle] [build_sage_bundle_wrapper] Torch not installed; cannot build Sage bundle." >&2
     return 1
   }
 
@@ -1446,7 +1449,7 @@ push_sage_bundle_if_requested() {
 
   local key tarpath
   key="$(torch_sage_key)"
-  echo "[sage-bundle] Pushing Sage bundle to HF for key=${key}…" >&2
+  echo "[sage-bundle] [push_sage_bundle_if_requested] Pushing Sage bundle to HF for key=${key}…" >&2
 
   # Hard gate: don't push a bundle if we can't import SageAttention
   if ! "$PY" - << 'PY'
@@ -1463,41 +1466,55 @@ print("Could not import any SageAttention module (tried: sageattention, SageAtte
 raise SystemExit(1)
 PY
   then
-    echo "[sage-bundle] ❌ Not pushing Sage bundle — SageAttention is not importable." >&2
+    echo "[sage-bundle] [push_sage_bundle_if_requested] ❌ Not pushing Sage bundle — SageAttention is not importable." >&2
     return 1
   fi
 
   tarpath="$(build_sage_bundle_wrapper "$key")" || {
-    echo "[sage-bundle] Failed to build Sage bundle." >&2
+    echo "[sage-bundle] [push_sage_bundle_if_requested] Failed to build Sage bundle." >&2
     return 1
   }
 
   hf_push_files "torch_sage bundle ${key}" "$tarpath"
-  echo "[sage-bundle] Uploaded torch_sage_bundle_${key}.tgz"
+  echo "[sage-bundle] [push_sage_bundle_if_requested] Uploaded torch_sage_bundle_${key}.tgz"
 }
 
 hf_fetch_sage_bundle() {
   local key="${1:?SAGE_KEY}" repo patt local_tgz
-  echo "[sage-bundle] [hf_fetch_sage_bundle] Creating local repo." >&2
+
+  echo "[sage-bundle] [hf_fetch_sage_bundle] Ensuring local HF repo..." >&2
   repo="$(hf_ensure_local_repo)" || {
-    echo "[sage-bundle] ❌ Could not create local HF repo" >&2
+    echo "[sage-bundle] [hf_fetch_sage_bundle] ❌ Could not create local HF repo." >&2
     return 1
   }
-  echo "[sage-bundle] [hf_fetch_sage_bundle] Local repo exists at repo=${repo}." >&2
-  echo "[sage-bundle] [hf_fetch_sage_bundle] Available sage bundles: " >&2
-  echo "$(ls -lrt ${repo}/bundles/torch_sage_bundle_*)" >&2
-  echo ""
+  echo "[sage-bundle] [hf_fetch_sage_bundle] Local repo=${repo}." >&2
+
+  # List available Sage bundles in a nullglob-safe way
+  local matches=()
+  shopt -s nullglob
+  matches=("$repo"/bundles/torch_sage_bundle_*.tgz)
+  shopt -u nullglob
+
+  if ((${#matches[@]} == 0)); then
+    echo "[sage-bundle] [hf_fetch_sage_bundle] No Sage bundles found in ${repo}/bundles." >&2
+  else
+    echo "[sage-bundle] [hf_fetch_sage_bundle] Available Sage bundles:" >&2
+    for f in "${matches[@]}"; do
+      echo "  - $(basename "$f")" >&2
+    done
+  fi
 
   patt="${repo}/bundles/torch_sage_bundle_${key}.tgz"
-  echo "[sage-bundle] [hf_fetch_sage_bundle] Looking for matching bundle=${patt}" >&2
+  echo "[sage-bundle] [hf_fetch_sage_bundle] Looking for matching bundle $(basename $patt)." >&2
+
   if [[ ! -f "$patt" ]]; then
-    echo "[sage-bundle] [hf_fetch_sage_bundle] ❌ Bundle (torch_sage_bundle_${key}.tgz) not available in HF repo." >&2
+    echo "[sage-bundle] [hf_fetch_sage_bundle] ❌ Exact bundle not found for key=${key}." >&2
     return 1
   fi
 
   mkdir -p "$CACHE_DIR"
   local_tgz="${CACHE_DIR}/$(basename "$patt")"
-  echo "[sage-bundle] [hf_fetch_sage_bundle] Copying bundle from repo to local cache @ ${local_tgz}"
+  echo "[sage-bundle] [hf_fetch_sage_bundle] Found bundle. Copying → ${local_tgz}." >&2
   cp -f "$patt" "$local_tgz"
 
   echo "$local_tgz"
@@ -1507,26 +1524,25 @@ hf_fetch_sage_bundle() {
 #   Look for pip_cache/pip_cache_${key}.tgz in HF repo, copy into CACHE_DIR, echo local path.
 hf_fetch_pip_cache() {
   local key="${1:?pip cache key required}"
+  
   local repo
-
   repo="$(hf_ensure_local_repo)" || {
-    echo "[sage-bundle] hf_fetch_latest_custom_nodes_bundle: no local repo." >&2
+    echo "[sage-bundle] [hf_fetch_pip_cache]: Could not use local repo." >&2
     return 1
   }
 
-  local rel="pip_cache/pip_cache_${key}.tgz"
-  local src="${repo}/${rel}"
-
-  if [[ ! -f "$src" ]]; then
-    echo "[pip-cache] No pip cache found for key=${key}" >&2
+  local patt="${repo}/pip_cache/pip_cache_${key}.tgz"
+  if [[ ! -f "$patt" ]]; then
+    echo "[pip-cache] [hf_fetch_pip_cache] No pip cache found for key=${key}." >&2
     return 0
   fi
 
+  local local_tgz="${CACHE_DIR}/pip_cache_${key}.tgz"
   mkdir -p "${CACHE_DIR:-/workspace/ComfyUI/cache}"
-  local dst="${CACHE_DIR}/pip_cache_${key}.tgz"
-  cp -f "$src" "$dst"
+  echo "[pip-cache] [hf_fetch_pip_cache] Found bundle. Copying → ${local_tgz}." >&2
+  cp -f "$patt" "$local_tgz"
 
-  echo "$dst"
+  echo "$local_tgz"
 }
 
 # push_pip_cache_if_requested:
@@ -1538,12 +1554,12 @@ push_pip_cache_if_requested() {
 
   local cache="${CUSTOM_NODES_PIP_CACHE_DIR:-}"
   if [[ -z "$cache" || ! -d "$cache" ]]; then
-    echo "[pip-cache] No CUSTOM_NODES_PIP_CACHE_DIR set; nothing to push." >&2
+    echo "[pip-cache] [push_pip_cache_if_requested] No CUSTOM_NODES_PIP_CACHE_DIR set; nothing to push." >&2
     return 0
   fi
 
   if [[ -z "$(ls -A "$cache" 2>/dev/null)" ]]; then
-    echo "[pip-cache] CUSTOM_NODES_PIP_CACHE_DIR is empty; skipping push." >&2
+    echo "[pip-cache] [push_pip_cache_if_requested] CUSTOM_NODES_PIP_CACHE_DIR is empty; skipping push." >&2
     return 0
   fi
 
@@ -1551,14 +1567,14 @@ push_pip_cache_if_requested() {
   key="$(pip_cache_key)"
   tgz="${CACHE_DIR}/pip_cache_${key}.tgz"
 
-  echo "[pip-cache] Creating pip cache archive ${tgz}..." >&2
+  echo "[pip-cache] [push_pip_cache_if_requested] Creating pip cache archive ${tgz}..." >&2
   tar -czf "$tgz" -C "$cache" . || {
-    echo "[pip-cache] ❌ Failed to tar pip cache." >&2
+    echo "[pip-cache] [push_pip_cache_if_requested] ❌ Failed to tar pip cache." >&2
     return 1
   }
 
   hf_push_files "pip_cache ${key}" "$tgz"
-  echo "[pip-cache] Uploaded pip_cache_${key}.tgz" >&2
+  echo "[pip-cache] [push_pip_cache_if_requested] Uploaded pip_cache_${key}.tgz" >&2
 }
 
 # ensure_pip_cache_for_custom_nodes:
@@ -1606,22 +1622,22 @@ for p in sys.path:
 PY
 )"
   if [[ -z "$site" ]]; then
-    echo "[sage-bundle] ERROR: could not locate site-packages for $PY" >&2
+    echo "[sage-bundle] [restore_sage_from_tar] ERROR: could not locate site-packages for $PY" >&2
     return 1
   fi
 
-  echo "[sage-bundle] Untarring SageAttention from $(basename "$tar") into ${site}…" >&2
+  echo "[sage-bundle] [restore_sage_from_tar] Untarring SageAttention from $(basename "$tar") into ${site}…" >&2
   mkdir -p "$site"
   tar xzf "$tar" -C "$site"
 
   "$PY" - <<'PY'
 import sys
-print("[sage-bundle] sys.executable:", sys.executable)
+print("[sage-bundle] [restore_sage_from_tar] sys.executable:", sys.executable)
 try:
     import sageattention
-    print("[sage-bundle] SAGE imported sucessfully from tar bundle:", sageattention, getattr(sageattention, "__file__", None))
+    print("[sage-bundle] [restore_sage_from_tar] SAGE imported sucessfully from tar bundle:", sageattention, getattr(sageattention, "__file__", None))
 except Exception as e:
-    print("[sage-bundle] SAGE IMPORT ERROR:", repr(e))
+    print("[sage-bundle] [restore_sage_from_tar] SAGE IMPORT ERROR:", repr(e))
 PY
 }
 
@@ -1629,20 +1645,20 @@ ensure_sage_from_bundle_or_build() {
   local key tarpath
   key="$(torch_sage_key)"
 
-  echo "[sage-bundle] Looking for Sage bundle key=${key}…" >&2
+  echo "[sage-bundle] [ensure_sage_from_bundle_or_build] Looking for Sage bundle key=${key}…" >&2
 
   # If the user wants a fresh build, skip bundle lookup entirely
   if [[ "${SAGE_FORCE_REBUILD:-0}" == "1" ]]; then
-    echo "[sage-bundle] SAGE_FORCE_REBUILD=1 — skipping bundle restore and rebuilding from source." >&2
+    echo "[sage-bundle] [ensure_sage_from_bundle_or_build] SAGE_FORCE_REBUILD=1 — skipping bundle restore and rebuilding from source." >&2
   else
     local pattern="${CACHE_DIR}/torch_sage_bundle_${key}.tgz"
 
     if [[ -f "$pattern" ]]; then
-      echo "[sage-bundle] Found local Sage bundle in cache: $(basename "$pattern")" >&2
+      echo "[sage-bundle] [ensure_sage_from_bundle_or_build] Found local Sage bundle in cache: $(basename "$pattern")" >&2
     else
       # Exact bundle from HF
-      echo "[sage-bundle] No version of bundle (${pattern}) found in local cache=${CACHE_DIR}. Attempting to fetch bundle from HF repo." >&2
-      if tarpath="$(hf_fetch_sage_bundle "$key" 2>/dev/null)"; then
+      echo "[sage-bundle] [ensure_sage_from_bundle_or_build] No version of bundle (${pattern}) found in local cache=${CACHE_DIR}. Attempting to fetch bundle from HF repo." >&2
+      if tarpath="$(hf_fetch_sage_bundle "$key")"; then
         :
       else
         tarpath=""
@@ -1650,7 +1666,7 @@ ensure_sage_from_bundle_or_build() {
 
       # If still nothing, optionally reuse a compatible bundle (same cuXXX_sm_YY)
       if [[ -z "$tarpath" && "${SAGE_ALLOW_COMPAT_REUSE:-0}" == "1" ]]; then
-        if tarpath="$(hf_fetch_compatible_sage_bundle "$key" 2>/dev/null)"; then
+        if tarpath="$(hf_fetch_compatible_sage_bundle "$key")"; then
           :
         else
           tarpath=""
@@ -1660,12 +1676,12 @@ ensure_sage_from_bundle_or_build() {
   fi
 
   if [[ -n "${tarpath:-}" && -f "$tarpath" ]]; then
-    echo "[sage-bundle] Using Sage bundle: $(basename "$tarpath")" >&2
+    echo "[sage-bundle] [ensure_sage_from_bundle_or_build] Using Sage bundle: $(basename "$tarpath")" >&2
     SAGE_TARPATH="$tarpath" restore_sage_from_tar
     return 0
   fi
 
-  echo "[sage-bundle] No bundle found — building Sage from source…" >&2
+  echo "[sage-bundle] [ensure_sage_from_bundle_or_build] No bundle found — building Sage from source…" >&2
   install_sage_from_source || return 1
   return 0
 }
