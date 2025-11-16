@@ -419,11 +419,11 @@ rewrite_custom_nodes_requirements() {
   local out="$2"
 
   if [[ ! -f "$in" ]]; then
-    echo "[custom-nodes] rewrite_custom_nodes_requirements: input missing: $in" >&2
+    echo "[custom-nodes] [rewrite_custom_nodes_requirements]: input missing: $in" >&2
     return 1
   fi
 
-  system cp -f "$in" "$out"
+  cp -f "$in" "$out"
 
   # Walk all env vars prefixed with CUSTOM_NODES_REQ_REWRITE_
   local var spec pkg repl
@@ -440,13 +440,13 @@ rewrite_custom_nodes_requirements() {
 
     # If replacement begins with "#", we just drop it and move on
     if [[ "$repl" == "#"* || -z "$repl" ]]; then
-      echo "[custom-nodes] rewrite: removed '${pkg}' with no replacement (rule: ${var})"
+      echo "[custom-nodes] [rewrite_custom_nodes_requirements]: REMOVED '${pkg}' with no replacement (rule: ${var})"
       continue
     fi
 
     # Append replacement line at end
     echo "$repl" >>"$out"
-    echo "[custom-nodes] rewrite: replaced '${pkg}' -> '${repl}' (rule: ${var})"
+    echo "[custom-nodes] [rewrite_custom_nodes_requirements]: REPLACED '${pkg}' -> '${repl}' (rule: ${var})"
   done
 }
 
@@ -1528,13 +1528,29 @@ hf_fetch_pip_cache() {
   
   local repo
   repo="$(hf_ensure_local_repo)" || {
-    echo "[sage-bundle] [hf_fetch_pip_cache]: Could not use local repo." >&2
+    echo "[pip-cache] [hf_fetch_pip_cache]: Could not use local repo." >&2
     return 1
   }
 
-  local patt="${repo}/pip_cache/pip_cache_${key}.tgz"
+  # List available Sage bundles in a nullglob-safe way
+  local matches=()
+  shopt -s nullglob
+  matches=("$repo"/bundles/pip_cache_*.tgz)
+  shopt -u nullglob
+
+  if ((${#matches[@]} == 0)); then
+    echo "[pip-cache] [hf_fetch_pip_cache] No pip_cache bundles found in ${repo}/bundles." >&2
+    return 0
+  else
+    echo "[pip-cache] [hf_fetch_pip_cache] Available pip_cache bundles:" >&2
+    for f in "${matches[@]}"; do
+      echo "  - $(basename "$f")" >&2
+    done
+  fi
+
+  local patt="${repo}/bundles/pip_cache_${key}.tgz"
   if [[ ! -f "$patt" ]]; then
-    echo "[pip-cache] [hf_fetch_pip_cache] No pip cache found for key=${key}." >&2
+    echo "[pip-cache] [hf_fetch_pip_cache] No pip cache bundle found in local repo for key=${key}." >&2
     return 0
   fi
 
