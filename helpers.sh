@@ -712,6 +712,8 @@ _custom_node_bundle_compatible() {
 
 hf_fetch_compatible_sage_bundle() {
   local key="${1:?SAGE_KEY}"
+  
+  echo "[sage-bundle] hf_fetch_latest_custom_nodes_bundle: Attempting to find a compatible bundle for key=${key}." >&2
 
   local repo cuda_tag
   repo="$(hf_ensure_local_repo)" || {
@@ -1476,19 +1478,26 @@ PY
 
 hf_fetch_sage_bundle() {
   local key="${1:?SAGE_KEY}" repo patt local_tgz
+  echo "[sage-bundle] [hf_fetch_sage_bundle] Creating local repo." >&2
   repo="$(hf_ensure_local_repo)" || {
-    echo "[sage-bundle] ❌ Could not ensure local HF repo" >&2
+    echo "[sage-bundle] ❌ Could not create local HF repo" >&2
     return 1
   }
+  echo "[sage-bundle] [hf_fetch_sage_bundle] Local repo exists at repo=${repo}." >&2
+  echo "[sage-bundle] [hf_fetch_sage_bundle] Available sage bundles: " >&2
+  echo "$(ls -lrt ${repo}/bundles/torch_sage_bundle_*)" >&2
+  echo ""
 
   patt="${repo}/bundles/torch_sage_bundle_${key}.tgz"
+  echo "[sage-bundle] [hf_fetch_sage_bundle] Looking for matching bundle=${patt}" >&2
   if [[ ! -f "$patt" ]]; then
-    echo "[sage-bundle] ❌ Bundle (torch_sage_bundle_${key}.tgz) not available in HF repo." >&2
+    echo "[sage-bundle] [hf_fetch_sage_bundle] ❌ Bundle (torch_sage_bundle_${key}.tgz) not available in HF repo." >&2
     return 1
   fi
 
   mkdir -p "$CACHE_DIR"
   local_tgz="${CACHE_DIR}/$(basename "$patt")"
+  echo "[sage-bundle] [hf_fetch_sage_bundle] Copying bundle from repo to local cache @ ${local_tgz}"
   cp -f "$patt" "$local_tgz"
 
   echo "$local_tgz"
@@ -1632,7 +1641,8 @@ ensure_sage_from_bundle_or_build() {
       tarpath="$pattern"
       echo "[sage-bundle] Found local Sage bundle in cache: $(basename "$tarpath")" >&2
     else
-      # Exact bundle from HF?
+      # Exact bundle from HF
+      echo "[sage-bundle] No version of bundle found in local cache: $(basename "$tarpath"). Attempting to fetch bundle from HF repo." >&2
       if tarpath="$(hf_fetch_sage_bundle "$key" 2>/dev/null)"; then
         :
       else
