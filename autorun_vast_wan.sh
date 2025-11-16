@@ -227,9 +227,13 @@ export PINS="$(pins_signature)"
 echo "[custom-nodes] PINS = $PINS"
 
 # 9.2) Prefer HF bundle for (BUNDLE_TAG + PINS); else build from list (CUSTOM_NODE_LIST_FILE → CUSTOM_NODE_LIST → DEFAULT_NODES)
-echo "== [custom-nodes] phase starting…"
-ensure_custom_nodes_from_bundle_or_build
-echo "== [custom-nodes] phase done, moving to model downloads…"
+echo "[custom-nodes] Installing custom nodes…"
+if ensure_custom_nodes_from_bundle_or_build; then
+    echo "[custom-nodes] Completed OK"
+else
+    echo "[custom-nodes] FAILED — aborting bootstrap"
+    exit 1
+fi
 
 # =============================================================================================
 #
