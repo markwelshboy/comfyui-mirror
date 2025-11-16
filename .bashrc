@@ -100,6 +100,8 @@ if [[ -L "$SCRIPT_PATH" ]]; then
 fi
 repo_root="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 
+echo "REPO ROOT: $repo_root"
+
 # -------------------------
 # Vast / ComfyUI environment wiring
 # -------------------------
