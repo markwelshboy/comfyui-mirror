@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+echo "START - Formatted time: $(date +\"%Y-%m-%d %H:%M:%S\")"
+
 touch ~/.no_auto_tmux
 
 mkdir -p /workspace
@@ -399,4 +401,7 @@ else
 fi
 
 echo "Bootstrap complete. General Comfy Logs: ${COMFY_LOGS} | Bootstrap log: ${LOGFILE_BOOTSTRAP}"
+
+echo "END - Formatted time: $(date +\"%Y-%m-%d %H:%M:%S\")"
+
 sleep infinity
