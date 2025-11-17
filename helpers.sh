@@ -592,12 +592,8 @@ hf_push_files() {
 
   git clone "$(hf_remote_url)" "$tmp"
   ( cd "$tmp"
-    # Use hf (or huggingface-cli) here, for the current repo
-    local HF_CLI="${HF_CLI:-hf}"
-    if ! command -v "$HF_CLI" >/dev/null 2>&1; then
-      HF_CLI="huggingface-cli"
-    fi
-    "$HF_CLI" lfs-enable-largefiles .      
+    # use huggingface-cli (comes from huggingface-hub[cli])
+    huggingface-cli lfs-enable-largefiles .      
     git checkout "$CN_BRANCH" 2>/dev/null || git checkout -b "$CN_BRANCH"
     mkdir -p bundles meta requirements
     for f in "${files[@]}"; do

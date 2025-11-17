@@ -154,7 +154,7 @@ aria2_download_from_manifest
 #
 #====================================================================================
 
-$PIP install -U pip wheel setuptools ninja packaging hf
+$PIP install -U pip wheel setuptools ninja packaging "huggingface-hub[cli]==0.36.0"
 
 aria2_show_download_snapshot
 
