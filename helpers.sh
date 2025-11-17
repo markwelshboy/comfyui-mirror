@@ -592,6 +592,7 @@ hf_push_files() {
   git lfs install
   git clone "$(hf_remote_url)" "$tmp"
   ( cd "$tmp"
+    hf lfs-enable-largefiles $tmp
     git checkout "$CN_BRANCH" 2>/dev/null || git checkout -b "$CN_BRANCH"
     mkdir -p bundles meta requirements
     for f in "${files[@]}"; do
