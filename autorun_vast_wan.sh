@@ -154,7 +154,15 @@ aria2_download_from_manifest
 #
 #====================================================================================
 
-$PIP install -U pip wheel setuptools ninja packaging "huggingface-hub[cli]==0.36.0"
+# Core Python tooling
+$PIP install -U pip wheel setuptools ninja packaging
+
+$PIP install pyyaml gdown \
+        "huggingface-hub[cli]==0.36.0" \
+        onnxruntime-gpu \
+        jupyterlab jupyterlab-lsp \
+        jupyter-server jupyter-server-terminals \
+        ipykernel jupyterlab_code_formatter
 
 aria2_show_download_snapshot
 
