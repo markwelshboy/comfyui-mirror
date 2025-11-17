@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "START - Formatted time: $(date +\"%Y-%m-%d %H:%M:%S\")"
+echo "START: Current time: $(date)"
 
 touch ~/.no_auto_tmux
 
@@ -402,6 +402,6 @@ fi
 
 echo "Bootstrap complete. General Comfy Logs: ${COMFY_LOGS} | Bootstrap log: ${LOGFILE_BOOTSTRAP}"
 
-echo "END - Formatted time: $(date +\"%Y-%m-%d %H:%M:%S\")"
+echo "END: Current time: $(date)"
 
 sleep infinity
