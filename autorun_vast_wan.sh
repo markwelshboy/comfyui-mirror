@@ -154,7 +154,7 @@ aria2_download_from_manifest
 #
 #====================================================================================
 
-$PIP install -U pip wheel setuptools ninja packaging
+$PIP install -U pip wheel setuptools ninja packaging hf
 
 aria2_show_download_snapshot
 
@@ -217,9 +217,7 @@ aria2_show_download_snapshot
 #
 #====================================================================================
 
-echo "[comfy-install] Starting install of ComfyUI."
 ensure_comfy
-echo "[comfy-install] Completed ComfyUI install."
 
 aria2_show_download_snapshot
 

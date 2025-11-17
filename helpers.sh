@@ -589,10 +589,15 @@ hf_push_files() {
   local files=( "$@" )
   local tmp="${CACHE_DIR}/.hf_push.$$"
   rm -rf "$tmp"
-  git lfs install
+
   git clone "$(hf_remote_url)" "$tmp"
   ( cd "$tmp"
-    hf lfs-enable-largefiles $tmp
+    # Use hf (or huggingface-cli) here, for the current repo
+    local HF_CLI="${HF_CLI:-hf}"
+    if ! command -v "$HF_CLI" >/dev/null 2>&1; then
+      HF_CLI="huggingface-cli"
+    fi
+    "$HF_CLI" lfs-enable-largefiles .      
     git checkout "$CN_BRANCH" 2>/dev/null || git checkout -b "$CN_BRANCH"
     mkdir -p bundles meta requirements
     for f in "${files[@]}"; do
@@ -1615,14 +1620,14 @@ ensure_pip_cache_for_custom_nodes() {
   # If cache is empty, try to hydrate it from HF
   if [[ -z "$(ls -A "$cache" 2>/dev/null)" ]]; then
     local tgz
-    echo "[pip-cache] Attempting to retrieve from local HF repo, compatible cache for key: $key..." >&2
+    echo "[pip-cache] [ensure_pip_cache_for_custom_nodes] Attempting to retrieve from local HF repo, compatible cache for key: $key..." >&2
     tgz="$(hf_fetch_pip_cache "$key")"
     if [[ -n "$tgz" && -f "$tgz" ]]; then
-      echo "[pip-cache] Restoring pip cache from $(basename "$tgz")..." >&2
+      echo "[pip-cache] [ensure_pip_cache_for_custom_nodes] Restoring pip cache from $(basename "$tgz")..." >&2
       tar -xzf "$tgz" -C "$cache" || {
-        echo "[pip-cache] ⚠️ Failed to extract pip cache archive; continuing without it." >&2
+        echo "[pip-cache] [ensure_pip_cache_for_custom_nodes] ⚠️ Failed to extract pip cache archive; continuing without it." >&2
       }
-      echo "[pip-cache] Restored pip cache from tar file." >&2
+      echo "[pip-cache] [ensure_pip_cache_for_custom_nodes] Restored pip cache from tar file." >&2
     fi
   fi
 }
@@ -1663,12 +1668,13 @@ ensure_sage_from_bundle_or_build() {
   local key tarpath
   key="$(torch_sage_key)"
 
-  echo "[sage-bundle] [ensure_sage_from_bundle_or_build] Looking for Sage bundle key=${key}…" >&2
-
   # If the user wants a fresh build, skip bundle lookup entirely
   if [[ "${SAGE_FORCE_REBUILD:-0}" == "1" ]]; then
     echo "[sage-bundle] [ensure_sage_from_bundle_or_build] SAGE_FORCE_REBUILD=1 — skipping bundle restore and rebuilding from source." >&2
   else
+
+    echo "[sage-bundle] [ensure_sage_from_bundle_or_build] Looking for Sage bundle key=${key}…" >&2
+  
     local pattern="${CACHE_DIR}/torch_sage_bundle_${key}.tgz"
 
     if [[ -f "$pattern" ]]; then
@@ -1698,7 +1704,7 @@ ensure_sage_from_bundle_or_build() {
     SAGE_TARPATH="$tarpath" restore_sage_from_tar
     return 0
   fi
-
+ 
   echo "[sage-bundle] [ensure_sage_from_bundle_or_build] No bundle found — building Sage from source…" >&2
   install_sage_from_source || return 1
   return 0
@@ -1944,49 +1950,52 @@ install_custom_nodes_bundle() {
 ensure_custom_nodes_from_bundle_or_build() {
   local tag="${CUSTOM_NODES_BUNDLE_TAG:?CUSTOM_NODES_BUNDLE_TAG required}"
   local pins="${PINS:-$(pins_signature)}"
-  local ok=0
 
   mkdir -p "$CACHE_DIR" "$CUSTOM_LOG_DIR"
   mkdir -p "$(dirname "$CUSTOM_DIR")"
 
-  # Enable PIP cache for custom-node requirements only
   ensure_pip_cache_for_custom_nodes
 
-  echo "[custom-nodes] PINS = $pins"
-  echo "[custom-nodes] Looking for bundle tag=${tag}, pins=${pins}…"
-
-  local tgz=""
-  tgz="$(hf_fetch_latest_custom_nodes_bundle "$tag" "$pins" 2>/dev/null || true)"
-
-  if [[ -n "$tgz" && -f "$tgz" ]]; then
-    echo "[custom-nodes] Using HF bundle: $(basename "$tgz")"
-    rm -rf "$CUSTOM_DIR"
-    mkdir -p "$(dirname "$CUSTOM_DIR")"
-    tar -xzf "$tgz" -C "$(dirname "$CUSTOM_DIR")"
-    echo "[custom-nodes] Restored custom nodes from HF bundle."
-
-    if install_custom_nodes_requirements "$tag"; then
-      ok=1
-    else
-      ok=0
-      echo "[custom-nodes] ⚠️ Requirements install failed; NOT pushing bundle/cache." >&2
-    fi
+  # If the user wants a fresh build, skip bundle lookup entirely
+  if [[ "${CUSTOM_NODES_FORCE_INSTALL:-0}" == "1" ]]; then
+    echo "[custom-nodes] [ensure_custom_nodes_from_bundle_or_build] CUSTOM_NODES_FORCE_INSTALL=1 — skipping custom node bundle restore and rebuilding from source." >&2
   else
-    echo "[custom-nodes] No HF bundle available — installing from DEFAULT_NODES…" >&2
-    if install_custom_nodes_set; then
-      ok=1
+
+    echo "[custom-nodes] [ensure_custom_nodes_from_bundle_or_build] PINS = $pins"
+    echo "[custom-nodes] [ensure_custom_nodes_from_bundle_or_build] Looking for bundle tag=${tag}, pins=${pins}…"
+
+    local tgz=""
+    tgz="$(hf_fetch_latest_custom_nodes_bundle "$tag" "$pins" 2>/dev/null || true)"
+
+    if [[ -n "$tgz" && -f "$tgz" ]]; then
+      echo "[custom-nodes] [ensure_custom_nodes_from_bundle_or_build] Using HF bundle: $(basename "$tgz")."
+      
+      rm -rf "$CUSTOM_DIR"
+      mkdir -p "$(dirname "$CUSTOM_DIR")"
+      tar -xzf "$tgz" -C "$(dirname "$CUSTOM_DIR")"
+      echo "[custom-nodes] [ensure_custom_nodes_from_bundle_or_build] Restored custom nodes from HF bundle."
+
+      if install_custom_nodes_requirements "$tag"; then
+        push_bundle_if_requested || true
+        push_pip_cache_if_requested || true
+        return 0
+      else
+        echo "[custom-nodes] [ensure_custom_nodes_from_bundle_or_build] ⚠️ Requirements install failed; NOT pushing bundle/cache." >&2
+        return 1
+      fi
     else
-      ok=0
-      echo "[custom-nodes] ⚠️ Custom-node install failed; NOT pushing bundle/cache." >&2
+      echo "[custom-nodes] [ensure_custom_nodes_from_bundle_or_build] No HF bundle available — installing from DEFAULT_NODES…" >&2
     fi
   fi
 
-  if (( ok == 1 )); then
+  if install_custom_nodes_set; then
     push_bundle_if_requested || true
     push_pip_cache_if_requested || true
+    return 0
+  else
+    echo "[custom-nodes] ⚠️ Custom-node install failed; NOT pushing bundle/cache." >&2
+    return 1
   fi
-
-  return $(( ok == 1 ? 0 : 1 ))
 }
 
 # push_bundle_if_requested: convenience wrapper (respects CUSTOM_NODES_BUNDLE_TAG/PINS)
