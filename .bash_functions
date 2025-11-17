@@ -9,13 +9,6 @@ source_if_exists() {
 
 # Load the "runtime env" so an SSH shell matches the autorun context
 load_runtime_env() {
-
-  # Discover repo root as the directory containing this .env file
-  SCRIPT_PATH="${BASH_SOURCE[0]}"
-  if [[ -L "$SCRIPT_PATH" ]]; then
-    SCRIPT_PATH="$(readlink -f "$SCRIPT_PATH")"
-  fi
-  repo_root="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
   
   secrets="/root/.secrets/env.current"
 

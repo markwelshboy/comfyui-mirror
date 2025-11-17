@@ -41,12 +41,6 @@ alias gds='git diff --stat'
 # -------------------------
 # Pod / ComfyUI helpers
 # -------------------------
-# Discover repo root as the directory containing this .env file
-SCRIPT_PATH="${BASH_SOURCE[0]}"
-if [[ -L "$SCRIPT_PATH" ]]; then
-  SCRIPT_PATH="$(readlink -f "$SCRIPT_PATH")"
-fi
-repo_root="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 
 # Common locations
 alias cwork='cd /workspace'

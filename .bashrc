@@ -6,6 +6,9 @@ case $- in
       *) return;;
 esac
 
+# Will be replaced during installation
+REPO_ROOT=<CHANGEME>
+
 # -------------------------
 # History behaviour
 # -------------------------
@@ -94,13 +97,7 @@ if [ -f "$HOME/.bash_aliases" ]; then
   . "$HOME/.bash_aliases"
 fi
 
-SCRIPT_PATH="${BASH_SOURCE[0]}"
-if [[ -L "$SCRIPT_PATH" ]]; then
-  SCRIPT_PATH="$(readlink -f "$SCRIPT_PATH")"
-fi
-repo_root="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
-
-echo "REPO ROOT: $repo_root"
+export repo_root="${REPO_ROOT:?REPO_ROOT not set}"
 
 # -------------------------
 # Vast / ComfyUI environment wiring
